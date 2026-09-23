@@ -4,6 +4,16 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Deps](https://img.shields.io/badge/deps-PySide6%20%2B%20markdown-green)
 
+## 界面
+
+| 待办清单（三栏 + 内嵌今日打卡） | 日历（时间轴 / 日 / 周 / 月） |
+| --- | --- |
+| ![待办清单](docs/todo.png) | ![日历](docs/calendar.png) |
+| **番茄钟** | **习惯打卡** |
+| ![番茄钟](docs/focus.png) | ![习惯打卡](docs/habit.png) |
+
+> 以上截图为演示数据，界面运行时的数据全部存放在你自己的 `~/.life_system/life.db`。
+
 市面上的待办软件要么把数据放云上，要么把「专注」「记账」「笔记」拆成五个 App。这个项目是我自己日用的一套：**一个进程、一个 .db、十个页面**，界面按滴答清单的交互习惯重做，图表全部 QPainter 自绘（不引入 matplotlib / pyqtgraph）。
 
 ## 模块
