@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 构建产物
+build/
+dist/
+distribution/
+*.manifest.bak
+
+# 本地数据：数据库、导出文件、日志（永不入库）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 打包时的一次性输出目录
+_distribution/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
