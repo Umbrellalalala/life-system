@@ -881,12 +881,15 @@ class NotePage(Page):
         base = self._sort.split("-")[0]
         reverse = self._sort.endswith("-desc")
         if base == "manual":
+            # 没记过顺序的兄弟退化成字母序排在已排序的后面；不然会跟着 set 的
+            # 迭代顺序漂，每次进来都不一样
             order = self._manual.get(folder, [])
-            rank = lambda e: order.index(e[1]) if e[1] in order else len(order)
+            rank = lambda e: (order.index(e[1]) if e[1] in order else len(order),
+                              e[1].lower())
         elif base == "name":
             rank = lambda e: e[1].lower()
         else:
-            rank = lambda e: e[2]
+            rank = lambda e: (e[2], e[1].lower())
         dirs = sorted([e for e in entries if e[0] == "dir"], key=rank, reverse=reverse)
         files = sorted([e for e in entries if e[0] == "file"], key=rank, reverse=reverse)
         return dirs + files
@@ -942,16 +945,17 @@ class NotePage(Page):
         stamp: dict[str, float] = {}
         for n in self._notes:
             files.setdefault(n["folder"], []).append(n)
-            parent, _, _ = n["folder"].rpartition("/")
-            subdirs.setdefault(parent, set()).add(n["folder"])
+            cur = n["folder"]
+            while cur:                      # 逐级往上登记，中间那几层也得有节点
+                subdirs.setdefault(cur.rpartition("/")[0], set()).add(cur)
+                cur = cur.rpartition("/")[0]
             cur = n["folder"]
             while True:                     # 时间戳往上冒泡，父文件夹取子树里最新的
                 stamp[cur] = max(stamp.get(cur, 0.0), n[field])
                 if not cur:
                     break
                 cur = cur.rpartition("/")[0]
-        for folder in subdirs:
-            subdirs.setdefault(folder, set())
+        subdirs.setdefault("", set())
 
         dirs: dict[str, QTreeWidgetItem] = {}
         bold = QFont()
@@ -961,7 +965,7 @@ class NotePage(Page):
             parent = parent_item if parent_item is not None \
                 else self.tree.invisibleRootItem()
             entries = [("dir", f.rpartition("/")[2], stamp.get(f, 0.0), f)
-                       for f in subdirs.get(folder, ())]
+                       for f in sorted(subdirs.get(folder, ()))]
             entries += [("file", n["name"], n[field], n["rel"])
                         for n in files.get(folder, ())]
             for kind, name, _ts, payload in self._sort_children(entries, folder):
