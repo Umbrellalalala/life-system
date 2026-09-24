@@ -8,7 +8,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QSizePolicy,
     QAbstractSpinBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTimeEdit, QComboBox,
-    QLineEdit, QDialog, QCalendarWidget,
+    QLineEdit, QDialog, QCalendarWidget, QListWidget,
 )
 
 from . import theme
@@ -278,6 +278,85 @@ def _apply_property(widget: QWidget, name: str, value: str) -> None:
     widget.update()
 
 
+def drop_widget(widget: QWidget) -> None:
+    """把控件从布局里摘掉并销毁 —— 必须先 hide 再 setParent(None)。
+
+    对一个正显示着的控件调 `setParent(None)`，它当场就成了顶层窗口：Qt 会给它
+    建一个带标题栏的空窗，而 `deleteLater` 要到下一轮事件循环才跑到，
+    用户看到的就是「一瞬间弹出一堆空窗口」（重建详情子任务 / 重建列表行时）。
+    """
+    widget.hide()
+    widget.setParent(None)
+    widget.deleteLater()
+
+
+def _height_at(row: QWidget, w: int) -> int:
+    """这行被限定成宽度 w 时到底要多高。
+
+    不能读 row.sizeHint().height()：开了 wordWrap 的 QLabel，它的 sizeHint
+    算的是「整句不折行需要多宽」那一版，跟当前宽度无关 —— 于是窄栏里行高少算
+    一截，最后一行被裁掉。只能逐个问子控件「宽度限定成这么多时你要多高」。
+    """
+    lay = row.layout()
+    if lay is None:
+        return row.sizeHint().height()
+    m = lay.contentsMargins()
+    inner = max(w - m.left() - m.right(), 20)
+    heights: list[int] = []
+    for j in range(lay.count()):
+        item = lay.itemAt(j)
+        if item is None:
+            continue
+        wid = item.widget()
+        if wid is not None and wid.isVisible():
+            heights.append(wid.heightForWidth(inner)
+                           if wid.hasHeightForWidth()
+                           else wid.sizeHint().height())
+        elif item.layout() is not None:
+            heights.append(item.layout().sizeHint().height())
+    if not heights:
+        return row.sizeHint().height()
+    return max(m.top() + m.bottom()
+               + sum(heights) + lay.spacing() * (len(heights) - 1),
+               row.sizeHint().height())
+
+
+class FittingList(QListWidget):
+    """行宽始终等于视口宽的列表。
+
+    QListWidget 是按 itemWidget 的 sizeHint 定行大小的，而开了 wordWrap 的
+    QLabel，它的 sizeHint 宽度是「整句不折行需要多宽」—— 于是把左栏拖窄之后
+    行仍然是原来的宽，列表横向滚动条又是关掉的，文字就被裁掉而不是折行。
+    这里在每次尺寸变化时把行宽钉回视口宽，再按这个真实宽度量一次高度。
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def fit_rows(self) -> None:
+        # QListView 把行控件摆在 item 矩形里偏 (1,1) 的位置，宽高各再少 1：
+        # 按视口全宽去量会少算一截，最后一行正好被裁掉
+        w = max(self.viewport().width() - 2, 58)
+        for i in range(self.count()):
+            it = self.item(i)
+            row = self.itemWidget(it)
+            if row is None:
+                continue
+            # 已经按这个宽度量过的行跳过：拖着分割条时每帧重排整列会发涩。
+            # 判据里带上 item 的 sizeHint 宽度，所以重新填过列表（新行没定过宽）
+            # 和视口变宽变窄都会重新量，不会因为缓存漏掉。
+            if (it.sizeHint().width() == w + 2
+                    and row.minimumWidth() == w and row.maximumWidth() == w):
+                continue
+            row.setFixedWidth(w)
+            it.setSizeHint(QSize(w + 2, _height_at(row, w) + 2))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.fit_rows()
+
+
 class Card(QFrame):
     """圆角卡片容器。"""
 
@@ -298,25 +377,42 @@ class Card(QFrame):
 
 
 class StatCard(Card):
-    """顶部统计卡片。"""
+    """顶部统计卡片。mini=True 时是挂在页面大标题那一行的小胶囊：
+    数字和文字横排、贴着内容宽，不再独占一整排。"""
 
     def __init__(self, label: str, value: str = "0", accent: str = "accent",
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, mini: bool = False):
         super().__init__(parent=parent)
-        self.body().setSpacing(4)
+        self._mini = mini
+        self._base_size = 16 if mini else 26
+        if mini:
+            self._layout.setContentsMargins(10, 4, 10, 5)
+            self._layout.setSpacing(0)
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            self._layout.addLayout(row)
+            # Maximum：不抢标题行 stretch 的空间，但窄到放不下时可以缩
+            self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        else:
+            row = self._layout
+            self._layout.setSpacing(4)
         self.value_lbl = QLabel(value)
-        self.value_lbl.setObjectName("StatValue")
+        # 小胶囊故意不走 #StatValue：那条规则带了 color，而 ID 选择器压过
+        # [statColor=...] 属性选择器，写在那儿会让强调色永远不生效
+        self.value_lbl.setObjectName("MiniValue" if mini else "StatValue")
         _apply_property(self.value_lbl, "statColor", accent)
         self.label_lbl = QLabel(label)
-        self.label_lbl.setObjectName("StatLabel")
-        self.body().addWidget(self.value_lbl)
-        self.body().addWidget(self.label_lbl)
+        self.label_lbl.setObjectName("MiniLabel" if mini else "StatLabel")
+        row.addWidget(self.value_lbl)
+        row.addWidget(self.label_lbl)
 
     def set_value(self, value: str) -> None:
         self.value_lbl.setText(value)
+        if self._mini:
+            return          # 16px 的数字撑不爆胶囊，不用降字号
         # 数字过长时逐级降字号，避免被截断
         n = len(value)
-        size = 26
+        size = self._base_size
         if n > 13:
             size = 17
         elif n > 10:
@@ -324,7 +420,7 @@ class StatCard(Card):
         elif n > 8:
             size = 23
         self.value_lbl.setStyleSheet(
-            "" if size == 26 else f"font-size: {size}px;")
+            "" if size == self._base_size else f"font-size: {size}px;")
 
     def set_label(self, label: str) -> None:
         self.label_lbl.setText(label)

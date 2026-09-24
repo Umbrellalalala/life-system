@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -242,7 +243,7 @@ class StickyNote(QFrame):
         for w in (self.title, self.note):
             w.blockSignals(False)
         self.check.blockSignals(True)
-        self.check.set_checked(bool(t["done"]))
+        self.check.set_checked(self._is_done(t))
         self.check.set_priority(int(t.get("priority") or 0))
         self.check.blockSignals(False)
         due = t.get("due_date") or ""
@@ -259,9 +260,22 @@ class StickyNote(QFrame):
         for fn in list(_LISTENERS):
             fn(self._id)
 
+    def _today(self) -> str:
+        return date.today().isoformat()
+
+    def _is_done(self, t: dict) -> bool:
+        """重复任务的勾记在「哪一周期」上，`todos.done` 那一位从来不动。
+        所以直接读 t["done"] 会画成永远没勾上 —— 用户看着就是「勾了弹回来」。"""
+        if not (t.get("repeat") or "").strip():
+            return bool(t["done"])
+        return any(r["done"] for r in services.cal_occurrences(self._today(),
+                                                              self._today())
+                   if r["id"] == self._id)
+
     def _on_check(self, checked: bool) -> None:
-        # occ_set_done 自己区分「重复系列的某个周期」和「普通任务」
-        services.occ_set_done(self._id, "", checked)
+        # 周期日不能传空串：occ_set_done 会写出一条 occ_date='' 的例外，
+        # 而日历/统计只按真实日期查例外，那个勾就成了谁也看不见的死数据。
+        services.occ_set_done(self._id, self._today(), checked)
         self.pull()
 
     # ---- 无边框窗口要自己拖 ----

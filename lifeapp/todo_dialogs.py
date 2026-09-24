@@ -11,15 +11,24 @@ from PySide6.QtGui import QConicalGradient, QColor, QPainter
 from PySide6.QtWidgets import (
     QDialog, QWidget, QFrame, QLabel, QLineEdit, QPushButton, QComboBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QCheckBox, QRadioButton, QButtonGroup,
-    QSizePolicy,
+    QSizePolicy, QScrollArea,
 )
 
-from . import services, theme, widgets
-from .todo_icons import TickIcon, ColorDot
+from . import popups, services, theme, widgets
+from .todo_icons import TickIcon, ColorDot, emoji_text, is_emoji_icon
 
 # 清单可选图标（都是 todo_icons 里已有的线性图标名）
 LIST_ICONS = ["list", "folder", "tag", "flag", "calendar", "inbox", "archive",
               "habit", "note", "clock", "filter", "pin"]
+# 常用 emoji 备选（和主窗口左侧模块栏那套 🔬/🧩/🗣 同一类画法）。
+# 分四组，一组一个标题；每组 16 个 = 图标弹层里八列两行。
+ICON_COLS = 8
+LIST_EMOJI_GROUPS = [
+    ("学习 / 科研", ["📚", "📖", "✏", "📝", "🧠", "🔬", "🧪", "🗣", "💡", "🎓", "🧩", "📐", "🧮", "🔖", "⌨", "🗃"]),
+    ("工作 / 项目", ["💼", "📅", "⏰", "🎯", "📌", "🗂", "✉", "🧾", "📊", "📈", "🤝", "🛠", "🖥", "💻", "🗒", "📋"]),
+    ("生活 / 日常", ["🏠", "🍜", "☕", "🧹", "🐱", "🛒", "👕", "🧳", "🚗", "🎬", "🎧", "🍎", "💰", "🎂", "🌧", "✈"]),
+    ("运动 / 健康", ["🏃", "🏋", "🚴", "🏊", "🧘", "❤", "🦷", "💧", "🌞", "🌙", "💤", "🍌", "🚭", "📵", "💊", "🏸"]),
+]
 # 调色板：第 0 个是「无颜色」，最后一个是滴答的「彩色」渐变项
 SWATCHES = ["", "#f0435f", "#ed9a12", "#e8c33a", "#0db987",
             "#3d8bff", "#8b5cf6", "gradient"]
@@ -230,6 +239,99 @@ class _BaseDialog(QDialog):
         self._ok_btn.setEnabled(on)
 
 
+class _IconCell(QPushButton):
+    """图标格：emoji 直接当按钮文字（系统彩色字体），线性图标挂一枚 TickIcon。"""
+
+    def __init__(self, value: str, tip: str = "", parent=None):
+        super().__init__(parent)
+        self.value = value
+        self.setObjectName("IconCell")
+        self.setFixedSize(30, 30)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tip or value)
+        widgets._apply_property(self, "on", "false")
+        if is_emoji_icon(value):
+            self.setText(emoji_text(value))
+        else:
+            self.ic = TickIcon(value, 16, "text", self)
+            self.ic.move(7, 7)
+            self.ic.show()
+
+    def set_on(self, on: bool) -> None:
+        widgets._apply_property(self, "on", "true" if on else "false")
+
+
+class ListIconPopup(popups.PopupCard):
+    """清单图标选择器：线性图标 + 常用 emoji + 自己输入一个。
+
+    原来只有一列 12 个线性图标，想给清单挂个 🔬 / 🧩 那种和主窗口左侧模块栏
+    一样的标记根本没有入口，所以这里既给一批常用 emoji，也留一个输入框。
+    """
+
+    picked = Signal(str)
+
+    def __init__(self, current: str = "list", parent=None):
+        # 282 = 8 列 × 30 + 7 × 6 间距；PopupCard 再按这个数加阴影宽
+        super().__init__(parent, 282 + 28)
+        self._cells: dict[str, _IconCell] = {}
+        self.lay.setSpacing(7)
+        holder = QScrollArea()
+        holder.setWidgetResizable(True)
+        holder.setFrameShape(QFrame.NoFrame)
+        holder.setFixedHeight(232)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+        row = 0
+        for cap, values in (("线性", LIST_ICONS), *LIST_EMOJI_GROUPS):
+            lbl = QLabel(cap)
+            lbl.setObjectName("IconGroupCap")
+            grid.addWidget(lbl, row, 0, 1, ICON_COLS)
+            row += 1
+            for i, v in enumerate(values):
+                cell = _IconCell(v, parent=inner)
+                self._cells[v] = cell
+                cell.clicked.connect(lambda _c=False, x=v: self._pick(x))
+                grid.addWidget(cell, row + i // ICON_COLS, i % ICON_COLS)
+            row += (len(values) + ICON_COLS - 1) // ICON_COLS
+        holder.setWidget(inner)
+        self.lay.addWidget(holder)
+
+        line = QFrame()
+        line.setObjectName("Hairline")
+        line.setFixedHeight(1)
+        self.lay.addWidget(line)
+        custom = QHBoxLayout()
+        custom.setSpacing(6)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("输入 / 粘贴任意 emoji")
+        self.edit.returnPressed.connect(self._commit_custom)
+        custom.addWidget(self.edit, 1)
+        btn = QPushButton("用这个")
+        btn.setObjectName("Ghost")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(self._commit_custom)
+        custom.addWidget(btn)
+        self.lay.addLayout(custom)
+        self.set_current(current)
+
+    def set_current(self, value: str) -> None:
+        for k, cell in self._cells.items():
+            cell.set_on(k == value)
+
+    def _pick(self, value: str) -> None:
+        self.picked.emit(value)
+        self._accept(value)
+
+    def _commit_custom(self) -> None:
+        # emoji 可能带变体选择符 / 零宽连接（👨‍👩‍ 是 5 个码位），按字素切太讲究，
+        # 截前 4 个码位足够覆盖常用的那些
+        text = self.edit.text().strip()[:4]
+        if text:
+            self._pick(text)
+
+
 class ListDialog(_BaseDialog):
     """添加 / 编辑清单：名称 + 图标 + 颜色 + 视图 + 文件夹 + 类型 + 预览。"""
 
@@ -279,7 +381,7 @@ class ListDialog(_BaseDialog):
         self._view_btns: dict[str, QPushButton] = {}
         for kind, icon, lab in (("list", "list", "列表视图"),
                                 ("kanban", "board", "看板视图"),
-                                ("timeline", "timeline", "时间线视图（暂未支持）")):
+                                ("timeline", "timeline", "时间线视图（甘特）")):
             b = QPushButton()
             b.setObjectName("SegTab")
             b.setCheckable(True)
@@ -287,16 +389,13 @@ class ListDialog(_BaseDialog):
             b.setCursor(Qt.PointingHandCursor)
             b.setToolTip(lab)
             TickIcon(icon, 15, "text", b).move(16, 8)
-            if kind == "timeline":
-                # 时间线整个应用里都没有，就让它一直是灰的；以前连看板一起灰着，
-                # 结果这排按钮看着像三个都不能点
-                b.setEnabled(False)
-            else:
-                b.clicked.connect(lambda _c=False, k=kind: self._pick_view(k))
+            b.clicked.connect(lambda _c=False, k=kind: self._pick_view(k))
             self.view_group.addButton(b)
             self._view_btns[kind] = b
             vl.addWidget(b)
         self._init_view = (list_row or {}).get("view_kind") or "list"
+        if self._init_view not in self._view_btns:
+            self._init_view = "list"
         self._view_btns[self._init_view].setChecked(True)
         vl.addStretch(1)
         fl.addLayout(_field_row("视图", vw))
@@ -347,8 +446,10 @@ class ListDialog(_BaseDialog):
         pv.addLayout(head)
         self._pv_list = self._pv_rows()
         self._pv_board = self._pv_columns()
+        self._pv_time = self._pv_bars()
         pv.addWidget(self._pv_list)
         pv.addWidget(self._pv_board)
+        pv.addWidget(self._pv_time)
         pv.addStretch(1)
         body.addWidget(self.preview)
 
@@ -386,6 +487,36 @@ class ListDialog(_BaseDialog):
             v.addLayout(r)
         return box
 
+    def _pv_bars(self) -> QWidget:
+        """时间线（甘特）视图的样子：一条日期刻度 + 几根错开的横条。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(7)
+        axis = QHBoxLayout()
+        axis.setContentsMargins(0, 0, 0, 0)
+        axis.setSpacing(0)
+        for d in ("22", "23", "24", "25"):
+            cell = QLabel(d)
+            cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cell.setStyleSheet("color: %s; font-size: 10px;" % _c("muted"))
+            axis.addWidget(cell, 1)
+        v.addLayout(axis)
+        for off, span in ((0, 2), (1, 1), (2, 2)):
+            r = QHBoxLayout()
+            r.setContentsMargins(0, 0, 0, 0)
+            r.setSpacing(0)
+            if off:
+                r.addSpacing(off * 52)
+            bar = QFrame()
+            bar.setFixedSize(span * 52 - 6, 16)
+            bar.setStyleSheet("background: %s; border: none; border-radius: 4px;"
+                              % _c("accent"))
+            r.addWidget(bar)
+            r.addStretch(1)
+            v.addLayout(r)
+        return box
+
     def _pv_columns(self) -> QWidget:
         """看板视图的样子：三列小卡片。"""
         box = QWidget()
@@ -414,8 +545,9 @@ class ListDialog(_BaseDialog):
         return box
 
     def _pv_show(self, kind: str) -> None:
-        self._pv_list.setVisible(kind != "kanban")
+        self._pv_list.setVisible(kind == "list")
         self._pv_board.setVisible(kind == "kanban")
+        self._pv_time.setVisible(kind == "timeline")
 
     def _pick_view(self, kind: str) -> None:
         self._pv_show(kind)
@@ -423,18 +555,22 @@ class ListDialog(_BaseDialog):
     def _repaint_icon_btn(self) -> None:
         for ch in self.icon_btn.findChildren(TickIcon):
             ch.deleteLater()
-        ic = TickIcon(self._icon_kind, 16, "muted", self.icon_btn)
-        if self._icon_color:
+        emoji = is_emoji_icon(self._icon_kind)
+        # emoji 走系统彩色字体，给它比线性图标大一号、并且不吃清单的自定义色
+        size = 20 if emoji else 16
+        ic = TickIcon(self._icon_kind, size, "muted", self.icon_btn)
+        if self._icon_color and not emoji:
             ic.set_color_hex(self._icon_color)
-        ic.move(7, 7)
+        ic.move((self.icon_btn.width() - size) // 2,
+                (self.icon_btn.height() - size) // 2)
         ic.show()
 
     def _pick_icon(self) -> None:
-        from .pages.todo import TickMenu
-        items = [(k, k, k) for k in LIST_ICONS]
-        menu = TickMenu(items, self, checked=self._icon_kind)
-        menu.picked.connect(self._on_icon)
-        menu.exec_at(self.icon_btn.mapToGlobal(QPoint(0, self.icon_btn.height())))
+        pop = ListIconPopup(self._icon_kind, self)
+        pop.picked.connect(self._on_icon)
+        self._icon_popup = pop        # 局部变量的话会被 Python 提前回收
+        popups.place_popup(pop, self.icon_btn)
+        pop.show()
 
     def _on_icon(self, kind: object) -> None:
         self._icon_kind = str(kind)

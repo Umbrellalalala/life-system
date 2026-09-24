@@ -935,6 +935,13 @@ class WeightPage(QWidget):
         return rec["weight"] - data[idx - 1]["weight"]
 
     def _update_list(self, data: list[dict]) -> None:
+        if not data:
+            # 一条都没有时要留一句话：这块地方空着，看着像界面坏了，
+            # 而不像「还没有记录」。按钮名字和顶上那颗对齐。
+            empty = QLabel("还没有体重记录，点上面「＋ 记录体重」记第一条。")
+            empty.setObjectName("Muted")
+            self.list_layout.insertWidget(self.list_layout.count() - 1, empty)
+            return
         for d in reversed(data[-50:]):
             row = widgets.Card()
             lay = row.body()

@@ -32,6 +32,10 @@ class _Reapply(QObject):
 
 # 滴答这几张卡里的「蓝」实测是 #4772fa，和全局色板的 accent（#00a5ff，偏青）
 # 不是一回事。accent 换掉会影响全应用，所以这里按模块局部取色。
+SUB_ROW_H = 40        # 卡片里子任务一行多高（含发丝分隔线）
+SUB_MAX_ROWS = 4      # 最多露几行，其余在列表里滚
+
+
 def tick_blue() -> str:
     return "#8ba3ff" if theme.is_dark() else "#4772fa"
 
@@ -238,8 +242,17 @@ QLineEdit#CardTitle {{ border: none; font-size: 17px; font-weight: 700;
 QTextEdit#CardDesc {{ border: none; font-size: 13.5px; color: {g('text')}; padding: 0; }}
 QFrame#CardDetail {{ background: transparent; border: none; }}
 QListWidget#CardSubList {{ background: transparent; border: none; }}
-QListWidget#CardSubList::item {{ min-height: 26px; border-radius: 6px; padding: 0 4px; }}
-QListWidget#CardSubList::item:hover {{ background: {g('surface_hi')}; }}
+/* 滴答的子任务是一行一行带发丝分隔线的，不是带圆角高亮的列表块 */
+QListWidget#CardSubList::item {{
+    min-height: {SUB_ROW_H - 6}px; border-bottom: 1px solid {grid};
+    border-radius: 0; padding: 0 2px; color: {g('text')}; font-size: 14px; }}
+QListWidget#CardSubList::item:last {{ border-bottom: none; }}
+QLabel#CardSubCount, QLabel#CardSubCountText {{
+    font-size: 13px; color: {g('muted')}; background: transparent; border: none; }}
+QLabel#CardSubCountText {{ padding-right: 6px; }}
+QLabel#CardLocked {{
+    font-size: 12.5px; color: {g('muted')}; background: {g('surface_hi')};
+    border-radius: 8px; padding: 6px 9px; }}
 QLineEdit#CardSubAdd {{ border: none; font-size: 13.5px; padding: 4px 0; color: {g('text')}; }}
 QPushButton#CardListBtn {{
     background: transparent; border: none; border-radius: 8px;

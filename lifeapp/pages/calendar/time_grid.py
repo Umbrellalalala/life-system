@@ -203,6 +203,10 @@ class TimeBlock(QFrame):
             return
         if self._press is not None and \
                 (p - self._press).manhattanLength() > 8:
+            self._press = None
+            if model.trainer_drag_blocked(self.row,
+                                          event.globalPosition().toPoint()):
+                return
             mime = QMimeData()
             mime.setData(model.MIME_CAL,
                          f"{self.row['id']}|{self.row['occ']}".encode())
@@ -210,7 +214,6 @@ class TimeBlock(QFrame):
             drag = QDrag(self)
             drag.setMimeData(mime)
             drag.exec(Qt.CopyAction)
-            self._press = None
         super().mouseMoveEvent(event)
 
 
@@ -359,9 +362,15 @@ class TimeCanvas(_CanvasBase):
         self.setMinimumHeight(HOUR_H * 24)
 
     def _slot_at(self, y: int) -> str:
-        """y → 就近的半点时间。"""
-        mins = int(max(0.0, min(23.99, y / HOUR_H * 60)) / 30) * 30
-        return f"{mins // 60:02d}:{mins % 60:02d}"
+        """y → 就近的半点时间。
+
+        夹的是分钟上限（24 小时 = 1440 分）。原来写成 min(23.99, ...) 把分钟
+        夹在「小时」量级上，HOUR_H=58 下 y≥24px 一律落到 23.99 分 → 永远返回
+        00:00：日/周视图点下午的空白新建、把色块拖到下午，时间全被抹成零点。
+        """
+        mins = max(0.0, min(24 * 60 - 1, y / HOUR_H * 60))
+        slot = min(int(round(mins / 30) * 30), 23 * 60 + 30)
+        return f"{slot // 60:02d}:{slot % 60:02d}"
 
     def relayout(self) -> None:
         self._clear_kids()

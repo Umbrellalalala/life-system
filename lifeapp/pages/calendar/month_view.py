@@ -90,6 +90,10 @@ class TaskBar(QFrame):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._press is not None and \
                 (event.position().toPoint() - self._press).manhattanLength() > 8:
+            if model.trainer_drag_blocked(self.row,
+                                          event.globalPosition().toPoint()):
+                self._press = None
+                return
             self._start_drag()
             self._press = None
         super().mouseMoveEvent(event)

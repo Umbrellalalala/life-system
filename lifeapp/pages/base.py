@@ -22,11 +22,17 @@ class Page(QWidget):
         outer.setContentsMargins(28, 24, 28, 24)
         outer.setSpacing(16)
 
-        # 头部
+        # 头部：大标题独占一行，右边留位给页面挂东西（例如缩小的统计胶囊）
+        self._header: QHBoxLayout | None = None
         if not bare:
+            head = QHBoxLayout()
+            head.setSpacing(10)
             title_lbl = QLabel(title)
             title_lbl.setObjectName("PageTitle")
-            outer.addWidget(title_lbl)
+            head.addWidget(title_lbl)
+            head.addStretch(1)
+            outer.addLayout(head)
+            self._header = head
             if subtitle:
                 sub = QLabel(subtitle)
                 sub.setObjectName("PageSubtitle")
@@ -49,6 +55,10 @@ class Page(QWidget):
 
     def body(self) -> QVBoxLayout:
         return self._layout
+
+    def header(self) -> QHBoxLayout | None:
+        """大标题所在那一行（bare 页没有）。末尾是 stretch，直接 addWidget 就贴右。"""
+        return self._header
 
 
 def stats_row(cards: list[widgets.StatCard]) -> QHBoxLayout:

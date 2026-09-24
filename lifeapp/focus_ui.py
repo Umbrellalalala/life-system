@@ -1406,13 +1406,17 @@ class MiniTrend(QWidget):
     """
 
     def __init__(self, style: str = "line", unit: str = "count",
-                 zoom: bool = False, parent: QWidget | None = None):
+                 zoom: bool = False, divisions: int = 6,
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self._style = style
         self._unit = unit
         # zoom：y 轴贴着数据范围画（成就值那种「累计分」几乎是一条平线，
         # 从 0 起画的话涨的那点全压在最顶上看不见）。默认从 0 起。
         self._zoom = zoom
+        # 网格几格：常用专注页那张柱状图参考图只画 3 格（0/20m/40m/1h），
+        # 6 格会把标签挤成一列小字。
+        self._divisions = divisions
         self._values: list[float] = []
         self._labels: list[str] = []
         self._highlight = -1
@@ -1473,9 +1477,10 @@ class MiniTrend(QWidget):
         if self._unit == "percent":
             return 100.0, 20.0
         # 计数轴的地板值取 1（4 个任务就该是 0~5 的轴，而不是被时长轴的
-        # floor=20 拉成 0~25）；时长轴留 5 分钟地板，全 0 时也是 0~5m。
-        floor = 1.0 if self._unit == "count" else 5.0
-        return _nice_axis(vmax, 6, floor)
+        # floor 拉成 0~25）；时长轴地板取一小时——全 0 的时候参考图也是
+        # 画到 1h，画到 5m 会让整张图看起来像坏了。
+        floor = 1.0 if self._unit == "count" else 60.0
+        return _nice_axis(vmax, self._divisions, floor)
 
     def _fmt(self, v: float) -> str:
         if self._unit == "percent":

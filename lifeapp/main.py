@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QProgressBar,
 )
 
-from . import config, db, services, sounds, theme
+from . import config, db, popups, services, sounds, theme
 from .main_window import MainWindow
 
 
@@ -53,9 +53,13 @@ class SplashScreen(QWidget):
         lay.addWidget(self.bar)
 
         card.addWidget(inner)
+        # 这张卡是在 apply_immediate 之后建的（main 里第 131 行在前、146 行在后），
+        # 所以取色拿得到当前主题。写死 #ffffff 的话，夜间模式每次启动都先闪一块
+        # 白底 + 浅色标题字，等于白字写在白纸上。
         self.setStyleSheet(
-            "QWidget#SplashInner { background: #ffffff;"
-            " border: 1px solid #e6e8f0; border-radius: 14px; }"
+            "QWidget#SplashInner { background: %s; border: 1px solid %s;"
+            " border-radius: 14px; }" % (theme.get("surface"),
+                                         theme.get("border"))
         )
 
     def set_message(self, text: str) -> None:
@@ -95,6 +99,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Life System")
     app.setFont(QFont("Microsoft YaHei UI", 10))
+    # 文本框右键一律走应用自己的那套菜单（系统的是英文的、也不跟主题变色）
+    popups.install_edit_menu_guard(app)
 
     # 单实例：已有实例在运行时，唤起它并让本实例退出。
     # LifeSystem 是托盘常驻应用，点 × 只缩到托盘，用户再次双击 exe 很容易误开

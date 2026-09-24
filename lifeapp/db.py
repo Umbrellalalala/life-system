@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -35,9 +36,12 @@ CREATE TABLE IF NOT EXISTS todos (
     deleted_at TEXT DEFAULT '',        -- 非空=在垃圾桶里（软删除时间）
     archived INTEGER DEFAULT 0,        -- 归档：不在常规视图出现
     duration_min INTEGER DEFAULT 0,    -- 时长（分钟），时间轴视图排块用
+    end_date TEXT DEFAULT '',          -- 持续时间段：截止日，空=到日即止的单点任务
+    end_time TEXT DEFAULT '',          -- 持续时间段的结束时刻 HH:MM
     pinned INTEGER DEFAULT 0,          -- 置顶：排在进行中的最前面
     abandoned INTEGER DEFAULT 0,       -- 放弃：不做了，既不算完成也不算未完成
-    sticky INTEGER DEFAULT 0           -- 便签开着：重启后自动把便签窗放回来
+    sticky INTEGER DEFAULT 0,          -- 便签开着：重启后自动把便签窗放回来
+    pomo_plan INTEGER DEFAULT 0        -- 预计番茄数（右键「开始专注 › 预计番茄」）
 );
 
 CREATE TABLE IF NOT EXISTS todo_lists (
@@ -207,12 +211,15 @@ CREATE TABLE IF NOT EXISTS algo_writes (
     note TEXT DEFAULT ''
 );
 
--- 复习点 ↔ 待办 一一对应。todo_id 是排期落地的凭据：勾掉了哪条待办，
--- 才知道该按「独立/不独立」重排下一档，也才不会重复建待办。
+-- 复习点 ↔ 待办子任务 一一对应。排期落地的凭据在这里：
+-- 一天一门课只在清单里挂一条大任务（todo_id），这天的题目各是它的一条子任务
+-- （subtask_id）。勾掉哪条子任务，才知道该按「独立/不独立」重排下一档。
+-- 早期版本是一题一条独立待办，所以 todo_id 单靠自身不再能定位到某一题。
 CREATE TABLE IF NOT EXISTS algo_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     problem_id INTEGER NOT NULL,
     todo_id INTEGER NOT NULL DEFAULT 0,
+    subtask_id INTEGER DEFAULT 0,
     stage INTEGER DEFAULT 0,
     due_date TEXT DEFAULT '',
     status TEXT DEFAULT 'open',        -- open/done_indep/done_struggle/dropped
@@ -269,11 +276,12 @@ CREATE TABLE IF NOT EXISTS interview_attempts (
     decision TEXT DEFAULT 'skip'         -- correct/incorrect/skip
 );
 
--- 复习点 ↔ 待办。与算法复习各用各的清单，互不干扰。
+-- 复习点 ↔ 待办子任务。与算法复习各用各的清单，互不干扰。
 CREATE TABLE IF NOT EXISTS interview_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     problem_id INTEGER NOT NULL,
     todo_id INTEGER NOT NULL DEFAULT 0,
+    subtask_id INTEGER DEFAULT 0,
     stage INTEGER DEFAULT 0,
     due_date TEXT DEFAULT '',
     status TEXT DEFAULT 'open',
@@ -354,22 +362,63 @@ CREATE TABLE IF NOT EXISTS notified (
 """
 
 
+_conn_local = threading.local()
+
+
+def invalidate_connection() -> None:
+    """丢掉当前线程缓存的连接。
+
+    数据库文件被整体换掉时必须调用（恢复备份、隔离损坏库），否则缓存连接还指着
+    旧文件句柄。只影响本线程 —— 这条路径都在启动/设置页的 GUI 线程上，其它线程
+    各自持有自己的连接，下次进入 connect() 时会自然重建。
+    """
+    conn = getattr(_conn_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _conn_local.conn = None
+    _conn_local.path = None
+
+
 @contextmanager
 def connect():
-    conn = sqlite3.connect(config.db_path())
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    # 并发写不立即报错，等待锁释放（最多 5 秒）
-    conn.execute("PRAGMA busy_timeout = 5000")
+    """线程内复用一条 SQLite 连接。
+
+    以前每条语句开一次连接：一次待办页 reload 实测 53 次，光 connect/close 加两条
+    PRAGMA 就白付 ~130ms。sqlite3 默认 check_same_thread，跨线程共用会直接报错，
+    所以缓存必须做成线程局部。
+
+    刻意保持不变的语义：
+    - 只有最外层 with 块结束才 commit，异常时回滚并继续上抛；内层不参与提交，
+      这样将来万一有人写出嵌套调用，不会静默把外层的半成品提交掉；
+    - 每次进入都是新的读事务 —— WAL 下读快照以事务为界而不是以连接为界，
+      所以别的进程提交的改动照样能读到，不会因为连接变长命而看到旧数据。
+    """
+    path = config.db_path()
+    conn = getattr(_conn_local, "conn", None)
+    if conn is None or getattr(_conn_local, "path", None) != path:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        # 并发写不立即报错，等待锁释放（最多 5 秒）
+        conn.execute("PRAGMA busy_timeout = 5000")
+        _conn_local.conn = conn
+        _conn_local.path = path
+    depth = getattr(_conn_local, "depth", 0)
+    _conn_local.depth = depth + 1
     try:
         yield conn
-        conn.commit()
+        if depth == 0:
+            conn.commit()
     except Exception:
         # 事务内出错回滚，避免半写状态污染数据；异常继续上抛交由调用方处理
-        conn.rollback()
+        if depth == 0:
+            conn.rollback()
         raise
     finally:
-        conn.close()
+        _conn_local.depth = depth
 
 
 def _ensure_columns(conn, table: str, cols: dict) -> None:
@@ -378,6 +427,42 @@ def _ensure_columns(conn, table: str, cols: dict) -> None:
     for name, decl in cols.items():
         if name not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate_list_icons(conn) -> None:
+    """把三张和主窗口模块同名的清单，图标换成模块栏那三个 emoji（🔬/🧩/🗣）。
+
+    一次性：跑过就在 settings 里记标记。只动 icon 仍是默认线性图标的行，
+    用户后来自己挑过 emoji 的清单不会被盖掉。
+    """
+    if conn.execute("SELECT 1 FROM settings WHERE key='list_icons_seeded'").fetchone():
+        return
+    for name, emoji in (("科研DDL", "\U0001F52C"),
+                        ("算法复习", "\U0001F9E9"),
+                        ("八股复习", "\U0001F5E3")):
+        conn.execute("UPDATE todo_lists SET icon = ? "
+                     "WHERE name = ? AND icon IN ('', 'list')", (emoji, name))
+    conn.execute("INSERT INTO settings(key, value) VALUES('list_icons_seeded', '1')")
+
+
+def _migrate_checks_default(conn) -> None:
+    """把「显示检查事项」这个偏好翻成开，只翻一次。
+
+    这个开关刚做出来时默认是关的，行内子任务在列表里根本看不见，
+    一条任务有几个勾选项只能点开详情才知道。现在改成默认摊开（最多三条），
+    但老库里存着的 '0' 会盖住新默认值 —— 用户没主动选过的东西不该让他重新点一遍，
+    所以这里改写一次；之后他自己在 ⋯ 菜单里怎么关都不再动。
+    """
+    if conn.execute("SELECT 1 FROM settings WHERE key='checks_default_on'"
+                    ).fetchone():
+        return
+    row = conn.execute("SELECT value FROM settings WHERE key='todo_show_checks'"
+                       ).fetchone()
+    if row is None or row["value"] == "0":
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                     "VALUES('todo_show_checks', '1')")
+    conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                 "VALUES('checks_default_on', '1')")
 
 
 def _migrate_research_route(conn) -> None:
@@ -415,9 +500,13 @@ def init_db() -> None:
             "deleted_at": "TEXT DEFAULT ''",
             "archived": "INTEGER DEFAULT 0",
             "duration_min": "INTEGER DEFAULT 0",
+            "end_date": "TEXT DEFAULT ''",
+            "end_time": "TEXT DEFAULT ''",
             "pinned": "INTEGER DEFAULT 0",
             "abandoned": "INTEGER DEFAULT 0",
             "sticky": "INTEGER DEFAULT 0",
+            # 右键菜单「开始专注 › 预计番茄」：这条打算用几个番茄做完（0=没设）
+            "pomo_plan": "INTEGER DEFAULT 0",
         })
         _ensure_columns(conn, "todo_lists", {
             "color": "TEXT DEFAULT ''",
@@ -433,6 +522,10 @@ def init_db() -> None:
             "parent_id": "INTEGER DEFAULT 0",
             "sort_order": "INTEGER DEFAULT 0",
         })
+        # 复习从「一题一条待办」改成「一天一条 + 题目做子任务」，
+        # 旧库的两张排期表要补上指向子任务的那一列。
+        for _t in ("algo_reviews", "interview_reviews"):
+            _ensure_columns(conn, _t, {"subtask_id": "INTEGER DEFAULT 0"})
         # 老库的 papers 表留着不删（历史数据），但代码已不再读写它：
         # 论文库改由 Arxiver 负责，这里只补课题需要的列。
         _ensure_columns(conn, "research", {
@@ -450,7 +543,12 @@ def init_db() -> None:
             "language": "TEXT DEFAULT 'cpp'",
             "idea": "TEXT DEFAULT ''",
         })
+        # 记录归属哪个「常用专注」（存 fav 的 id/uuid）。按 task 名归集不可靠：
+        # 改名、或两个常用专注关联了同名待办，统计就会串。老记录留空即「不属于任何常用专注」。
+        _ensure_columns(conn, "pomodoro", {"fav_id": "TEXT DEFAULT ''"})
         _migrate_research_route(conn)
+        _migrate_list_icons(conn)
+        _migrate_checks_default(conn)
         wcols = {r["name"] for r in conn.execute("PRAGMA table_info(weight)")}
         if "body_fat" not in wcols:
             conn.execute("ALTER TABLE weight ADD COLUMN body_fat REAL")
@@ -639,6 +737,8 @@ def restore_latest_backup() -> bool:
         src = os.path.join(backup_dir(), files[0])
         if not os.path.exists(src):
             return False
+        # 换库之前先丢掉缓存连接，否则它还指着要被覆盖的那个文件
+        invalidate_connection()
         # 恢复前清理残留的 WAL/SHM，避免旧日志污染恢复后的主库
         _clear_sidecars(config.db_path())
         shutil.copy2(src, config.db_path())

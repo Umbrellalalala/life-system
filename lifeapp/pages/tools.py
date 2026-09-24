@@ -25,9 +25,9 @@ import subprocess
 import sys
 import weakref
 
-from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtCore import QAbstractNativeEventFilter, QTimer, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .. import config, popups
 
@@ -81,6 +81,7 @@ if IS_WIN:
     from ctypes import wintypes
 
     _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
 
     # 用无符号 32 位处理窗口样式：WS_POPUP(0x80000000) 等高位若被解释为
     # 有符号负数，会让 GetWindowLongW 返回负值，进而在 reparent/restore 时
@@ -277,6 +278,77 @@ if IS_WIN:
         except Exception:  # noqa: BLE001
             pass
 
+    # ---- 点击内嵌窗口时替它抢键盘焦点 -------------------------------------
+    # 实测（_ime_repro/host.py：真鼠标点击 + GetGUIThreadInfo）：点内嵌窗口时
+    # 鼠标消息进得了子进程、子进程 Qt 自己的焦点也落到了它的输入框上，但 Win32
+    # 的 hwndFocus 仍是宿主的顶层窗口 —— 按键全进了本进程，表现就是
+    # 「内嵌的工具里打不了字、唤不起输入法」。
+    #
+    # 宿主控件上装 eventFilter 抓不到这一下：鼠标消息被子进程的 WndProc 消费，
+    # Qt 一次 MouseButtonPress 都收不到（实测计数恒为 0）。盯焦点变化也不行：
+    # 焦点本来就停在宿主顶层，点击时它压根没变，EVENT_OBJECT_FOCUS 一次都不发
+    # （SetWinEventHook 实测 cb=0）。
+    #
+    # 能收到的只有 WM_PARENTNOTIFY —— Windows 会把「有人点了你的子窗口」通知给
+    # 父窗口，wParam 低字是那条鼠标消息、lParam 是父窗口客户区坐标。
+    # 实测（_t_parentnotify.py）：点内嵌窗口时宿主侧收到
+    # WM_PARENTNOTIFY wParam=0x201(WM_LBUTTONDOWN) lParam=客户区(150,30)。
+    _WM_PARENTNOTIFY = 0x0210
+    _BUTTONDOWN = (0x0201, 0x0204, 0x0207)   # 左 / 右 / 中键按下
+
+    class _MSG(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                    ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                    ("time", wintypes.UINT), ("pt", wintypes.POINT)]
+
+    _MSG_PTR = ctypes.POINTER(_MSG)
+
+    class _ClickFocusFilter(QAbstractNativeEventFilter):
+        """把「点到了内嵌窗口」翻成一次 focus_child。
+
+        watch: client 句柄 -> (宿主容器 HWND, 宿主页面)。回调在每个 Windows 消息上
+        都要过一遍，所以先比消息号、再比 HWND，全程不做窗口查询。
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.watch: dict[int, tuple[int, object]] = {}
+
+        def nativeEventFilter(self, eventType, message):  # noqa: N802
+            if eventType != b"windows_generic_MSG":
+                return False, 0
+            try:
+                if self.watch:
+                    m = ctypes.cast(ctypes.c_void_p(int(message)), _MSG_PTR).contents
+                    if (m.message == _WM_PARENTNOTIFY
+                            and (int(m.wParam) & 0xFFFF) in _BUTTONDOWN):
+                        hwnd = int(m.hwnd or 0)
+                        for client, (wid, _host) in list(self.watch.items()):
+                            if hwnd == wid:
+                                # 延后一拍：宿主自己的激活流程还没走完，同步抢会被盖回去
+                                QTimer.singleShot(0, lambda c=client: focus_child(c))
+                                break
+            except Exception:  # noqa: BLE001
+                pass           # 这里抛异常会打断整个消息派发，只能吞
+            return False, 0
+
+    _click_focus: "_ClickFocusFilter | None" = None
+
+    def watch_focus(client: int, host) -> None:  # noqa: ANN001
+        """开始盯这个内嵌窗口的点击；第一次调用时挂上原生事件过滤器。"""
+        global _click_focus
+        app = QApplication.instance()
+        if app is None:
+            return
+        if _click_focus is None:
+            _click_focus = _ClickFocusFilter()
+            app.installNativeEventFilter(_click_focus)   # Qt 不持有所有权，模块级留引用
+        _click_focus.watch[client] = (getattr(host, "_host_wid", 0), host)
+
+    def unwatch_focus(client: int) -> None:
+        if _click_focus is not None:
+            _click_focus.watch.pop(client, None)
+
     def restore_window(hwnd: int) -> None:
         """退出内嵌：还原标题栏/边框并挂回桌面，作为独立窗口继续存活。
 
@@ -354,6 +426,12 @@ else:
         pass
 
     def focus_child(hwnd):  # noqa: ANN001
+        pass
+
+    def watch_focus(client, host):  # noqa: ANN001
+        pass
+
+    def unwatch_focus(client):  # noqa: ANN001
         pass
 
     def restore_window(hwnd):  # noqa: ANN001
@@ -553,17 +631,7 @@ class ToolEmbedHost(QWidget):
 
         self.host = QWidget()
         self.host.setObjectName("EmbedHost")
-        # 拦截 host 的鼠标事件，点击时把键盘焦点转给内嵌窗口（tkinter 输入框需要）
-        self.host.installEventFilter(self)
         root.addWidget(self.host, 1)
-
-    def eventFilter(self, obj, event):  # noqa: ANN001
-        """host 区域被点击时，把键盘焦点转给内嵌窗口，确保 tkinter 输入框可打字。"""
-        from PySide6.QtCore import QEvent
-        if obj is self.host and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
-            if self._hwnd and is_window(self._hwnd):
-                focus_child(self._hwnd)
-        return super().eventFilter(obj, event)
 
     # ---- 生命周期 ----
     def showEvent(self, event):  # noqa: ANN001
@@ -589,6 +657,7 @@ class ToolEmbedHost(QWidget):
         if self._embedded and self._hwnd and is_window(self._hwnd):
             # 窗口若已被工具自己 detach（如 Arxiver 点托盘弹出独立窗口），进入独立窗口模式
             if get_parent(self._hwnd) != int(self.host.winId()):
+                unwatch_focus(self._hwnd)
                 self._embedded = False
                 self._external = True
                 self.status.setText(f"{self.tool['name']} · 独立窗口")
@@ -675,7 +744,8 @@ class ToolEmbedHost(QWidget):
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
                 show_child(client)
                 self._resize_child()
-                # 嵌入后把键盘焦点交给子窗口，解决 tkinter 输入框无法打字的问题
+                # 嵌入后把键盘焦点交给子窗口，之后每次点击由 watch_focus 续上
+                watch_focus(client, self)
                 QTimer.singleShot(120, lambda: focus_child(client))
                 # 布局稳定后再补几次，确保完全填满
                 QTimer.singleShot(80, self._resize_child)
@@ -751,6 +821,7 @@ class ToolEmbedHost(QWidget):
                 self._stop_watch()
                 return
             if host_wid and get_parent(hwnd) != host_wid:
+                unwatch_focus(hwnd)
                 self._embedded = False
                 self._external = True
                 self.status.setText(f"{self.tool['name']} · 独立窗口")
@@ -796,6 +867,7 @@ class ToolEmbedHost(QWidget):
         hwnd = self._hwnd
         if not (hwnd and is_window(hwnd)):
             return
+        unwatch_focus(hwnd)
         wrapper = getattr(self, "_wrapper", None)
         if wrapper and is_window(wrapper):
             _orig_styles.pop(hwnd, None)  # client 不改样式，丢弃样式记录
@@ -855,6 +927,8 @@ class ToolEmbedHost(QWidget):
     def quit_tool(self, force: bool = False) -> None:
         """结束工具进程。先终止进程再清状态（不做还原，避免窗口闪一下再消失）。"""
         self._stop_watch()
+        if self._hwnd:
+            unwatch_focus(self._hwnd)   # 进程要没了，别让死句柄留在监视表里
         self._hwnd = None
         self._embedded = False
         self._external = False

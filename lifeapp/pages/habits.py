@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, QDate, Signal, QRectF
-from PySide6.QtGui import QColor, QPainter, QPainterPath
+from PySide6.QtCore import (Qt, QDate, QPoint, QMimeData, QTimer, Signal,
+                            QRectF)
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QDrag
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QLabel, QLineEdit,
     QPushButton, QComboBox, QCheckBox, QDialog, QScrollArea, QSpinBox,
-    QButtonGroup)
+    QButtonGroup, QApplication)
 
 from .. import db, popups, services, sounds, theme, widgets
 from ..focus_ui import RoundRadio
@@ -667,7 +668,7 @@ class HabitDialog(QDialog):
         self._popup = pop
         self._show_popup(pop, self.start_btn)
 
-    def _on_start(self, date: str, _time: str) -> None:
+    def _on_start(self, date: str, _time: str, *_rest) -> None:
         self.habit["start_date"] = date
         self._sync_values()
 
@@ -780,6 +781,7 @@ class HabitRow(QFrame):
     def __init__(self, habit: dict, checks: dict, selected: bool = False):
         super().__init__()
         self.habit = habit
+        self._press: QPoint | None = None
         self.setObjectName("HabitRow")
         self.setFixedHeight(54)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -861,8 +863,30 @@ class HabitRow(QFrame):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            self._press = event.position().toPoint()
             self.selected.emit(self.habit["id"])
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        # 按住拖出一段距离才起拖：不然单击选中都会被判成拖拽
+        if (self._press is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+                and (event.position().toPoint() - self._press).manhattanLength()
+                >= QApplication.startDragDistance()):
+            spot = self._press
+            self._press = None
+            self._start_drag(spot)
+        super().mouseMoveEvent(event)
+
+    def _start_drag(self, spot: QPoint) -> None:
+        mime = QMimeData()
+        mime.setData("application/x-life-habit", str(self.habit["id"]).encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pm = self.grab()
+        drag.setPixmap(pm)
+        drag.setHotSpot(spot)
+        drag.exec(Qt.DropAction.MoveAction)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         # 右键整行弹菜单，和滴答一致（它的习惯行没有别的右键语义）
@@ -1418,6 +1442,77 @@ class HabitDetail(QFrame):
 # ---------------------------------------------------------------------------
 # 整体两栏
 # ---------------------------------------------------------------------------
+class _RowsArea(QWidget):
+    """习惯行的容器：接拖拽、画插入线。
+
+    Windows 上的 QDrag 走 OLE、要真实光标移动才起得来，QTest 模拟不了整条链路，
+    所以这里只负责「把事件翻成 rows_holder 内的 y 坐标」，落点计算和落库都在
+    HabitPane 的方法上 —— 测试可以直接调那两个方法验算。
+    """
+
+    MIME = "application/x-life-habit"
+
+    def __init__(self, pane: "HabitPane", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.pane = pane
+        self.setAcceptDrops(True)
+        self.line = QFrame(self)
+        self.line.setObjectName("HabitDropLine")
+        self.line.setFixedHeight(2)
+        self.line.hide()
+
+    @staticmethod
+    def _drag_id(event) -> int | None:
+        m = event.mimeData()
+        if not m.hasFormat(_RowsArea.MIME):
+            return None
+        try:
+            return int(bytes(m.data(_RowsArea.MIME)).decode())
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _y(self, event) -> int:
+        return event.position().toPoint().y()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._drag_id(event) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        hid = self._drag_id(event)
+        if hid is None:
+            event.ignore()
+            return
+        self._show_line(self.pane._drop_target(self._y(event), hid))
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self.line.hide()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        hid = self._drag_id(event)
+        self.line.hide()
+        if hid is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        tgt = self.pane._drop_target(self._y(event), hid)
+        if tgt is not None:
+            group, before, _ = tgt
+            self.pane._apply_drop(hid, group, before)
+
+    def _show_line(self, target) -> None:
+        if target is None:
+            self.line.hide()
+            return
+        _, _, ly = target
+        self.line.setGeometry(0, ly, self.width(), 2)
+        self.line.show()
+        self.line.raise_()
+
+
 class HabitPane(QWidget):
     """习惯打卡两栏：左列表（坚持中/已归档）+ 右详情。"""
 
@@ -1482,7 +1577,7 @@ class HabitPane(QWidget):
         head.addWidget(self.more_btn)
         ll.addLayout(head)
 
-        self.rows_holder = QWidget()
+        self.rows_holder = _RowsArea(self)
         self.rows_lay = QVBoxLayout(self.rows_holder)
         self.rows_lay.setContentsMargins(0, 0, 0, 0)
         self.rows_lay.setSpacing(2)
@@ -1590,9 +1685,13 @@ class HabitPane(QWidget):
     def _set_tab(self, tab: str) -> None:
         self._tab = tab
         self._current_id = None
-        self.reload()
+        self.reload(keep_scroll=False)     # 换的是另一份清单，回顶部才对
 
-    def reload(self) -> None:
+    def reload(self, keep_scroll: bool = True,
+               reveal_id: int | None = None) -> None:
+        # 整表重建会把滚动条甩回顶部：新建 / 编辑 / 归档 / 挪顺序之后视野都跳走，
+        # 而新建的习惯一律排在最后，等于「点了保存什么都没发生」。
+        saved = self.scroll.verticalScrollBar().value()
         while self.rows_lay.count():
             it = self.rows_lay.takeAt(0)
             if it.widget():
@@ -1642,6 +1741,33 @@ class HabitPane(QWidget):
             self.detail.show_habit(habit)
         self._sync_panes()
 
+        # 几何要等下一帧布局跑完才定得下来，同帧滚是滚不动的
+        if reveal_id is not None:
+            self._reveal(reveal_id)
+        elif keep_scroll:
+            sb = self.scroll.verticalScrollBar()
+            QTimer.singleShot(0, lambda: sb.setValue(saved))
+        else:
+            sb = self.scroll.verticalScrollBar()
+            # 光靠「不恢复」是回不了顶的：Qt 在新范围仍然容得下旧值时会留着不动
+            QTimer.singleShot(0, lambda: sb.setValue(0))
+
+    def _reveal(self, habit_id: int) -> None:
+        """把某一习惯滚进视野。
+
+        试两次而不是一次：整表重建之后滚动范围还会再变一两帧（行高、分组标题的
+        padding、ElidedLabel 重新截字），实测第一次 ensureWidgetVisible 只滚到
+        当时的 max=944，随后范围涨到 1030，新行还是差一屏。
+        """
+        def once() -> None:
+            row = self._row_widgets.get(habit_id)
+            if row is None:
+                return
+            self.scroll.ensureWidgetVisible(row, 0, 60)
+
+        QTimer.singleShot(0, once)
+        QTimer.singleShot(140, once)
+
     def _select(self, habit_id: int) -> None:
         """换选中只翻两行的属性，不重建列表。
 
@@ -1660,6 +1786,44 @@ class HabitPane(QWidget):
         habit = services.habit_get(habit_id)
         self.detail.show_habit(habit)
         self._sync_panes()
+
+    # ---- 拖拽排序 ----
+    def _drop_target(self, y: int, dragging: int):
+        """光标在 rows_holder 内的 y 坐标 → ``(落到哪个组, 排在哪条之前, 插入线 y)``。
+
+        落点所属的组取「光标压在谁身上」那一行，不是取下一行 —— 不然瞄着某组
+        最后一行的下半段松手，会被判给下一组，白改一次分组。
+        组内落在上半段 = 插到它前面，下半段 = 插到它后面（也就是下一行前面；
+        下一行已经出了这个组，就顺延到本组末尾）。
+        """
+        lines = [self.rows_lay.itemAt(i).widget()
+                 for i in range(self.rows_lay.count())]
+        rows = [w for w in lines
+                if isinstance(w, HabitRow) and w.habit["id"] != dragging]
+        if not rows:
+            return None
+        for k, w in enumerate(rows):
+            rect = w.geometry()
+            g = str(w.habit.get("group_name") or "其他")
+            if y < rect.top():
+                return g, w.habit["id"], rect.top() - 1
+            if y <= rect.bottom():
+                if y < rect.center().y():
+                    return g, w.habit["id"], rect.top() - 1
+                nxt = rows[k + 1] if k + 1 < len(rows) else None
+                ng = (str(nxt.habit.get("group_name") or "其他")
+                      if nxt else None)
+                if nxt is None or ng != g:
+                    return g, None, rect.bottom() + 1
+                return g, nxt.habit["id"], nxt.geometry().top() - 1
+        last = rows[-1]
+        return (str(last.habit.get("group_name") or "其他"), None,
+                last.geometry().bottom() + 1)
+
+    def _apply_drop(self, habit_id: int, group: str,
+                    before_id: int | None) -> None:
+        if services.habit_move_to(habit_id, group, before_id):
+            self.reload()
 
     # ---- 打卡 ----
     def _toggle_check(self, habit_id: int, date: str) -> None:
@@ -1709,10 +1873,12 @@ class HabitPane(QWidget):
     def _add_habit(self) -> None:
         dlg = HabitDialog(parent=self)
         if dlg.exec():
-            self._current_id = dlg.habit.get("id")
+            new_id = dlg.habit.get("id")
+            self._current_id = new_id
             if self._tab != "active":
                 self.seg_active.setChecked(True)
-            self.reload()
+            # 新建的排在最后，不滚过去用户看不到自己刚建了什么
+            self.reload(reveal_id=new_id)
 
     def _edit_habit(self, habit: dict) -> None:
         dlg = HabitDialog(services.habit_get(habit["id"]), parent=self)

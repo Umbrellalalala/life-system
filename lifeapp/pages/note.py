@@ -11,27 +11,74 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import time
 from urllib.parse import unquote
 
 from PySide6.QtCore import (
     Qt, QEvent, QObject, QItemSelectionModel, QUrl, QTimer, Signal)
 from PySide6.QtGui import (
-    QColor, QFont, QImage, QKeySequence, QShortcut, QTextBlockFormat,
-    QTextCursor, QTextFormat)
+    QAction, QActionGroup, QColor, QFont, QFontMetricsF, QImage, QKeySequence,
+    QShortcut, QTextBlockFormat, QTextCursor, QTextFormat)
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QTextBrowser, QSplitter, QHeaderView,
     QFrame, QScrollArea, QAbstractItemView, QSizePolicy, QApplication,
-    QButtonGroup, QSlider,
+    QButtonGroup, QSlider, QMenu,
 )
 
-from .. import db, popups, theme, vault
+from .. import db, mathtex, popups, theme, vault
 from .base import Page
+
+# vault._restore_math 留下的两种公式槽位：行内和单独成段。
+# 群里的内容已经是「退化成文字」的版本，这里只是把它换成真版式图。
+_MATH_INLINE_RE = re.compile(
+    r'<span class="math" data-tex="([^"]*)">.*?</span>', re.S)
+_MATH_BLOCK_RE = re.compile(
+    r'<p align="center" class="mdis" data-tex="([^"]*)">.*?</p>', re.S)
+# 标题整段跳过（见 _mathify）
+_HEADING_RE = re.compile(r"<h[1-4][^>]*>.*?</h[1-4]>", re.S)
+
+# 图标按钮的字体族要自己挑：Qt 只给**富文本**逐字回退，控件文字不回退。
+# 雅黑里没有 ↻(U+21BB) 和 ⋯(U+22EF)，按钮就画成两个什么也没有的空方框 ——
+# 用户原话「工具栏上那两个空白按钮」，靠 tooltip 根本发现不了那是重新扫描。
+_ICON_FAMILIES = ("Segoe UI Symbol", "Segoe UI", "Microsoft YaHei UI")
+
+
+def _icon_btn(btn, char: str):
+    """图标按钮：把 Ghost 的 18px 左右内边距清掉，再挑一个真有这个字形的字体族。
+
+    两个坑叠在一起才画不出来：#Ghost 的 `padding: 9px 18px` 配 34px 定宽，
+    内容宽度直接是负的（边框照画、字整个没了）；而 Qt 只给富文本逐字回退，
+    控件文字不回退，雅黑里没有 ↻ / ，换字体族也治不了另一半毛病。
+    """
+    btn.setStyleSheet("QPushButton { padding: 8px 0; }")
+    btn.setFont(_icon_font(char, btn.font()))
+    return btn
+
+
+def _icon_font(char: str, base: QFont) -> QFont:
+    """挑一个真能画出这个字符的字体族（按安装情况，不硬依赖系统）。"""
+    from PySide6.QtGui import QFontDatabase
+    installed = set(QFontDatabase().families())
+    cp = ord(char)
+    fallback = None
+    for fam in _ICON_FAMILIES:
+        if fam not in installed:
+            continue
+        f = QFont(base)
+        f.setFamily(fam)
+        if fallback is None:
+            fallback = f
+        if QFontMetricsF(f).inFontUcs4(cp):
+            f.setPointSizeF(base.pointSizeF() * 1.15)
+            return f
+    return fallback or base
 
 _ROLE_REL = Qt.UserRole
 _ROLE_FOLDER = Qt.UserRole + 1
@@ -162,13 +209,22 @@ class ImageLoader(QObject):
         self._pending: set[str] = set()
         self._failed: set[str] = set()
 
-    def get(self, src: str) -> QImage | None:
-        return self._images.get(src)
+    def get(self, src: str, limit: int = 0) -> QImage | None:
+        """取图，顺手按「当前」视口再夹一次。
+
+        缓存里的图是按**下载那一刻**的视口夹过宽的，把窗口拖窄之后它还留着老尺寸，
+        一张就够把预览顶出横向滚动条。这里只往下夹、不放大（放大没有细节），
+        所以拖回去时图会保持小一号 —— 那不算毛病，顶出来的滚动条才算。
+        """
+        img = self._images.get(src)
+        if img is None or not limit or img.width() <= limit:
+            return img
+        return img.scaledToWidth(limit, Qt.TransformationMode.SmoothTransformation)
 
     def load(self, src: str, hint: int, limit: int) -> QImage | None:
         """能立刻给的就给（缓存/本地图），需要下载的先发起、返回 None。"""
         if src in self._images:
-            return self._images[src]
+            return self.get(src, limit)
         if src.startswith(("http://", "https://")):
             self._fetch(src, hint, limit)
             return None
@@ -275,10 +331,11 @@ class OutlineTree(QFrame):
         self.tree.clear()
         stack: list[tuple[int, QTreeWidgetItem]] = []
         for level, text, _line in headings:
-            it = QTreeWidgetItem([text])
-            it.setData(0, _ROLE_HEADING, vault.plain_text(text))
+            label = vault.plain_text(text)
+            it = QTreeWidgetItem([label])
+            it.setData(0, _ROLE_HEADING, label)
             it.setData(0, _ROLE_LEVEL, level)
-            it.setToolTip(0, vault.plain_text(text))
+            it.setToolTip(0, label)
             while stack and stack[-1][0] >= level:
                 stack.pop()
             if stack:
@@ -332,10 +389,14 @@ class OutlineTree(QFrame):
     def set_current(self, item: QTreeWidgetItem | None) -> None:
         if item is None or self.tree.hasFocus():
             return                          # 用户正在翻大纲，别抢他的选中项
-        if self.tree.currentItem() is not item:
-            self.tree.setCurrentItem(item,
-                                     QItemSelectionModel.SelectionFlag.NoUpdate)
-            self.tree.scrollToItem(item)
+        if self.tree.currentItem() is item:
+            return
+        # PySide6 的 setCurrentItem 没有 (item, command) 这个重载，只有
+        # (item)、(item, column) 和 (item, column, command) —— 传错不会崩在
+        # 调用处，只会被 Qt 打成 TypeError 冒到信号发射方，界面看起来「就是不高亮」。
+        self.tree.setCurrentItem(
+            item, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.tree.scrollToItem(item)
 
 
 class FolderTree(QTreeWidget):
@@ -391,6 +452,11 @@ class NotePage(Page):
         super().__init__("笔记记录", "Obsidian 负责写，这里负责看、搜、跳")
         self._notes: list[dict] = []
         self._current_rel = ""
+        self._html = ""                   # 当前这篇渲染出的 HTML，改宽时重夹图片要用
+        self._math_imgs: dict[str, QImage] = {}
+        self._math_avail = 0.0
+        self._math_cache: dict[tuple, object] = {}   # tex/字号/色 -> QImage
+        self._raw_html = ""                 # vault 给的 HTML（还带着 data-tex）
         self._tint_cache: dict[str, str] = {}
         self._view = "tree"              # tree | recent
         self._outline_pinned: bool | None = None   # None = 跟随窗口宽度自动
@@ -412,8 +478,11 @@ class NotePage(Page):
         self.splitter.addWidget(self._build_right())
         self.splitter.setStretchFactor(0, 2)
         self.splitter.setStretchFactor(1, 5)
-        self.splitter.setStretchFactor(2, 2)
-        self.splitter.setSizes([260, 620, 220])
+        self.splitter.setStretchFactor(2, 3)
+        # 右栏起始给到 300：大纲标题不再整列截断。这个值必须落在该栏自己的
+        # [min, max] 里 —— setSizes 传超过 maximumWidth 的值会被分割器记成
+        # 「幻影宽度」，按幻影值排位置，中间会露出一条空白（见记忆 qt-layout-painting-pitfalls）。
+        self.splitter.setSizes([260, 620, 300])
         self.splitter.setCollapsible(1, False)
         self.body().addWidget(self.splitter, 1)
 
@@ -459,6 +528,7 @@ class NotePage(Page):
         bar.addWidget(self.vault_btn)
 
         self.refresh_btn = QPushButton("↻")
+        _icon_btn(self.refresh_btn, "↻")
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.setFixedWidth(34)
         self.refresh_btn.setToolTip("重新扫描库目录")
@@ -469,6 +539,7 @@ class NotePage(Page):
         # 窄窗口时右栏会被自动收起（见 resizeEvent），留个开关让人拽回来。
         # 只在「自动规则会藏掉它」的时候出现，宽窗口不占工具栏位置。
         self.outline_btn = QPushButton("☰")
+        _icon_btn(self.outline_btn, "☰")
         self.outline_btn.setObjectName("Ghost")
         self.outline_btn.setCheckable(True)
         self.outline_btn.setFixedWidth(34)
@@ -477,6 +548,18 @@ class NotePage(Page):
         self.outline_btn.setVisible(False)
         self.outline_btn.clicked.connect(self._toggle_outline)
         bar.addWidget(self.outline_btn)
+
+        # 排序方式 + 批量折叠。放工具栏而不是左栏那一行：左栏行会直接顶高整页的
+        # minimumSizeHint（实测窄窗口下限从 737 涨到 788），而右栏自动收起的阈值
+        # 是 780 —— 顶上去之后那个分支就永远进不去了。工具栏有短标签机制会自己让位。
+        self.tree_menu_btn = QPushButton("⋯")
+        _icon_btn(self.tree_menu_btn, "⋯")
+        self.tree_menu_btn.setObjectName("Ghost")
+        self.tree_menu_btn.setFixedWidth(34)
+        self.tree_menu_btn.setCursor(Qt.PointingHandCursor)
+        self.tree_menu_btn.setToolTip("排序方式 / 展开折叠全部")
+        self.tree_menu_btn.clicked.connect(lambda checked=False: self._show_tree_menu())
+        bar.addWidget(self.tree_menu_btn)
 
         bar.addStretch(1)
 
@@ -493,6 +576,11 @@ class NotePage(Page):
         self._search_timer.timeout.connect(self._apply_search)
         self.search_input.textChanged.connect(self._on_search)
         self.search_input.returnPressed.connect(self._enter_in_search)
+        # 图片是按夹宽那一刻的视口存的，窗口一改宽就得重塞资源表，同样要防抖
+        self._img_timer = QTimer(self)
+        self._img_timer.setSingleShot(True)
+        self._img_timer.timeout.connect(self._reclamp_images)
+        self._img_limit_used = 0
         # Esc 得用事件过滤器：QLineEdit 自己的 keyPressEvent 会先吃掉它，
         # 挂 QShortcut（哪怕是 WidgetShortcut）抢不过。
         self.search_input.installEventFilter(self)
@@ -527,6 +615,8 @@ class NotePage(Page):
                 btn = getattr(self, name)
                 btn.setText(self._long_labels[name] if wide else short)
         self._apply_outline_visibility()
+        # 拖窗口的每一帧都不该去重夹 30 张图，停手之后再补一次
+        self._img_timer.start(320)
 
     def _apply_outline_visibility(self) -> None:
         """右栏（大纲 / 反向链接）：窄窗口默认收起，但允许用户手动拽回来。
@@ -580,25 +670,6 @@ class NotePage(Page):
             self._view_btns[key] = b
             tl.addWidget(b)
         tl.addStretch(1)
-
-        self.sort_btn = QPushButton()
-        self.sort_btn.setObjectName("Ghost")
-        self.sort_btn.setCursor(Qt.PointingHandCursor)
-        self.sort_btn.setToolTip("目录树的排序方式（手动顺序只影响本应用，Obsidian 没有这一档）")
-        self.sort_btn.clicked.connect(self._pick_sort)
-        tl.addWidget(self.sort_btn)
-
-        # 批量折叠：一层层点折叠太累，尤其库里有十几层目录的时候
-        self.expand_btn = QPushButton("⊞")
-        self.collapse_btn = QPushButton("⊟")
-        for btn, tip, slot in ((self.expand_btn, "展开全部文件夹", self._expand_all),
-                               (self.collapse_btn, "折叠全部文件夹", self._collapse_all)):
-            btn.setObjectName("Ghost")
-            btn.setFixedWidth(28)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setToolTip(tip)
-            btn.clicked.connect(lambda checked=False, s=slot: s())
-            tl.addWidget(btn)
         lay.addWidget(track)
 
         self.tree = FolderTree()
@@ -680,6 +751,13 @@ class NotePage(Page):
 
         self.preview = QTextBrowser()
         self.preview.setOpenLinks(False)
+        # 横向滚动条常关：Qt 算它的范围用的是「整段不换行时的理想宽度」，
+        # 段落里一有行内图片就虚增一大段可滚空白（实测最宽行 556 = 可用 556，
+        # 滚动条却报 321）。这里的内容本来也不该横向溢出 —— 代码块强制换行、
+        # 表格折行、图片按视口夹宽、公式超长就断行，
+        # 由 _t_obsidian.py 第 25 步逐块量着守住。
+        self.preview.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.preview.anchorClicked.connect(self._on_anchor)
         lay.addWidget(self.preview, 1)
 
@@ -718,6 +796,10 @@ class NotePage(Page):
                    font-size: 10pt; }}
             table {{ border-collapse: collapse; }}
             td, th {{ border: 1px solid {border}; padding: 5px 10px; }}
+            /* 公式（vault._tex 排的 Unicode + 上下标）故意不指定字体：实测 Qt 会
+               逐字回退，∑ √ ⟨⟩ 和帽子符号在雅黑里没字形也画得出来；写死字体族反而
+               让公式和正文字距对不上。span 留着当以后调样式的钩子。 */
+            span.math {{ color: {text}; }}
             blockquote {{ color: {muted}; border-left: 3px solid {border};
                           margin: 0; padding-left: 12px; }}
             hr {{ border: none; border-top: 1px solid {border}; }}
@@ -742,7 +824,9 @@ class NotePage(Page):
     def _build_right(self) -> QWidget:
         w = QFrame()
         w.setMinimumWidth(190)
-        w.setMaximumWidth(320)
+        # 320 太窄：大纲是这页的主导航，267px 下每条标题都以「…」截断，
+        # 只能靠 tooltip 认。放到能读下常见标题长度，用户仍可拖分割条收窄。
+        w.setMaximumWidth(460)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 0, 0, 0)
         lay.setSpacing(8)
@@ -839,16 +923,67 @@ class NotePage(Page):
         except ValueError:
             blob = {}
         # 手动顺序按「文件夹相对路径」记，换库之后对不上号，直接丢掉
-        self._manual = (blob.get("order") or {}) if blob.get("vault") == vault.vault_path() else {}
+        same = blob.get("vault") == vault.vault_path()
+        self._manual = (blob.get("order") or {}) if same else {}
+        try:
+            pblob = json.loads(db.get_setting("note_pos") or "{}")
+        except ValueError:
+            pblob = {}
+        self._pos_map = (pblob.get("map") or {}) if same else {}
+
+    def _save_pos(self) -> None:
+        """记下这篇读到哪儿：86k 字的笔记每次点开都回到顶部，等于没法分段读。
+
+        存的是「滚动位置 + 当时整篇的高度」，回来时按比例换算 —— 图片是异步下来的，
+        读的时候和下次打开的时候文档高度不一定一样。
+        """
+        if not self._current_rel:
+            return
+        doc = self.preview.document()
+        h = max(round(doc.size().height()), 1)
+        self._pos_map[self._current_rel] = [
+            self.preview.verticalScrollBar().value(), h, int(time.time())]
+        if len(self._pos_map) > _POS_KEEP:       # 别攒着几百篇不用的
+            keep = sorted(self._pos_map.items(), key=lambda kv: -kv[1][2])
+            self._pos_map = dict(keep[:_POS_KEEP])
+        db.set_setting("note_pos", json.dumps(
+            {"vault": vault.vault_path(), "map": self._pos_map}))
+
+    def _restore_pos(self, force: bool = False) -> None:
+        want = self._pos_map.get(self._current_rel)
+        if not want or self._pos_ref is None:
+            return
+        if not force and self._pos_ref[2] != want[2]:
+            return                               # 期间用户自己滚走了，别再抢
+        y, old_h, stamp = want
+        doc = self.preview.document()
+        h = max(round(doc.size().height()), 1)
+        scaled = y * h / max(old_h, 1)
+        sb = self.preview.verticalScrollBar()
+        self._pos_applying = True
+        sb.setValue(int(max(0, min(scaled, sb.maximum()))))
+        self._pos_applying = False
+        self._pos_ref = (self._current_rel, scaled, stamp)
+
+    def _note_scrolled(self, _value: int) -> None:
+        """用户自己滚了：放弃这次「等图片下完再校正位置」，并防抖存一次位置。"""
+        if not self._pos_applying:
+            self._pos_ref = None
+        self._pos_timer.start(900)
 
     def _save_order(self) -> None:
         db.set_setting("note_order", json.dumps(
             {"vault": vault.vault_path(), "order": self._manual},
             ensure_ascii=False))
 
+    def _sort_label(self) -> str:
+        return dict(SORTS).get(self._sort, "排序")
+
     def _apply_sort_ui(self) -> None:
         manual = self._sort == "manual"
-        self.sort_btn.setText("↕ " + dict(SORTS)[self._sort].split("（")[0])
+        self.tree_menu_btn.setToolTip(
+            "排序：%s\n（手动顺序只影响本应用，Obsidian 没有这一档）"
+            % self._sort_label())
         mode = (QAbstractItemView.DragDropMode.InternalMove if manual
                 else QAbstractItemView.DragDropMode.NoDragDrop)
         self.tree.setDragDropMode(mode)
@@ -859,14 +994,29 @@ class NotePage(Page):
         if manual:
             self.tree.setDefaultDropAction(Qt.MoveAction)
 
-    def _pick_sort(self) -> None:
-        labels = [lab for _k, lab in SORTS]
-        idx = next((i for i, (k, _l) in enumerate(SORTS) if k == self._sort), 1)
-        choice, ok = popups.get_item(self, "排序方式", "目录树的排序", labels, idx)
-        if not ok:
+    def _show_tree_menu(self) -> None:
+        menu = QMenu(self)
+        submenu = menu.addMenu("排序方式")
+        group = QActionGroup(submenu)
+        group.setExclusive(True)
+        for key, label in SORTS:
+            act = QAction(label, submenu)
+            act.setCheckable(True)
+            act.setChecked(key == self._sort)
+            act.triggered.connect(lambda checked=False, k=key: self._set_sort(k))
+            group.addAction(act)
+            submenu.addAction(act)
+        menu.addSeparator()
+        menu.addAction("展开全部文件夹", self._expand_all)
+        menu.addAction("折叠全部文件夹", self._collapse_all)
+        menu.exec(self.tree_menu_btn.mapToGlobal(
+            self.tree_menu_btn.rect().bottomLeft()))
+
+    def _set_sort(self, key: str) -> None:
+        if key == self._sort:
             return
-        self._sort = SORTS[labels.index(choice)][0]
-        db.set_setting("note_sort", self._sort)
+        self._sort = key
+        db.set_setting("note_sort", key)
         self._apply_sort_ui()
         self._build_tree()
         if self._current_rel:
@@ -1138,25 +1288,131 @@ class NotePage(Page):
     def _render_preview(self) -> None:
         if not self._current_rel:
             return
-        html = vault.render_html(self._current_rel)
-        self.preview.setHtml(html)
+        self._raw_html = vault.render_html(self._current_rel)
+        try:
+            self._html = self._mathify(self._raw_html)
+        except Exception:
+            # 公式画图再怎么坏也不能把整页吃掉：退回文字版公式，正文照看。
+            # （_open 里 _render_preview 后面还有 _refresh_side，这里一抛
+            #  大纲和反向链接就全空了 —— 整页空白比公式难看严重得多。）
+            self._math_imgs = {}
+            self._html = self._raw_html
+        self.preview.setHtml(self._html)
         self._apply_doc_format()
-        self._load_images(html)
+        self._load_images(self._html)
+
+    def _mathify(self, html: str) -> str:
+        """把带 data-tex 的公式换成真版式图（分式上下两层、根号带上盖）。
+
+        vault 那边给每段公式同时留了「退化成文字」的版本，所以这里画不出来时
+        原样返回就行 —— 界面上仍然可读，不会变成一片空白。
+        标题里**不换**：`_scroll_to_heading` 和大纲标签都是拿 `plain_text(标题)`
+        和渲染后的块文本比字符串的，换成图片就永远对不上了。
+        """
+        if "data-tex" not in html:
+            return html
+        fm = self.preview.fontMetrics()
+        px = fm.height() if fm.height() > 4 else 14.0
+        color = theme.get("text")
+        dpr = self.preview.devicePixelRatioF() or 1.0
+        doc = self.preview.document()
+        avail = max(120.0, self.preview.viewport().width()
+                    - 2 * doc.documentMargin())
+        pending: dict[str, QImage] = {}
+
+        def repl(m: re.Match, display: bool) -> str:
+            tex = unquote(m.group(1))
+            try:
+                ck = (tex, round(px, 1), round(avail), color, display)
+                got = self._math_cache.get(ck)
+                if got is None:
+                    # max_w：太长就在 = + , 处折行。Qt 排行内图片按图片自身宽度算
+                    # 文档宽度，写 width= 和调 devicePixelRatio 都压不住，只能在源头断。
+                    got = mathtex.render(
+                        tex, px=px * (1.12 if display else 1.0),
+                        color=color, display=display, dpr=dpr,
+                        max_w=avail)[0]
+                    self._math_cache[ck] = got
+                img = got
+            except Exception:
+                return m.group(0)
+            # 折行管不了「单个原子就超宽」（一长串 \text{}、一个大括号），只能整体缩。
+            # 图片一旦比视口宽，Qt 就把横向滚动条撑出等量的空白区。
+            if img.width() / dpr > avail:
+                img = img.scaledToWidth(int(avail * dpr),
+                                        Qt.TransformationMode.SmoothTransformation)
+                img.setDevicePixelRatio(dpr)
+            src = "mathtex:%s" % hashlib.sha1(
+                ("%s|%s|%d|%s" % (display, px, dpr, tex)).encode()).hexdigest()[:16]
+            pending[src] = img
+            tag = '<img src="%s" />' % src
+            return '<p align="center">%s</p>' % tag if display else tag
+
+        def sub(part: str) -> str:
+            return _MATH_BLOCK_RE.sub(
+                lambda m: repl(m, True),
+                _MATH_INLINE_RE.sub(lambda m: repl(m, False), part))
+
+        # 只替换标题之外的片段
+        out = []
+        pos = 0
+        for head in _HEADING_RE.finditer(html):
+            out.append(sub(html[pos:head.start()]))
+            out.append(head.group(0))
+            pos = head.end()
+        out.append(sub(html[pos:]))
+        self._math_imgs = pending
+        self._math_avail = avail
+        return "".join(out)
+
+    def _img_limit(self) -> int:
+        return max(200, self.preview.viewport().width() - 44)
 
     def _load_images(self, html: str) -> None:
         """文档里每张图都按视口夹宽后塞进资源表；网络图异步补。"""
         doc = self.preview.document()
-        limit = max(200, self.preview.viewport().width() - 44)
+        for src, img in self._math_imgs.items():
+            doc.addResource(_IMAGE_OBJECT, src, img)
+        limit = self._img_limit()
+        self._img_limit_used = limit
         for src, hint in vault.image_refs(html):
             img = self._loader.load(src, hint, limit)
             if img is not None:
                 doc.addResource(_IMAGE_OBJECT, src, img)
 
     def _on_image_ready(self, src: str) -> None:
-        img = self._loader.get(src)
+        img = self._loader.get(src, self._img_limit())
         if img is not None:
             # 图可能属于上一篇笔记，addResource 只是塞进资源表，不引用就没影响
             self.preview.document().addResource(_IMAGE_OBJECT, src, img)
+
+    def _reclamp_images(self) -> None:
+        """窗口改宽后重夹一遍：照片留着老尺寸、公式图比视口宽，都会顶出横向滚动条。
+
+        照片只重塞资源表就够；公式要按新宽度重排一遍 HTML（断行位置变了），
+        所以那里存了滚动位置、排完再放回去。
+        """
+        limit = self._img_limit()
+        avail = max(120.0, self.preview.viewport().width()
+                    - 2 * self.preview.document().documentMargin())
+        doc = self.preview.document()
+        if abs(limit - self._img_limit_used) > 8:
+            self._load_images(self._html)
+            # addResource 只换资源表，已经排好版的图片块还按老尺寸画
+            doc.markContentsDirty(0, doc.characterCount())
+        if self._raw_html and abs(avail - self._math_avail) > 2:
+            top = self.preview.verticalScrollBar().value()
+            try:
+                self._html = self._mathify(self._raw_html)
+            except Exception:
+                return
+            self.preview.setHtml(self._html)
+            self._apply_doc_format()
+            self._load_images(self._html)
+            # setHtml 之后补的资源表同样不会让已有块重排，这里再逼一次；
+            # 不逼的话照片继续按老几何占位（实测拖窄后最宽行仍是 500 / 可用 373）
+            doc.markContentsDirty(0, doc.characterCount())
+            self.preview.verticalScrollBar().setValue(top)
 
     def _refresh_side(self) -> None:
         heads = vault.headings(self._current_rel)

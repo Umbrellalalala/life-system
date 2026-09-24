@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from ... import popups, services, sounds, theme, widgets
 from ..base import Page
-from ..todo import DatePickerPopup
+from ..todo import DatePickerPopup, _review_ask_sub
 from . import model, style
 from .feed_popup import FeedPopup
 from .month_view import MonthView
@@ -633,7 +633,8 @@ class CalendarPage(Page):
                               (services.todo_get(int(row["id"])) or
                                {}).get("due_time") or "", parent=self)
         self._menu_picker = pop       # 局部变量的话会被 Python 提前回收
-        pop.accepted.connect(lambda d_s, t_s: self._menu_date_picked(row, d_s, t_s))
+        pop.accepted.connect(
+            lambda d_s, t_s, *_rest: self._menu_date_picked(row, d_s, t_s))
         scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         pos = getattr(self, "_menu_pos", QPoint())
         pop.adjustSize()
@@ -642,7 +643,8 @@ class CalendarPage(Page):
                      scr.bottom() - pop.height() - 4))
         pop.show()
 
-    def _menu_date_picked(self, row: dict, date_s: str, time_s: str) -> None:
+    def _menu_date_picked(self, row: dict, date_s: str, time_s: str,
+                         *_rest) -> None:
         d = QDate.fromString(date_s, "yyyy-MM-dd")
         if d.isValid():
             self._on_dropped(int(row["id"]), row.get("occ") or "", d,
@@ -665,7 +667,19 @@ class CalendarPage(Page):
         elif verb == "tag_new":
             self._menu_tag_new(tid)
         elif verb == "done":
-            services.occ_set_done(tid, occ, bool(payload))
+            sid = int(row.get("sub_id") or 0)
+            if sid:
+                # 摊出来的一道题：勾它等于在待办页勾那个子任务，所以问结论这一步
+                # 不能省 —— 不问就是不答，答不答决定这题往下走一档还是退一档。
+                # 没答的话 _review_ask_sub 自己会把 done 退回 0。
+                services.subtask_update(sid, done=1 if payload else 0)
+                if payload:
+                    _review_ask_sub(self, {"id": sid})
+                # 待办页靠这个版本号决定切回去要不要重刷：不问结论的那两种改勾
+                # （取消勾、勾一条用户自己加的检查事项）services 那边不会 bump。
+                services.bump_review_rev()
+            else:
+                services.occ_set_done(tid, occ, bool(payload))
         elif verb == "copy":
             self._menu_copy(row)
         elif verb == "convert":
@@ -779,6 +793,15 @@ class CalendarPage(Page):
     def reload(self) -> None:
         self._f.load()
         self.refresh()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 复习排期是在刷题页改的：那边改了下次复习日，切回日历得看到它挪了日子
+        seen = getattr(self, "_seen_review_rev", None)
+        rev = services.review_rev()
+        self._seen_review_rev = rev
+        if seen is not None and seen != rev:
+            self.refresh()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)

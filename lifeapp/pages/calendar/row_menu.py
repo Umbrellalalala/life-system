@@ -74,19 +74,37 @@ class RowMenu(QMenu):
         self.row = row
         self.today = today
         self.chosen: tuple[str, object] | None = None
-        self._embed(self._date_row())
+        # 刷题页排出来的复习待办：日期那一排整个换成一句话说为什么不给改，
+        # 「移动到」也收掉（清单名就是那两个页认领这批待办的凭据）。
+        self._who = model.trainer_of(row)
+        if self._who:
+            self._trainer_note()
+        else:
+            self._embed(self._date_row())
         self._embed(self._prio_row())
         self.addSeparator()
-        self._list_menu()
+        if not self._who:
+            self._list_menu()
         self._tag_menu()
         self.addSeparator()
         self._done_action()
         self._focus_menu()
         self.addSeparator()
-        self._flat("copy", "创建副本", "copy")
-        self._convert_action()
-        self.addSeparator()
-        self._flat("delete", "删除", "trash", danger=True)
+        # 摊出来的一道题只是父条名下的一条子任务：「创建副本」「转换为笔记」
+        # 动的是父条本体（那整天的复习），点在一道题上做出那种事太意外。
+        if not self.row.get("sub_id"):
+            self._flat("copy", "创建副本", "copy")
+            self._convert_action()
+            self.addSeparator()
+        if self._who:
+            # 删除一起收掉：这条待办是排期给那天合成的，删了只会剩下一堆
+            # 指向已删待办的映射行。直接不摆会比摆个灰的清楚，但用户找不到
+            # 入口会以为菜单漏了项，所以留一行说明去哪儿删。
+            a = self.addAction(_icon("trash", "muted"),
+                               f"删除请到「{self._who}」页")
+            a.setEnabled(False)
+        else:
+            self._flat("delete", "删除", "trash", danger=True)
 
     # ------------------------------------------------------------ 内部
     def _pick(self, verb: str, payload=None) -> None:
@@ -120,6 +138,12 @@ class RowMenu(QMenu):
                             self._pick(v, p))
 
     # ------------------------------------------------------------ 两行快捷
+    def _trainer_note(self) -> None:
+        """复习待办顶上的那行灰字：与其摆一排点不动的按钮，不如一句话说清楚。"""
+        a = self.addAction(_icon("repeat", "muted"),
+                           f"日期由「{self._who}」页排，这里不能改")
+        a.setEnabled(False)
+
     def _date_row(self) -> _IconRow:
         row = _IconRow("日期", self._pick, self)
         row.add("date", self.today, kind="today", tip="今天")

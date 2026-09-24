@@ -12,6 +12,7 @@ vault 路径从 ``%APPDATA%/obsidian/obsidian.json`` 自动发现，用户可在
 """
 from __future__ import annotations
 
+import html as h
 import json
 import os
 import re
@@ -24,7 +25,7 @@ import markdown
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 
-from . import db, popups, services, sounds
+from . import db, mathtex, popups, services, sounds
 
 EXPORT_DIR = "LifeSystem"
 GEN_MARK = "generated-by-life-system"
@@ -371,10 +372,14 @@ def headings(rel: str, root: str | None = None) -> list[tuple[int, str, int]]:
 
 
 def plain_text(s: str) -> str:
-    """去掉行内标记后用于比对：标题里写 `**粗**`，渲染出来是没有星号的。
+    """去掉行内标记、把公式排成渲染后的样子，只用于比对和大纲标签。
 
-    拿源文本直接和渲染后的块文本比字符串必然对不上，点大纲就没反应。
+    拿源文本直接和渲染后的块文本比字符串必然对不上：`**粗**` 渲染出来没有星号，
+    `$V_{\\phi}$` 渲染出来是 `Vφ`。库里有 16 条标题带公式，不排这一步点就没反应。
+    顺序不能反：先排公式，`x_{i}` 里的下划线才不会被当成斜体标记先被削掉。
     """
+    s = _MATH_ANY_RE.sub(
+        lambda m: _TAG_STRIP_RE.sub("", _tex(m.group(1) or m.group(2) or "")), s)
     return _INLINE_MARK_RE.sub("", s).strip()
 
 
@@ -418,8 +423,8 @@ def image_refs(html: str) -> list[tuple[str, int]]:
     for m in _IMG_TAG_RE.finditer(html):
         tag = m.group(1)
         src = _attr(tag, _SRC_RE)
-        if not src or src in seen:
-            continue
+        if not src or src in seen or src.startswith("mathtex:"):
+            continue        # 公式图由页面自己画（见 mathtex），不归下载器管
         seen.add(src)
         hint = re.search(r'data-w="(\d+)"', tag)
         out.append((src, int(hint.group(1)) if hint else 0))
@@ -443,14 +448,131 @@ def stats(rel: str, root: str | None = None) -> str:
     return " · ".join(bits)
 
 
+# ---------------------------------------------------------------- 数学式
+# 库里 13 篇笔记有 1154 处 LaTeX。两条路都实测过走不通：
+# - 原样丢给 markdown：`x_{i}` 的下划线被当成斜体标记，一篇 444 条公式里有 10 条
+#   被改写，渲染出 23 个来路不明的 <em>；
+# - 引 matplotlib 排真公式：\text{} 里的中文丢字形，还要给 52MB 的分发包加几十 MB。
+# 所以走中间路线：markdown 之前先把数学式整段摘走存好（顺手把围栏和行内码也遮住，
+# 免得代码里的 $ 被误伤），渲染完再回填成 Unicode 符号 + <sup>/<sub>。
+# 命令表是按这个库里实际出现的 54 个命令枚举的，认得的都覆盖到；
+# 认不出的命令退成命令名本身 —— 宁可难看，不能像现在这样吃字。
+
+_BLOCK_MATH_RE = re.compile(r"\$\$(.+?)\$\$", re.S)
+_INLINE_MATH_RE = re.compile(r"(?<![\\$])\$([^$\n]+?)\$(?!\$)")
+# plain_text 用的合并版：一条标题里块式和行内式都可能出现
+_MATH_ANY_RE = re.compile(r"\$\$(.+?)\$\$|(?<![\\$])\$([^$\n]+?)\$(?!\$)", re.S)
+_INLINE_CODE_RE = re.compile(r"(?<!`)`{1,2}([^`\n]+?)`{1,2}(?!`)")
+_MATH_SLOT_RE = re.compile(r"@@LTX(\d+)@@")
+_MATH_P_RE = re.compile(r"<p>\s*(@@LTX(\d+)@@)\s*(?:<br\s*/?>\s*)*</p>")
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+def _tex(s: str) -> str:
+    """一小段 LaTeX -> 退化成文字的富文本（实现在 `mathtex`）。
+
+    语法树和命令表都在 `lifeapp/mathtex.py`，那边一份树两个后端：这里是「退化成
+    Unicode + <sup>/<sub>」的那一个，给大纲标签、传给 Obsidian 的标题、以及画图
+    失败时兜底；正文预览走 `mathtex.render()` 画真版式。
+    """
+    try:
+        return mathtex.to_html(s)
+    except Exception:                   # 用户写得再怪也不该把预览弄崩
+        return h.escape(s)
+
+
+_MATH_HINT_RE = re.compile(r"[A-Za-z\\^_{}]")
+_NUM_ONLY_RE = re.compile(r"[\d.,%+\-/*= ]+")
+
+
+def _is_math(s: str) -> bool:
+    """挡掉「价格是 $5 和 $10」：没有字母/记号线索的不算公式。
+
+    光看「是不是纯数字」不够，中文夹在中间就漏了（`5 和` 会被当成公式，
+    连带把后面的空格吃掉）。真公式总有拉丁字母或 `^_\\{}` 其中之一。
+    """
+    t = s.strip()
+    return bool(t) and bool(_MATH_HINT_RE.search(t)) \
+        and not _NUM_ONLY_RE.fullmatch(t)
+
+
+def _extract_math(text: str) -> tuple[str, list[str]]:
+    """把数学式换成 @@LTXn@@ 槽位，返回 (遮好文本, 每个槽位的 HTML)。
+
+    先遮围栏和行内码再找公式：代码里的 `$` 成对出现时会被行内公式规则吃掉。
+    """
+    slots: list[str] = []
+    code: list[str] = []
+    lines: list[str] = []
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        m = _FENCE_RE.match(line)
+        if m:
+            marker = m.group(1)[0]
+            fence = "" if fence and marker == fence else (fence or marker)
+            code.append(line)
+            lines.append("@@LTXK%d@@\n" % (len(code) - 1))
+            continue
+        if fence:
+            code.append(line)
+            lines.append("@@LTXK%d@@\n" % (len(code) - 1))
+            continue
+        def hide(mm: re.Match) -> str:
+            code.append(mm.group(0))
+            return "@@LTXK%d@@" % (len(code) - 1)
+        lines.append(_INLINE_CODE_RE.sub(hide, line))
+    masked = "".join(lines)
+
+    def take(mm: re.Match, display: bool) -> str:
+        src = mm.group(1)
+        if not _is_math(src):
+            return mm.group(0)
+        try:
+            html_txt = _tex(src.strip())
+        except Exception:                   # 用户写得再怪也不该把预览弄崩
+            html_txt = h.escape(src)
+        slots.append((html_txt, src.strip()))
+        return "@@LTX%d@@" % (len(slots) - 1)
+
+    masked = _BLOCK_MATH_RE.sub(lambda m: take(m, True), masked)
+    masked = _INLINE_MATH_RE.sub(lambda m: take(m, False), masked)
+    return re.sub(r"@@LTXK(\d+)@@", lambda m: code[int(m.group(1))], masked), slots
+
+
+def _restore_math(body: str, slots: list[str]) -> str:
+    """markdown 渲染完，把槽位换回公式。
+
+    这里给每段公式带上 `data-tex`：页面拿到 HTML 后会就地把它换成
+    `mathtex.render()` 画出来的真版式图（见 note.NotePage._mathify）。
+    带的是**已排好版的文字**，所以画图失败或没画的时候，界面上仍然是可读的。
+    """
+    def para(m: re.Match) -> str:
+        k = int(m.group(2))
+        if k >= len(slots):
+            return m.group(0)
+        return ('<p align="center" class="mdis" data-tex="%s">%s</p>'
+                % (quote(slots[k][1], safe=""), slots[k][0]))
+
+    def inline(m: re.Match) -> str:
+        k = int(m.group(1))
+        if k >= len(slots):
+            return m.group(0)
+        return ('<span class="math" data-tex="%s">%s</span>'
+                % (quote(slots[k][1], safe=""), slots[k][0]))
+
+    body = _MATH_P_RE.sub(para, body)
+    return _MATH_SLOT_RE.sub(inline, body)
+
+
 def render_html(rel: str, root: str | None = None) -> str:
     """把笔记渲染成给 QTextBrowser 看的 HTML（只读预览用）。"""
-    import html as h
     root = root or vault_path()
     if os.path.normcase(root) not in _ATTACH_INDEX:
         iter_notes(root)          # 附件索引可能还没建过（直接调本函数的路径）
     text = read_text(rel, root)
+    slots: list[str] = []
     if rel.lower().endswith(".md"):
+        text, slots = _extract_math(text)
         body = markdown.markdown(
             text, extensions=["fenced_code", "tables", "toc", "nl2br"])
     else:
@@ -475,7 +597,8 @@ def render_html(rel: str, root: str | None = None) -> str:
 
     body = re.sub(r"\[\[[^\]]+\]\]", link_repl, body)
     body = _TAG_RE.sub(r'<a class="tag" href="lifeapp:/tag/\1">#\1</a>', body)
-    return _IMG_RE.sub(lambda m: _image_tag(m, rel, root, h), body)
+    body = _IMG_RE.sub(lambda m: _image_tag(m, rel, root, h), body)
+    return _restore_math(body, slots)
 
 
 def _attr(tag: str, rx: re.Pattern) -> str:

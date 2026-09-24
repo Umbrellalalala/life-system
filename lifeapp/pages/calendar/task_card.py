@@ -18,7 +18,7 @@ Qt.Popup 的鼠标抓取会在子弹窗打开时把卡片自己关掉。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QDate, QDateTime, QPoint, Signal
+from PySide6.QtCore import Qt, QDate, QDateTime, QEvent, QPoint, Signal
 from PySide6.QtGui import QFont, QIcon, QKeyEvent
 from PySide6.QtWidgets import (
     QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLineEdit, QTextEdit,
@@ -42,6 +42,16 @@ def _chip_text(row: dict) -> tuple[str, str]:
     d = QDate.fromString(row["date"], "yyyy-MM-dd")
     if not d.isValid():
         return "无日期", "muted"
+    e = QDate.fromString(row.get("end_date") or "", "yyyy-MM-dd")
+    s = QDate.fromString(row.get("start_date") or "", "yyyy-MM-dd")
+    if e.isValid() and s.isValid() and e > s:
+        # 跨天的条目在它覆盖的每一天都写成区间；过了结束日才算过期
+        text = (f"{s.month()}月{s.day()}日-"
+                + (f"{e.year()}年" if e.year() != s.year() else "")
+                + f"{e.month()}月{e.day()}日")
+        if row.get("time"):
+            text += f" {dateparse.human_time(row['time'])}"
+        return text, ("red" if QDate.currentDate().daysTo(e) < 0 else "accent")
     left = QDate.currentDate().daysTo(d)
     label = f"{d.month()}月{d.day()}日"
     if left < 0:
@@ -90,6 +100,10 @@ class TaskCard(QFrame):
         self.row = dict(row)
         self._detail = False
         self._filtered = False
+        # 卡片自己打开的子弹层（新建清单的输入框等）。它们是 Qt.Tool 不是
+        # Qt.Popup，activePopupWidget() 看不到，只能靠这个引用挡一下 ——
+        # 否则点到子弹层上就被当成「点了卡片外面」，卡片连带关掉。
+        self._child = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 10)
@@ -102,6 +116,30 @@ class TaskCard(QFrame):
         root.addWidget(style.sep_line())
         self._build_footer(root)
         self._sync()
+        self._apply_lock()
+
+    # ------------------------------------------------------------ 只读模式
+    def _apply_lock(self) -> None:
+        """刷题页排出来的复习待办：这张卡只能看，不能改。
+
+        改了日期，题目那边的 next_review 不会跟着动，两边就悄悄对不上了；
+        标题 / 描述 / 子任务也是那一页的题库内容，在日历里编辑没有归宿。
+        唯一留着的是完成勾选 —— 勾掉复习待办正是推进记忆档的动作。
+        """
+        self._locked = bool(model.trainer_of(self.row))
+        if not self._locked:
+            return
+        for w in (self.title, self.desc):
+            w.setReadOnly(True)
+        for w in (self.flag, self.repeat_btn, self.list_btn, self.sub_add):
+            w.setEnabled(False)
+        self.sub_list.setEnabled(False)
+        widgets._apply_property(self.date_btn, "locked", "true")
+        self.head_note = QLabel("这条由「%s」页排期，日历里只能查看"
+                                % model.trainer_of(self.row))
+        self.head_note.setObjectName("CardLocked")
+        self.head_note.setWordWrap(True)
+        self.layout().insertWidget(1, self.head_note)
 
     # ------------------------------------------------------------ 构建
     def _build_header(self, root: QVBoxLayout) -> None:
@@ -159,17 +197,27 @@ class TaskCard(QFrame):
         self.desc.setFixedHeight(66)
         root.addWidget(self.desc)
 
+        # 子任务直接摊在描述下面（滴答就是这样）：以前藏在「详情」里，一点开
+        # 连添加框带标签整块铺开，卡片瞬间长高一截。
+        self.sub_list = QListWidget()
+        self.sub_list.setObjectName("CardSubList")
+        self.sub_list.itemChanged.connect(self._on_sub_toggled)
+        self.sub_list.setVerticalScrollMode(QListWidget.ScrollPerItem)
+        # 滴答的子任务能改能删：双击改名、右键或 Delete 删掉。
+        # 以前只能加和勾，打错一个字就得回待办页去改。
+        self.sub_list.setEditTriggers(QListWidget.EditTrigger.DoubleClicked)
+        self.sub_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sub_list.customContextMenuRequested.connect(self._sub_menu)
+        self.sub_list.installEventFilter(self)
+        self.sub_list.setVisible(False)
+        root.addWidget(self.sub_list)
+
     def _build_detail(self, root: QVBoxLayout) -> None:
         self.detail_wrap = QFrame()
         self.detail_wrap.setObjectName("CardDetail")
         dl = QVBoxLayout(self.detail_wrap)
         dl.setContentsMargins(0, 4, 0, 0)
         dl.setSpacing(4)
-
-        self.sub_list = QListWidget()
-        self.sub_list.setObjectName("CardSubList")
-        self.sub_list.itemChanged.connect(self._on_sub_toggled)
-        dl.addWidget(self.sub_list)
 
         self.sub_add = QLineEdit()
         self.sub_add.setObjectName("CardSubAdd")
@@ -193,6 +241,17 @@ class TaskCard(QFrame):
         self.list_btn.setCursor(Qt.PointingHandCursor)
         self.list_btn.clicked.connect(self._pick_list)
         foot.addWidget(self.list_btn)
+        # 滴答在左下角放「还剩几个子任务」，卡片收起来时也能一眼看到进度。
+        # QLabel 的 setPixmap / setText 会互相顶掉，所以图标和数字分成两个标签。
+        self.sub_icon = QLabel()
+        self.sub_icon.setObjectName("CardSubCount")
+        self.sub_icon.setPixmap(_menu_icon("subtask_list", "muted", 14).pixmap(14, 14))
+        self.sub_count = QLabel()
+        self.sub_count.setObjectName("CardSubCountText")
+        foot.addWidget(self.sub_icon)
+        foot.addWidget(self.sub_count)
+        self.sub_icon.hide()
+        self.sub_count.hide()
         foot.addStretch(1)
 
         for kind, tip, slot in (
@@ -257,7 +316,10 @@ class TaskCard(QFrame):
         for s in subs:
             it = QListWidgetItem(s["title"])
             it.setData(Qt.ItemDataRole.UserRole, s["id"])
-            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            # 多存一份原标题：itemChanged 同时被勾选和改名触发，靠它分辨是哪种
+            it.setData(Qt.ItemDataRole.UserRole + 1, s["title"])
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                        | Qt.ItemFlag.ItemIsEditable)
             it.setCheckState(Qt.CheckState.Checked if s["done"]
                              else Qt.CheckState.Unchecked)
             f = QFont()
@@ -266,7 +328,15 @@ class TaskCard(QFrame):
             self.sub_list.addItem(it)
         self.sub_list.blockSignals(False)
         self.sub_list.setVisible(bool(subs))
-        self.sub_list.setFixedHeight(min(132, 26 * max(len(subs), 1) + 10))
+        # 只露四行，其余在里面滚 —— 子任务多的时候卡片不会长成一屏高
+        rows = min(len(subs), style.SUB_MAX_ROWS)
+        self.sub_list.setFixedHeight(rows * style.SUB_ROW_H + 2)
+        left = sum(1 for s in subs if not s["done"])
+        self.sub_icon.setVisible(bool(subs))
+        self.sub_count.setVisible(bool(subs))
+        self.sub_count.setText(str(left))
+        self.sub_count.setToolTip(
+            f"子任务：{len(subs) - left} / {len(subs)} 已完成")
 
     def _rebuild_tags(self) -> None:
         """只显示已打上的标签，末尾挂一个「＋标签」入口（滴答的做法）。"""
@@ -330,11 +400,47 @@ class TaskCard(QFrame):
 
     def _on_sub_toggled(self, item: QListWidgetItem) -> None:
         sub_id = item.data(Qt.ItemDataRole.UserRole)
-        if sub_id:
-            services.subtask_update(
-                sub_id, done=int(item.checkState() == Qt.CheckState.Checked))
-            self._rebuild_subs()
+        if not sub_id:
+            return
+        title = item.text().strip()
+        old = item.data(Qt.ItemDataRole.UserRole + 1) or ""
+        if title != old:
+            if not title:
+                # 清空当没改：不然列表里会留下一条没有名字的子任务
+                self.sub_list.blockSignals(True)
+                item.setText(old)
+                self.sub_list.blockSignals(False)
+                return
+            services.subtask_update(sub_id, title=title)
+            item.setData(Qt.ItemDataRole.UserRole + 1, title)
             self.changed.emit()
+            return
+        services.subtask_update(
+            sub_id, done=int(item.checkState() == Qt.CheckState.Checked))
+        self._rebuild_subs()
+        self.changed.emit()
+
+    def _sub_menu(self, pos) -> None:
+        item = self.sub_list.itemAt(pos)
+        if item is None or self._locked:
+            return
+        menu = style.menu(self)
+        act_re = menu.addAction(_menu_icon("edit", "muted", 15), "重命名")
+        menu.addSeparator()
+        act_del = menu.addAction(_menu_icon("trash", "red", 15), "删除子任务")
+        act = menu.exec(self.sub_list.mapToGlobal(pos))
+        if act is act_re:
+            self.sub_list.editItem(item)
+        elif act is act_del:
+            self._delete_sub(item)
+
+    def _delete_sub(self, item: QListWidgetItem) -> None:
+        sub_id = item.data(Qt.ItemDataRole.UserRole)
+        if not sub_id:
+            return
+        services.subtask_delete(sub_id)
+        self._rebuild_subs()
+        self.changed.emit()
 
     def _add_subtask(self) -> None:
         text = self.sub_add.text().strip()
@@ -365,6 +471,13 @@ class TaskCard(QFrame):
         self._sync()
 
     def _pick_date(self) -> None:
+        who = model.trainer_of(self.row)
+        if who:
+            popups.notify(self, "这条的日期不归日历管",
+                          f"它是「{who}」按艾宾浩斯排出来的复习待办。在这里改了，"
+                          "题目那边的下次复习日不会跟着动，两边就对不上了。"
+                          "要调整请去那一页改。", True)
+            return
         pop = DatePickerPopup(self.row["date"], self.row.get("time") or "",
                               parent=self)
         pop.accepted.connect(self._apply_date)
@@ -373,7 +486,8 @@ class TaskCard(QFrame):
         pop.move(anchor.x(), anchor.y() + 4)
         pop.show()
 
-    def _apply_date(self, new_date: str, new_time: str) -> None:
+    def _apply_date(self, new_date: str, new_time: str, *_rest) -> None:
+        # *_rest：日期弹层的 accepted 带结束端，卡片这一侧没有范围可存
         same = new_date == self.row["date"] and new_time == (self.row.get("time") or "")
         if same:
             return
@@ -463,10 +577,19 @@ class TaskCard(QFrame):
 
     def _more_menu(self) -> None:
         menu = style.menu(self)
-        today = menu.addAction("移到今天")
+        # 复习待办这里只留「创建副本」：移到今天和日期弹层是一回事（把待办从
+        # 排期给它的那一天扯走），删除更是直接让排期行指向一条没了的待办。
+        who = model.trainer_of(self.row)
+        today = drop = None
+        if not who:
+            today = menu.addAction("移到今天")
         dup = menu.addAction("创建副本")
         menu.addSeparator()
-        delete = menu.addAction("删除此周期" if self.row["repeat"] else "删除任务")
+        if who:
+            off = menu.addAction(f"这条由「{who}」页排，日期和删除去那边改")
+            off.setEnabled(False)
+        else:
+            drop = menu.addAction("删除此周期" if self.row["repeat"] else "删除任务")
         act = menu.exec(self._below(self.list_btn))
         if act is None:
             return
@@ -480,7 +603,7 @@ class TaskCard(QFrame):
                               due_time=self.row.get("time") or "",
                               list_name=self.row["list_name"])
             self.changed.emit()
-        elif act is delete:
+        elif act is drop:
             services.occ_delete(self.row["id"], self.row["occ"])
             self.changed.emit()
             self.close()
@@ -532,8 +655,16 @@ class TaskCard(QFrame):
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         """应用级过滤器：点到卡片和子弹窗之外就收起卡片。"""
+        if (obj is self.sub_list and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Delete and not self._locked):
+            it = self.sub_list.currentItem()      # Windows 习惯：选中按 Delete 删
+            if it is not None:
+                self._delete_sub(it)
+                return True
         if obj is not self and event.type() in (
                 event.Type.MouseButtonPress, event.Type.MouseButtonDblClick):
+            if self._child is not None and self._child.isVisible():
+                return False
             gp = event.globalPosition().toPoint()
             if not self.geometry().contains(gp) \
                     and QApplication.activePopupWidget() is None:

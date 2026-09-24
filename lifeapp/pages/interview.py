@@ -16,12 +16,12 @@ from PySide6.QtCore import Qt, QDate, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QScrollArea, QFrame,
+    QListWidgetItem, QPlainTextEdit, QScrollArea, QFrame,
     QSplitter, QStackedWidget, QFileDialog, QAbstractItemView,
 )
 
-from .. import popups, services, solution_card, sounds, theme, widgets
-from .base import Page, stats_row
+from .. import popups, services, solution_tabs, sounds, theme, widgets
+from .base import Page
 
 _ROLE_IID = Qt.UserRole
 _SAVE_MS = 700
@@ -32,8 +32,8 @@ class ClickableStat(widgets.StatCard):
 
     clicked = Signal()
 
-    def __init__(self, label, value="0", accent="accent"):
-        super().__init__(label, value, accent)
+    def __init__(self, label, value="0", accent="accent", mini=False):
+        super().__init__(label, value, accent, mini=mini)
         self.setCursor(Qt.PointingHandCursor)
 
     def mousePressEvent(self, event):  # noqa: N802
@@ -74,6 +74,7 @@ class InterviewPage(Page):
         self._first_show = True
         self._drill_id = 0          # 刷题模式当前抽到的题
         self._submitted = False
+        self._select_sol = 0        # 重画编辑器时要选中哪一版解法（0=保持）
 
         self._build_stats()
         self._build_toolbar()
@@ -130,13 +131,15 @@ class InterviewPage(Page):
 
     # ------------------------------------------------------------------ 统计
     def _build_stats(self) -> None:
-        self.card_total = widgets.StatCard("题库", "0", "accent")
-        self.card_due = ClickableStat("到期待复习", "0", "amber")
+        # 缩成小胶囊挂在大标题同一行的右边，不再单独占一整排
+        self.card_total = widgets.StatCard("题库", "0", "accent", mini=True)
+        self.card_due = ClickableStat("到期待复习", "0", "amber", mini=True)
         self.card_due.clicked.connect(self._toggle_due_filter)
-        self.card_round = widgets.StatCard("本轮已答对", "0", "green")
-        self.card_tried = widgets.StatCard("累计作答", "0", "blue")
-        self.body().addLayout(stats_row(
-            [self.card_total, self.card_due, self.card_round, self.card_tried]))
+        self.card_round = widgets.StatCard("本轮已答对", "0", "green", mini=True)
+        self.card_tried = widgets.StatCard("累计作答", "0", "blue", mini=True)
+        for c in (self.card_total, self.card_due,
+                  self.card_round, self.card_tried):
+            self.header().addWidget(c)
 
     def _toggle_due_filter(self) -> None:
         self._due_only = not self._due_only
@@ -267,9 +270,8 @@ class InterviewPage(Page):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
 
-        self.list = QListWidget()
+        self.list = widgets.FittingList()
         self.list.setFrameShape(QFrame.NoFrame)
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # ExtendedSelection 直接就是资源管理器语义：单击选、Ctrl+单击加减选、
         # Shift+单击连选（含从下往上）、点空白清空 —— 不用自己实现
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -365,11 +367,11 @@ class InterviewPage(Page):
             self.list.addItem(item)
             w = self._row_widget(p)
             self.list.setItemWidget(item, w)
-            # setItemWidget 不自己撑行高，不给 sizeHint 整行会被压成一条窄带
-            item.setSizeHint(w.sizeHint())
             if p.get("next_review") and p["next_review"] <= today:
                 item.setForeground(QColor(theme.get("amber")))
         self.list.blockSignals(False)
+        # 行高要按视口真实宽度量，窄栏里才会折行而不是被裁掉
+        self.list.fit_rows()
         if not rows:
             self._iid = 0
         elif not any(r["id"] == prev for r in rows):
@@ -464,19 +466,15 @@ class InterviewPage(Page):
         self.code_sum = QLabel("")
         self.code_sum.setObjectName("Muted")
         code_head.addWidget(self.code_sum, 1)
-        self.add_sol_btn = QPushButton("＋ 加一版解法")
-        self.add_sol_btn.setObjectName("Ghost")
-        self.add_sol_btn.setCursor(Qt.PointingHandCursor)
-        self.add_sol_btn.setToolTip("默认 C++；同一语言也能存多版（暴力 / 最优）")
-        self.add_sol_btn.clicked.connect(self._add_solution)
-        code_head.addWidget(self.add_sol_btn)
         lay.addLayout(code_head)
-        self.sol_box = QVBoxLayout()
-        self.sol_box.setSpacing(8)
-        lay.addLayout(self.sol_box)
-        self.no_sol = QLabel("还没写代码解法")
-        self.no_sol.setObjectName("Muted")
-        lay.addWidget(self.no_sol)
+        # 一版解法 = 一个语言标签，加一版只多一个标签，不再往下堆卡片
+        self.sol_tabs = solution_tabs.SolutionTabs(
+            on_save=lambda sid, **f: services.interview_solution_update(sid, **f),
+            on_delete=services.interview_solution_delete,
+            on_add=self._add_solution,
+            on_touch=self.mark_dirty,
+            on_commit=self.reload)
+        lay.addWidget(self.sol_tabs)
         # 数字题号拼不出链接，得提示用户自己粘，否则他会以为按钮坏了
         self.url_hint = QLabel("")
         self.url_hint.setObjectName("Muted")
@@ -487,7 +485,7 @@ class InterviewPage(Page):
         tag_row.setSpacing(8)
         tag_row.addWidget(self._label("标签"))
         self.tags = QLineEdit()
-        self.tags.setPlaceholderText("逗号分隔，如 操作系统,内存")
+        self.tags.setPlaceholderText("逗号分隔，中英文都行，如 操作系统，内存")
         self.tags.editingFinished.connect(self._save_line_fields)
         tag_row.addWidget(self.tags, 1)
         lay.addLayout(tag_row)
@@ -541,7 +539,7 @@ class InterviewPage(Page):
 
         lay.addWidget(self._label("备注"))
         self.note = QPlainTextEdit()
-        self.note.setPlaceholderText("哪里容易说漏、下次要补什么…")
+        self.note.setPlaceholderText("思路：怎么想到的、复杂度、有什么坑；哪里容易说漏、下次要补什么…")
         self.note.setMinimumHeight(64)
         self.note.textChanged.connect(self.mark_dirty)
         lay.addWidget(self.note)
@@ -574,7 +572,7 @@ class InterviewPage(Page):
                                 self.review_date, self.review_lbl,
                                 self.record_lbl, self.note, self.log_btn,
                                 self.arch_btn, self.del_btn, self.code_sum,
-                                self.add_sol_btn, self.no_sol, self.url_hint,
+                                self.sol_tabs, self.url_hint,
                                 *self.seps]
         scroll.hide()
         self._editor_scroll = scroll
@@ -628,33 +626,11 @@ class InterviewPage(Page):
             lbl.setObjectName("Muted")
             self.timeline.addWidget(lbl)
 
-        _clear_layout(self.sol_box)
         sols = services.interview_solution_list(p["id"])
-        for sol in sols:
-            self.sol_box.addWidget(self._new_card(sol))
-        self.no_sol.setVisible(not sols)
-        self.code_sum.setText(self._code_summary(sols))
+        self.sol_tabs.set_solutions(sols, select_id=self._select_sol)
+        self._select_sol = 0
+        self.code_sum.setText(solution_tabs.summary(sols))
         self._loading = False
-
-    def _new_card(self, sol: dict) -> solution_card.SolutionCard:
-        return solution_card.SolutionCard(
-            sol,
-            on_save=lambda sid, **f: services.interview_solution_update(sid, **f),
-            on_delete=services.interview_solution_delete,
-            on_touch=self.mark_dirty,
-            on_commit=self.reload)
-
-    def _format_solutions(self, sols: list[dict]) -> str:
-        return solution_card.as_text(sols)
-
-    def _code_summary(self, sols: list[dict]) -> str:
-        return solution_card.summary(sols)
-
-    def _solution_cards(self) -> list[solution_card.SolutionCard]:
-        return [self.sol_box.itemAt(i).widget()
-                for i in range(self.sol_box.count())
-                if isinstance(self.sol_box.itemAt(i).widget(),
-                              solution_card.SolutionCard)]
 
     def _add_solution(self) -> None:
         if not self._iid:
@@ -664,7 +640,10 @@ class InterviewPage(Page):
             self._iid, "", "", services.SOLUTION_DEFAULT_LANG,
             allow_empty=True)
         if sid:
-            self._render_editor()   # 只重画右侧，别把左侧列表也刷没了
+            # 只重画右侧，别把左侧列表也刷没了；新加的那一版要选中
+            self._select_sol = sid
+            self._render_editor()
+            self.sol_tabs.code.setFocus()
 
     def _review_text(self, p: dict) -> str:
         stage = int(p.get("stage") or 0)
@@ -728,7 +707,7 @@ class InterviewPage(Page):
         if not ids:
             return
         raw, ok = popups.ask_text(self, "加标签",
-                                  "要加的标签（多个用逗号分隔）")
+                                  "要加的标签（多个用逗号分隔，中英文都行）")
         if not ok or not raw.strip():
             return
         n = services.interview_tags_add(ids, raw)
@@ -988,7 +967,7 @@ class InterviewPage(Page):
             return
         ref = self._ref_of_current()
         sols = services.interview_solution_list(self._drill_id)
-        extra = "\n\n" + self._format_solutions(sols) if sols else ""
+        extra = "\n\n" + solution_tabs.as_text(sols) if sols else ""
         if not ref:
             # 没写文字版答案但存了代码时，照样得能复习自己的解法
             if sols:
@@ -1010,7 +989,7 @@ class InterviewPage(Page):
         ref = p.get("answer") or ""
         sols = services.interview_solution_list(self._drill_id)
         # 存过的解法每次都带上：复习时最想看的正是自己当初怎么写的
-        extra = "\n\n" + self._format_solutions(sols) if sols else ""
+        extra = "\n\n" + solution_tabs.as_text(sols) if sols else ""
         if not ref:
             # 没有参照物就别给分：报 0 分只会让人以为是自己答得差
             self._last_score = 0
@@ -1133,8 +1112,7 @@ class InterviewPage(Page):
             services.interview_problem_update(self._iid, **fields)
             self._reload_list()
         # 代码/思路每 700ms 落一次盘：写几十行代码中途崩了不该全没
-        for card in self._solution_cards():
-            card.flush()
+        self.sol_tabs.flush()
 
     def _save_line_fields(self) -> None:
         if self._loading or not self._iid:
@@ -1250,15 +1228,19 @@ class InterviewPage(Page):
         elif pick == self.ADD_ACTIONS[2]:
             self._import_deck()
 
+    _NOTES_HINT = (
+        "每组用「字节llm算法一面：」开头，下面写 1. 2. 3. 编号问题；"
+        "「代码：xxx」单独成一条，「代码：无」自动忽略\n"
+        "答案可以不写。要写就用【答案】标：跟在题目行后面就管到行尾；"
+        "多行答案让【答案】单独占一行，末尾用【/答案】收尾 —— "
+        "块里出现 1. 2. 3. 或「代码：」都不会被误认成新题")
+
     def _paste_notes(self) -> None:
-        """粘贴面经：一组一面 → 若干编号问题。只有问题没有答案，所以
-        组名转成标签、答案留空，导完直接按该标签筛出来逐条补。"""
+        """粘贴面经：一组一面 → 若干编号问题（可带答案）。
+        组名转成标签；没写答案的那些导完按标签筛出来逐条补。"""
         self._flush()
-        text, ok = popups.ask_note(
-            self, "粘贴面经",
-            "每组用「字节llm算法一面：」开头，下面写 1. 2. 3. 编号问题；"
-            "「代码：xxx」单独成一条，「代码：无」自动忽略",
-            width=640, height=320)
+        text, ok = popups.ask_note(self, "粘贴面经", self._NOTES_HINT,
+                                   width=640, height=320)
         if not ok or not (text or "").strip():
             return
         parsed = services.interview_parse_notes(text)
@@ -1266,23 +1248,33 @@ class InterviewPage(Page):
             popups.notify(self, "没识别出问题",
                           "问题要写成编号列表，例如：\n\n字节llm算法一面：\n"
                           "1. 用户的画像是怎么获取的？\n2. 讲下 fid 和 lpips",
-                          danger=True)
+                          danger=True, width=430)
             return
-        groups: dict[str, list[str]] = {}
-        for g, q in parsed:
-            groups.setdefault(g or "（无组名）", []).append(q)
+        groups: dict[str, list[tuple[str, str]]] = {}
+        for g, q, a in parsed:
+            groups.setdefault(g or "（无组名）", []).append((q, a))
+        answered = sum(1 for _g, _q, a in parsed if a.strip())
         lines = []
         for g, qs in list(groups.items())[:10]:
-            preview = "、".join(services._shorten(q, 14) for q in qs[:3])
+            preview = "、".join(services._shorten(q, 14) for q, _a in qs[:3])
             if len(qs) > 3:
                 preview += " …"
-            lines.append("· %s：%d 条（%s）" % (g, len(qs), preview))
+            n_ans = sum(1 for _q, a in qs if a.strip())
+            lines.append("· %s：%d 条%s（%s）"
+                         % (g, len(qs),
+                            "，带答案 %d" % n_ans if n_ans else "", preview))
         if len(groups) > 10:
             lines.append("… 另外 %d 组" % (len(groups) - 10))
-        summary = ("共 %d 组 %d 条：\n%s\n\n"
-                   "组名会存成标签；答案先留空，导入后用批量操作里的"
-                   "「只选中缺标准答案的」逐条补。"
-                   % (len(groups), len(parsed), "\n".join(lines)))
+        summary = "共 %d 组 %d 条，其中 %d 条带答案：\n%s\n" % (
+            len(groups), len(parsed), answered, "\n".join(lines))
+        opens, closes = services.interview_notes_block_balance(text)
+        if opens > closes:
+            summary += ("\n⚠ 有 %d 处【答案】没写【/答案】收尾 —— 它后面的行会"
+                        "一路被当成答案，条数对不上就是这儿。\n"
+                        % (opens - closes))
+        if answered < len(parsed):
+            summary += ("\n组名会存成标签。没写答案的 %d 条，导入后用批量操作里的"
+                        "「只选中缺标准答案的」逐条补。" % (len(parsed) - answered))
         if not popups.confirm(self, "确认录入", summary, ok_text="录入",
                               width=470):
             return
@@ -1293,10 +1285,13 @@ class InterviewPage(Page):
         idx = self.tag_filter.findData(first)
         if idx >= 0:
             self.tag_filter.setCurrentIndex(idx)
+        missing = res["created"] - res["answered"]
         popups.notify(
             self, "录入完成",
-            "新增 %d 条，跳过重复 %d 条。\n当前按「%s」筛选。"
-            % (res["created"], res["skipped"], first or "全部"), width=430)
+            "新增 %d 条（带答案 %d 条），跳过重复 %d 条。\n%s\n当前按「%s」筛选。"
+            % (res["created"], res["answered"], res["skipped"],
+               "缺答案的可以用批量操作里的「只选中缺标准答案的」挑出来补。"
+               if missing else "答案都齐了。", first or "全部"), width=430)
 
     def _log_manual(self) -> None:
         if not self._iid:
@@ -1346,6 +1341,8 @@ class InterviewPage(Page):
 
     def _on_theme_changed(self) -> None:
         self._flush()
+        # 高亮色是建规则时算死的，换肤后要按新主题重建一遍才会跟着变
+        self.sol_tabs.refresh_theme()
         self.reload()
 
 

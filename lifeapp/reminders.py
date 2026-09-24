@@ -53,10 +53,31 @@ class ReminderService(QObject):
 
     def _scan_todos(self, now: datetime) -> int:
         hits = 0
+        today = now.strftime("%Y-%m-%d")
+        # 只有真带重复规则的待办才需要「今天在不在系列上」这张表，懒着建
+        todays: dict[int, dict] | None = None
         for t in services.todo_list():
             slot = (t.get("reminder") or "").strip()
             when = _at(slot, "%Y-%m-%d %H:%M")
-            if when is None or when > now or int(t.get("done") or 0):
+            if when is None:
+                continue
+            if int(t.get("done") or 0) or int(t.get("abandoned") or 0):
+                # 放弃的和做完的一样：这事已经翻篇了，别再催
+                continue
+            if (t.get("repeat") or "").strip():
+                # 重复任务的提醒必须每天重新锚一次。reminder 存的是绝对时刻
+                # （'2026-09-24 09:00'），而 notified 按这个字符串去重 —— 于是
+                # 「每天 9 点催我」只在第一天响过一次，往后每天都撞在同一个键上
+                # 被吞掉，用户只会以为提醒坏了。日期换成今天，点钟留着。
+                if todays is None:
+                    todays = {r["id"]: r for r in
+                              services.cal_occurrences(today, today)}
+                occ = todays.get(int(t["id"]))
+                if occ is None or occ["done"]:
+                    continue        # 今天不是目标日，或这一周期已经勾掉了
+                slot = "%s %s" % (today, slot[11:16])
+                when = _at(slot, "%Y-%m-%d %H:%M")
+            if when is None or when > now:
                 continue
             if (now - when).total_seconds() > GRACE_HOURS * 3600:
                 continue
@@ -70,6 +91,7 @@ class ReminderService(QObject):
         hits = 0
         today = now.strftime("%Y-%m-%d")
         qday = QDate(now.year, now.month, now.day)   # habit_due_on 要的是 QDate
+        due = []
         for h in services.habit_list():
             if h.get("archived"):
                 continue
@@ -77,8 +99,19 @@ class ReminderService(QObject):
             when = _at("%s %s" % (today, hhmm), "%Y-%m-%d %H:%M")
             if when is None or when > now:
                 continue
+            if (now - when).total_seconds() > GRACE_HOURS * 3600:
+                continue            # 和待办同一条规矩：太旧的旧账不补
             # 不是目标日（比如每周一三五的习惯）就不催
             if not services.habit_due_on(h, qday):
+                continue
+            due.append(h)
+        if not due:
+            return hits
+        # 打过卡了还催就是骚扰。以前只按点到没点到判，晚上十一点还在弹早上
+        # 那个点，而那件事其实下午就做完了
+        checks = services.habit_checks_maps([h["id"] for h in due])
+        for h in due:
+            if services.habit_is_done(h, checks.get(h["id"], {}), today):
                 continue
             if services.mark_notified("habit", h["id"], today):
                 self.fired.emit("habit", h["id"], "习惯打卡提醒", h["name"])

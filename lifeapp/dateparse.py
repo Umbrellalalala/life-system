@@ -45,17 +45,28 @@ _DP = r"(?:凌晨|早上|早晨|上午|中午|午后|下午|傍晚|晚上|夜里
 
 # ---------- 日期模式（所有候选中取最靠左、最长者） ----------
 _DATE_RES = [
-    # 相对日：今晚/明晚附带默认 20:00
-    re.compile(r"(?P<t>今晚|明晚)"),
+    # 相对日：这几个词自带时段（晚=20:00 / 早=08:00），后面还跟着具体点钟时
+    # 要把那个点钟挪到同一时段 —— 「今晚八点」是 20:00，不是 08:00
+    re.compile(r"(?P<t>今晚|明晚|明早|明晨)"),
     re.compile(r"(?P<t>今天|今日|明天|明日|后天|大后天|大大后天|前天)"),
     # 周几：下下周X / 下周X / 周X / 星期X / 礼拜X（「每周五」不当作日期）
     re.compile(r"(?<!每)(?P<pre>下下|下)?(?:周|星期|礼拜)(?P<wd>[一二三四五六日天])"),
     # N 天后
     re.compile(r"(?P<n>\d{1,3}|[零一二两三四五六七八九十]{1,4})\s*天后"),
+    # 带年份：2027年11月1日 / 2027-11-1 / 2027.11.1 / 2027/11/1
+    # 没有这条的话 "2027年11月1日" 会被下面「M月D日」吃掉 "11月1日"，
+    # 年份静默丢掉还留在标题里 —— 用户写 2027 拿到的却是 2026。
+    # 候选按「最靠左 + 最长」排序，这条起点更靠前，天然压过那条。
+    re.compile(r"(?P<yr>[12]\d{3})\s*[年./\-]\s*"
+               r"(?P<mo>\d{1,2})\s*[月./\-]\s*"
+               r"(?P<da>\d{1,2})\s*[日号]?(?!\d)"),
     # 9月16日 / 十六号
     re.compile(rf"(?P<mo>{_NUM})\s*月\s*(?P<da>{_NUM})\s*[日号](?!\d)"),
     re.compile(rf"(?P<da>{_NUM})\s*[日号](?!\d)"),
 ]
+
+_EVENING = ("今晚", "明晚")      # 自带晚上语义的相对日
+_MORNING = ("明早", "明晨")      # 自带早上语义的相对日
 
 _REL_OFFSET = {"今天": 0, "今日": 0, "今晚": 0, "明天": 1, "明日": 1,
                "明早": 1, "明晨": 1, "明晚": 1, "后天": 2, "大后天": 3,
@@ -125,8 +136,13 @@ def _merge_spans(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int
     return merged
 
 
-def _pick_date(text: str, today: QDate) -> tuple[str, tuple[int, int] | None, str]:
-    """返回 (date, span, default_time)。"""
+def _pick_date(text: str, today: QDate) -> tuple[str, tuple[int, int] | None,
+                                                 str, str]:
+    """返回 (date, span, default_time, period)。
+
+    period 是 "pm"/"am"：像「今晚」「明早」这种词自带时段，后面紧跟的
+    「八点」得跟着挪到 20:00，不能留在 08:00。
+    """
     cands: list[tuple[int, int, re.Match]] = []
     for rx in _DATE_RES:
         for m in rx.finditer(text):
@@ -136,11 +152,14 @@ def _pick_date(text: str, today: QDate) -> tuple[str, tuple[int, int] | None, st
         g = m.groupdict()
         d: QDate | None = None
         default_time = ""
+        period = ""
         if g.get("t"):
             t = g["t"]
             d = today.addDays(_REL_OFFSET[t])
-            if t in ("今晚", "明晚"):
-                default_time = "20:00"
+            if t in _EVENING:
+                default_time, period = "20:00", "pm"
+            elif t in _MORNING:
+                default_time, period = "08:00", "am"
         elif g.get("wd"):
             ahead = (_WEEKDAY[g["wd"]] - today.dayOfWeek()) % 7
             ahead += {"下": 7, "下下": 14}.get(g.get("pre") or "", 0)
@@ -151,15 +170,20 @@ def _pick_date(text: str, today: QDate) -> tuple[str, tuple[int, int] | None, st
                 continue
             d = today.addDays(n)
         elif g.get("mo"):
-            d = _resolve_abs(today, _cn_to_int(g["mo"]), _cn_to_int(g["da"]))
+            if g.get("yr"):
+                # 写了年份就照搬，不做「过期顺延到明年」那套推断
+                mo, da = _cn_to_int(g["mo"]), _cn_to_int(g["da"])
+                d = QDate(int(g["yr"]), mo, da) if 1 <= mo <= 12 else None
+            else:
+                d = _resolve_abs(today, _cn_to_int(g["mo"]), _cn_to_int(g["da"]))
         elif g.get("da"):
             d = _resolve_day_only(today, _cn_to_int(g["da"]))
         if d is not None and d.isValid():
-            return d.toString("yyyy-MM-dd"), (s, e), default_time
-    return "", None, ""
+            return d.toString("yyyy-MM-dd"), (s, e), default_time, period
+    return "", None, "", ""
 
 
-def _pick_time(text: str) -> tuple[str, tuple[int, int] | None]:
+def _pick_time(text: str, period: str = "") -> tuple[str, tuple[int, int] | None]:
     cands: list[tuple[int, int, re.Match]] = []
     for rx in (_TIME_COLON, _TIME_OCLOCK):
         for m in rx.finditer(text):
@@ -185,7 +209,10 @@ def _pick_time(text: str) -> tuple[str, tuple[int, int] | None]:
         if not (0 <= minute <= 59):
             continue
         dp = g.get("dp") or ""
-        if dp in ("下午", "午后", "傍晚", "晚上", "夜里") and h < 12:
+        if not dp:
+            # 「今晚八点」的时段来自日期词而不是 dp，得同样挪
+            dp = {"pm": "晚上", "am": "早上"}.get(period, "")
+        if dp in ("中午", "下午", "午后", "傍晚", "晚上", "夜里") and h < 12:
             h += 12
         elif dp == "凌晨" and h == 12:
             h = 0
@@ -196,8 +223,8 @@ def _pick_time(text: str) -> tuple[str, tuple[int, int] | None]:
 def parse_datetime(text: str) -> Parsed:
     """解析标题中的日期与时间。只识别一个日期 + 一个时间。"""
     today = QDate.currentDate()
-    date, date_span, default_time = _pick_date(text, today)
-    time_v, time_span = _pick_time(text)
+    date, date_span, default_time, period = _pick_date(text, today)
+    time_v, time_span = _pick_time(text, period)
 
     # 只写了时间（「八点起床」）→ 视为今天
     if time_v and not date:
@@ -265,8 +292,8 @@ def parse_title(text: str, lists=(), tags=()) -> Parsed:
             masked[i] = " "
     mtext = "".join(masked)
 
-    date, date_span, default_time = _pick_date(mtext, today)
-    time_v, time_span = _pick_time(mtext)
+    date, date_span, default_time, period = _pick_date(mtext, today)
+    time_v, time_span = _pick_time(mtext, period)
     if time_v and not date:
         date = today.toString("yyyy-MM-dd")
     if date and not time_v and default_time:

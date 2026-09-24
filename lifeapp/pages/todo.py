@@ -19,13 +19,14 @@ from PySide6.QtCore import (
     QRectF, QPoint, QEvent, QVariantAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QPainter, QDrag, QDesktopServices, QTextCursor, QPixmap,
+    QColor, QFont, QFontMetrics, QPainter, QPen, QDrag, QDesktopServices,
+    QTextCursor, QPixmap,
     QKeySequence, QShortcut,
     QTextBlockFormat, QTextListFormat,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QLabel, QLineEdit,
-    QPushButton, QListWidget, QTextEdit, QScrollArea,
+    QPushButton, QListWidget, QTextEdit, QScrollArea, QCheckBox,
     QSizePolicy, QApplication, QSplitter,
 )
 
@@ -36,6 +37,50 @@ from ..todo_icons import (TickIcon, ColorDot, PrioCheckBox, FlagButton,
 
 # 自定义拖拽 mime：携带任务 id，用于列表内排序 + 拖到左侧导航改属性
 MIME_TODO = "application/x-lifesystem-todo"
+# 左栏导航行自己的拖拽：携带那一行的 key，用于组内上下排序
+MIME_NAV = "application/x-lifesystem-nav"
+
+# 智能栏那四行 + 底部两行的可拖顺序（存在 settings 里）。分成两组：上面那组是
+# 「视图」，下面那组是「已完成 / 垃圾桶」，互不串组。
+NAV_SMART = ("soon7", "today", "quad", "inbox")
+NAV_FOOT = ("done", "trash")
+# 四个优先级过滤器是写死的（不在 todo_filters 表里），和自建过滤器排在同一串里，
+# 所以整串的顺序另外存在 settings 的 todo_nav_filter。
+NAV_SETTINGS = {"smart": "todo_nav_smart", "foot": "todo_nav_foot",
+                "filter": "todo_nav_filter"}
+
+
+def _nav_group(key: str) -> str:
+    """这一行属于哪个可排序的组。跨组不许互拖（清单不能拖进标签区）。"""
+    if key.startswith(("list:", "folder:")):
+        return "list"
+    if key.startswith("tag:"):
+        return "tag"
+    if key.startswith("filter:") or key in QUAD_KEYS:
+        return "filter"
+    if key in NAV_SMART:
+        return "smart"
+    if key in NAV_FOOT:
+        return "foot"
+    return ""
+
+
+def _nav_parent(key: str) -> str:
+    """同组里还得同「一串」：子清单之间、顶层清单之间、子标签之间才互拖。"""
+    if key.startswith("list:"):
+        lst = next((l for l in services.list_all(include_archived=True)
+                    if l["name"] == key[5:] and l.get("kind") != "folder"), None)
+        return str(int((lst or {}).get("folder_id") or 0))
+    if key.startswith("folder:"):
+        return "0"
+    if key.startswith("tag:"):
+        try:
+            tid = int(key[4:])
+        except ValueError:
+            return "0"
+        tag = next((t for t in services.tag_all() if t["id"] == tid), None)
+        return str(int((tag or {}).get("parent_id") or 0))
+    return "0"
 
 PRIORITY_META = {
     0: ("无", "muted"),
@@ -49,8 +94,14 @@ PRIORITY_META = {
 # 时长档位（分钟）。日历的时间轴按 todos.duration_min 排块，这里给它一个入口。
 DURATION_OPTIONS = [15, 30, 45, 60, 90, 120]
 
+# 行内检查事项：只列前几条，剩下的靠「还有 N 项」进详情看。
+# 滴答也是这个做法 —— 一条任务二十个勾选项会把整屏占满，看不见别的任务。
+SUB_INLINE_MAX = 3
+# 「还有 N 项」那行的缩进：行本身有 10px 左边距，49 + 10 = 59 正好落在子任务文字上
+SUB_TEXT_INDENT = 49
 
-# 待办里可点开的链接：算法复习待办把力扣地址写在备注第一行，这里从备注/标题捞。
+
+# 待办里可点开的链接：从备注 / 描述里捞第一个 http，行上出🔗。
 _URL_RE = re.compile(r"""https?://[^\s<>"'）)，。]+""")
 
 
@@ -75,26 +126,61 @@ _REVIEW_ASK = {
     "algo": ("这道题这次独立做出来了吗？", ["独立做出来了", "没独立做出来"]),
     "interview": ("这道八股这次答对了吗？", ["答对了", "没答上来"]),
 }
+# 勾整条大任务 = 这天剩下的题目按同一个结论一起结掉
+_REVIEW_ASK_ALL = {
+    "algo": ("这天的 %d 道题一起记，按哪个结论？",
+             ["都独立做出来了", "都没独立做出来"]),
+    "interview": ("这天的 %d 道八股一起记，按哪个结论？",
+                  ["都答对了", "都没答上来"]),
+}
 
 
-def _review_ask(parent, todo_id: int, occ: str = "") -> bool:
-    """勾掉复习待办后问一句结论，据此重排下一个记忆点（算法 / 八股共用）。
+def _review_ask_sub(parent, sub: dict) -> bool:
+    """勾掉一条复习子任务后问一句结论，据此重排下一个记忆点。
 
-    返回 False 表示用户没答，调用方要把这次勾选退回未完成：结论没记下来就
-    不能往前走排期，否则这道题会被默认当成「做出来了」，越排越远。
+    返回 False 表示用户没答，调用方要把这条退回未勾：结论没记下来就不能
+    往前走排期，否则这道题会被默认当成「做出来了」，越排越远。
     """
-    kind = services.review_kind_of_todo(todo_id)
+    kind = services.review_kind_of_sub(sub["id"])
     if not kind:
-        return True                     # 不是复习待办，正常放行
+        return True                     # 不是复习条目，正常放行
     ask, opts = _REVIEW_ASK[kind]
     pick, ok = popups.get_item(parent, "复习结论", ask, opts)
     if not ok:
-        services.occ_set_done(todo_id, occ, False)
+        services.subtask_update(sub["id"], done=0)
         return False
-    services.review_resolve_todo(todo_id, independent=(pick == opts[0]))
-    # 复习待办的反馈用「答对/答错」音，调用方就不会再叠一层完成音
+    # 重排会把这条子任务摘掉（下一档排到别的日子），大任务空了自己收尾
+    services.review_resolve_sub(sub["id"], independent=(pick == opts[0]))
     sounds.play("answer_correct" if pick == opts[0] else "answer_wrong")
     return True
+
+
+def _review_ask_group(parent, todo_id: int) -> bool:
+    """勾整条复习大任务：把这天还没做的题目按同一个结论逐个结掉。
+
+    没有未勾的复习条目时直接放行 —— 那时它就是条普通待办（用户自己往大任务
+    下加过检查事项，或者题目都毕业后手动勾一遍收尾）。
+    """
+    pend = services.review_pending_subs(todo_id)
+    if not pend:
+        return True
+    kind = pend[0]["kind"]      # 一天一门课一个大任务，不会混
+    ask, opts = _REVIEW_ASK_ALL[kind]
+    pick, ok = popups.get_item(parent, "复习结论", ask % len(pend), opts)
+    if not ok:
+        return False
+    indep = pick == opts[0]
+    for entry in pend:
+        services.review_resolve_sub(entry["sub"]["id"], independent=indep)
+    sounds.play("answer_correct" if indep else "answer_wrong")
+    return True
+
+
+# TickMenu 里三种「不是一行普通项」的东西用这三个标记区分（见 TickMenu 的 docstring）。
+# 取值带 NUL，任何真实菜单值都不可能撞上。
+SEP = "\x00sep"          # 一条分隔线
+CAP = "\x00cap"          # 一段小标题（日期 / 优先级）
+STRIP = "\x00strip"      # 一整格自定义控件（横排图标条）
 
 
 def _prio_items() -> list[tuple]:
@@ -146,6 +232,8 @@ QUADRANTS = [
 # 象限页每格的角标：滴答用罗马数字 Ⅰ–Ⅳ，第四格是绿的（和侧栏那个白底方块不是一回事）
 QUAD_PAGE = {"p3": ("Ⅰ", "red"), "p2": ("Ⅱ", "amber"),
              "p1": ("Ⅲ", "blue"), "p0": ("Ⅳ", "green")}
+# 这四行在左栏「过滤器」段里，key 就是 p0-p3（_nav_group 认它们为一组）
+QUAD_KEYS = tuple(k for k, *_ in QUADRANTS)
 # 清单 / 标签可选的自定义色（滴答的调色板）
 PALETTE = [
     ("灰", "#8b8fa3"), ("红", "#f0435f"), ("橙", "#ed9a12"), ("黄", "#e8c33a"),
@@ -173,6 +261,15 @@ def _weekday_cn(d: QDate) -> str:
     return WEEKDAY_CN[(d.dayOfWeek() - 1) * 3:(d.dayOfWeek() - 1) * 3 + 2]
 
 
+def _settled(t: dict) -> bool:
+    """这条算不算「已经翻篇」：做完了 + 放弃了的。
+
+    角标、列表路由、组标题必须共用这一个判据，否则放弃的任务会一边在角标里
+    计数、一边在列表里根本不出现，两边的数字怎么数都对不上。
+    """
+    return bool(t["done"]) or bool(t.get("abandoned"))
+
+
 def _group_label(key: str, items: list) -> str:
     """分组标题。滴答会把日期分组写成「今天, 周六」这种带星期的形式。"""
     today = QDate.currentDate()
@@ -187,6 +284,11 @@ def _group_label(key: str, items: list) -> str:
     if key == "nodate":
         return "待安排"
     if key == "done":
+        # 滴答的写法：这一组里真出现了放弃项，标题就带上「& 已放弃」，
+        # 免得放弃的东西看着像被做完了
+        if any(int(t.get("abandoned") or 0) and not int(t.get("done") or 0)
+               for t in items):
+            return "已完成 & 已放弃"
         return "已完成"
     if key == "checkin":
         return f"今日打卡, {_weekday_cn(today)}"
@@ -201,13 +303,26 @@ def _group_label(key: str, items: list) -> str:
     return key
 
 
-def _detail_date_label(due: str, due_time: str = "") -> str:
-    """详情面板日期胶囊的文案：滴答对过期任务写「5天前, 9月14日」。"""
+def _holidays():
+    """假期角标那个模块。calendar 包反过来要 import 本模块，只能在用时取。"""
+    from .calendar import holidays
+    return holidays
+
+
+def _detail_date_label(due: str, due_time: str = "", end: str = "") -> str:
+    """详情面板日期胶囊的文案：滴答对过期任务写「5天前, 9月14日」。
+
+    `end` 非空且不等于起始日时写成跨天「今天, 11月1日-11月3日」。
+    """
     d = QDate.fromString(due, "yyyy-MM-dd")
     if not d.isValid():
         return due
     left = QDate.currentDate().daysTo(d)
     date_part = f"{d.month()}月{d.day()}日"
+    e = QDate.fromString(end, "yyyy-MM-dd") if end else QDate()
+    if e.isValid() and e > d:
+        tail = f"{e.month()}月{e.day()}日"
+        date_part += f"{e.year()}年{tail}" if e.year() != d.year() else f"-{tail}"
     if left < 0:
         head = f"{-left}天前"
     elif left == 0:
@@ -224,7 +339,8 @@ def _detail_date_label(due: str, due_time: str = "") -> str:
     return text
 
 
-def _date_state(due: str, due_time: str = "", countdown: bool = False) -> tuple[str, str]:
+def _date_state(due: str, due_time: str = "", countdown: bool = False,
+                end: str = "") -> tuple[str, str]:
     """截止日期/时间 → (展示文本, 状态色键)。
 
     countdown = ⋯ 菜单里的「显示倒数日」：滴答把「3月5日」换成「剩余N天」，
@@ -235,6 +351,17 @@ def _date_state(due: str, due_time: str = "", countdown: bool = False) -> tuple[
     d = QDate.fromString(due, "yyyy-MM-dd")
     if not d.isValid():
         return due, "normal"
+    e = QDate.fromString(end, "yyyy-MM-dd") if end else QDate()
+    if e.isValid() and e > d:
+        # 跨天的不套「今天 / 剩余N天」那套相对说法，直接写区间；
+        # 逾期要过了结束日才算，按起始日判会提前红起来
+        text = (f"{d.month()}月{d.day()}日-"
+                + (f"{e.year()}年" if e.year() != d.year() else "")
+                + f"{e.month()}月{e.day()}日")
+        if due_time:
+            text += f" {dateparse.human_time(due_time)}"
+        return text, ("overdue" if QDate.currentDate().daysTo(e) < 0
+                      else "normal")
     left = QDate.currentDate().daysTo(d)
     if left < 0:
         text, state = (f"已逾期{-left}天" if countdown
@@ -404,12 +531,19 @@ class TagPickPopup(QFrame):
             empty = QLabel("还没有标签")
             empty.setObjectName("TickMenuLabel")
             lay.addWidget(empty)
+        self._rows: dict[int, _MenuRow] = {}
         for tg in tags:
             row = _MenuRow("tag", tg["name"], int(tg["id"]) in on_task,
                            False, card)
             row.clicked_.connect(lambda i=tg["id"]: self._fire(i))
             lay.addWidget(row)
+            self._rows[int(tg["id"])] = row
         self.setFixedWidth(width)
+
+    def set_checked(self, ids: set[int]) -> None:
+        """只改勾选不重开菜单：连着勾两个标签时闪一下很扰。"""
+        for i, row in self._rows.items():
+            row.set_on(i in ids)
 
     def _fire(self, tag_id: int) -> None:
         self.toggled.emit(tag_id)
@@ -466,16 +600,170 @@ class IconBtn(QPushButton):
         self._place()
 
 
-class DatePickerPopup(QFrame):
-    """滴答清单式日期选择弹窗：快捷日期 + 月历 + 时间，确定/清除。"""
+class MonthPickPopup(QFrame):
+    """小月历：持续时间段里「开始 / 结束」那两格从这儿挑。
 
-    accepted = Signal(str, str)   # (date, time)
+    不复用 DatePickerPopup 自己那张网格 —— 一个面板里两套字段共用一个网格，
+    点了不知道在改哪一头；滴答也是再弹一层小月历。
+    """
+
+    picked = Signal(str)          # yyyy-MM-dd
+
+    def __init__(self, date_s: str = "", parent=None):
+        super().__init__(parent, POPUP_FLAGS)
+        self.setObjectName("TickMenu")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        card = QFrame(self)
+        card.setObjectName("TickMenuCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
+        d = QDate.fromString(date_s, "yyyy-MM-dd")
+        self._sel = d if d.isValid() else QDate.currentDate()
+        self._month = QDate(self._sel.year(), self._sel.month(), 1)
+
+        head = QHBoxLayout()
+        self.title = QLabel()
+        self.title.setObjectName("CalHeader")
+        head.addWidget(self.title)
+        head.addStretch(1)
+        for icon, cb in (("‹", lambda: self._shift(-1)),
+                         ("○", self._goto_today),
+                         ("›", lambda: self._shift(1))):
+            b = QPushButton(icon)
+            b.setObjectName("CalNav")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(cb)
+            head.addWidget(b)
+        lay.addLayout(head)
+        wd = QHBoxLayout()
+        wd.setSpacing(2)
+        for name in ("日", "一", "二", "三", "四", "五", "六"):
+            lbl = QLabel(name)
+            lbl.setObjectName("CalWd")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            wd.addWidget(lbl, 1)
+        lay.addLayout(wd)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(2)
+        self._btns: list[QPushButton] = []
+        for i in range(42):
+            b = QPushButton()
+            b.setObjectName("CalDay")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, ix=i: self._pick(ix))
+            grid.addWidget(b, i // 7, i % 7)
+            self._btns.append(b)
+        lay.addLayout(grid)
+        self.setFixedWidth(238)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        today = QDate.currentDate()
+        self.title.setText(f"{self._month.month()}月 {self._month.year()}年")
+        start = self._month.addDays(-(self._month.dayOfWeek() % 7))
+        for i, btn in enumerate(self._btns):
+            d = start.addDays(i)
+            btn.setText(str(d.day()))
+            btn._date = d  # noqa: SLF001 仅内部使用
+            state = ("off" if d.month() != self._month.month()
+                     else "sel" if d == self._sel
+                     else "today" if d == today else "")
+            widgets._apply_property(btn, "calState", state)
+
+    def _shift(self, delta: int) -> None:
+        self._month = self._month.addMonths(delta)
+        self._refresh()
+
+    def _goto_today(self) -> None:
+        self._sel = QDate.currentDate()
+        self._month = QDate(self._sel.year(), self._sel.month(), 1)
+        self._refresh()
+
+    def _pick(self, idx: int) -> None:
+        self.picked.emit(self._btns[idx]._date.toString("yyyy-MM-dd"))
+        self.close()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.deleteLater()
+
+
+class TimePickPopup(QFrame):
+    """时 / 分两列的小弹层：持续时间段那两个时刻框用。"""
+
+    picked = Signal(str)          # HH:MM
+
+    def __init__(self, time_s: str = "", parent=None):
+        super().__init__(parent, POPUP_FLAGS)
+        self.setObjectName("TickMenu")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        card = QFrame(self)
+        card.setObjectName("TickMenuCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        h, m = (9, 0)
+        if ":" in time_s:
+            try:
+                h, m = (int(x) for x in time_s.split(":")[:2])
+            except ValueError:
+                pass
+        self._hours = self._col(lay, 24, h)
+        self._mins = self._col(lay, 60, m)
+        self.setFixedWidth(150)
+
+    def _col(self, lay, count: int, at: int) -> QListWidget:
+        lst = QListWidget()
+        lst.setObjectName("TimeList")
+        lst.setFixedHeight(132)
+        lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for i in range(count):
+            lst.addItem("%02d" % i)
+        if 0 <= at < count:
+            lst.setCurrentRow(at)
+            # 打开就滚到当前值那一行，不然永远从 00 开始、看不出选的是几点
+            QTimer.singleShot(0, lambda: lst.scrollToItem(lst.item(at)))
+        lst.itemClicked.connect(lambda _it: self._commit())
+        lay.addWidget(lst, 1)
+        return lst
+
+    def _commit(self) -> None:
+        # 不关：点和时之后还要接着点分，一点就收等于永远只能选到整点。
+        # 值本身是即时生效的，点外面弹层自己收（Qt.Popup）。
+        self.picked.emit("%02d:%02d" % (max(self._hours.currentRow(), 0),
+                                        max(self._mins.currentRow(), 0)))
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.deleteLater()
+
+
+class DatePickerPopup(QFrame):
+    """滴答清单式日期选择弹窗：快捷日期 + 月历 + 时间，确定/清除。
+
+    `allow_range` 打开时顶部多一排「日期 / 时间段」分段切换，时间段那页是
+    开始/结束 + 全天三行。只有真能把 end_date 存回库里的入口才给这一排 ——
+    习惯的起始日、日历的单日卡片都没有范围可存，摆上去就是骗人点。
+    """
+
+    accepted = Signal(str, str, str, str)   # (开始日期, 开始时间, 结束日期, 结束时间)
     cleared = Signal()
     repeatPicked = Signal(str)      # 重复规则，"" = 不重复
     reminderPicked = Signal(str)    # 提醒的绝对时间串，"" = 无提醒
 
     def __init__(self, date: str = "", time_v: str = "", parent=None,
-                 repeat: str = "", reminder: str = ""):
+                 repeat: str = "", reminder: str = "",
+                 end_date: str = "", end_time: str = "",
+                 allow_range: bool = False):
         super().__init__(parent)
         self._repeat = repeat or ""
         self._reminder = reminder or ""
@@ -490,6 +778,10 @@ class DatePickerPopup(QFrame):
         if not self._selected.isValid():
             self._selected = today
         self._time = time_v or ""
+        e = QDate.fromString(end_date, "yyyy-MM-dd")
+        self._end = e if (e.isValid() and e >= self._selected) else self._selected
+        self._end_time = end_time or ""
+        self._mode = "range" if (allow_range and end_date) else "date"
         first = QDate(self._selected.year(), self._selected.month(), 1)
         self._month = first
 
@@ -504,14 +796,39 @@ class DatePickerPopup(QFrame):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
 
-        # 原来这里有个「日期 / 时间段」二级 tab，但时间段只是个「即将上线」的
-        # 占位页 —— 点了切过去看到一行灰字，比没有更糟。库里也还没有
-        # end_date 字段，等真做持续时间段时再一起加回来。
+        # 「日期 / 时间段」分段。第三轮里这个 tab 被删过，因为当时库里没有
+        # end_date，点过去是一行「即将上线」—— 现在两端都齐了才放回来，
+        # 而且存不下范围的那几个入口（习惯起始日、日历单日卡）压根不给它。
+        self._tabs: dict[str, QPushButton] = {}
+        tabbar = QFrame()
+        tabbar.setObjectName("DateTabBar")
+        tb = QHBoxLayout(tabbar)
+        tb.setContentsMargins(3, 3, 3, 3)
+        tb.setSpacing(3)
+        for key, label in (("date", "日期"), ("range", "时间段")):
+            b = QPushButton(label)
+            b.setObjectName("DateTab")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedHeight(26)
+            widgets._apply_property(b, "on", "false")
+            b.clicked.connect(lambda _c=False, k=key: self._set_mode(k))
+            tb.addWidget(b, 1)
+            self._tabs[key] = b
+        tabbar.setVisible(allow_range)
+        root.addWidget(tabbar)
+
         main = QWidget()
         ml = QVBoxLayout(main)
         ml.setContentsMargins(0, 4, 0, 0)
         ml.setSpacing(8)
         root.addWidget(main, 1)
+
+        # 日期页：快捷四枚 + 月历 + 时间行
+        self.page_date = QWidget()
+        dl = QVBoxLayout(self.page_date)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(8)
+        ml.addWidget(self.page_date, 1)
 
         quick_row = QHBoxLayout()
         quick_row.setSpacing(4)
@@ -531,13 +848,17 @@ class DatePickerPopup(QFrame):
             b.setFixedHeight(38)
             b.clicked.connect(cb)
             quick_row.addWidget(b, 1)
-        ml.addLayout(quick_row)
+        dl.addLayout(quick_row)
 
         # 月历
         head = QHBoxLayout()
         self.cal_title = QLabel()
         self.cal_title.setObjectName("CalHeader")
         head.addWidget(self.cal_title)
+        # 年份单独一个标签：不是今年的时候要能单独上色
+        self.cal_year = QLabel()
+        self.cal_year.setObjectName("CalYear")
+        head.addWidget(self.cal_year)
         head.addStretch(1)
         for icon, cb in (("‹", lambda: self._shift_month(-1)),
                          ("○", self._goto_today),
@@ -547,7 +868,7 @@ class DatePickerPopup(QFrame):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(cb)
             head.addWidget(b)
-        ml.addLayout(head)
+        dl.addLayout(head)
 
         wd_row = QHBoxLayout()
         wd_row.setSpacing(2)
@@ -556,7 +877,7 @@ class DatePickerPopup(QFrame):
             lbl.setObjectName("CalWd")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             wd_row.addWidget(lbl, 1)
-        ml.addLayout(wd_row)
+        dl.addLayout(wd_row)
 
         grid_holder = QWidget()
         self.grid = QGridLayout(grid_holder)
@@ -570,10 +891,10 @@ class DatePickerPopup(QFrame):
             b.clicked.connect(lambda _=False, ix=i: self._pick_day(ix))
             self.grid.addWidget(b, i // 7, i % 7)
             self._day_btns.append(b)
-        ml.addWidget(grid_holder)
+        dl.addWidget(grid_holder)
 
         # 时间行（点击展开/收起选择器）
-        self.time_btn = self._popup_row(ml, "clock", "时间", "accent")
+        self.time_btn = self._popup_row(dl, "clock", "时间", "accent")
         self.time_btn.clicked.connect(self._toggle_time_panel)
 
         # 时间选择面板（小时 / 分钟两列）
@@ -586,7 +907,25 @@ class DatePickerPopup(QFrame):
         tp.addWidget(self.hour_list, 1)
         tp.addWidget(self.minute_list, 1)
         self.time_panel.hide()
-        ml.addWidget(self.time_panel)
+        dl.addWidget(self.time_panel)
+
+        # 时间段页：开始 / 结束 各一个日期格 + 一个时刻格，再加「全天」
+        self.page_range = QWidget()
+        rl = QVBoxLayout(self.page_range)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(8)
+        ml.addWidget(self.page_range, 1)
+        self._rb_start_date, self._rb_start_time = self._range_row(rl, "开始")
+        self._rb_end_date, self._rb_end_time = self._range_row(rl, "结束")
+        self.all_day = QCheckBox("全天")
+        self.all_day.setObjectName("DateAllDay")
+        self.all_day.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.all_day.toggled.connect(self._on_all_day)
+        ad_row = QHBoxLayout()
+        ad_row.addWidget(self.all_day)
+        ad_row.addStretch(1)
+        rl.addLayout(ad_row)
+        rl.addStretch(1)
 
         # 提醒 / 重复：滴答这两行是可点的，原来只是摆着（点了没反应）
         self.remind_btn = self._popup_row(ml, "clock", "提醒")
@@ -618,6 +957,11 @@ class DatePickerPopup(QFrame):
 
         self._sync_time_btn()
         self._refresh_calendar()
+        self.all_day.blockSignals(True)
+        self.all_day.setChecked(not self._time and not self._end_time)
+        self.all_day.blockSignals(False)
+        self._sync_range()
+        self._set_mode(self._mode)
 
     # ---- 构建/刷新 ----
     def _make_time_list(self, count: int, on_pick) -> QListWidget:
@@ -704,9 +1048,14 @@ class DatePickerPopup(QFrame):
         self._set_row_value(self.remind_btn, _human_reminder(self._reminder))
 
     def _refresh_calendar(self) -> None:
-        self.cal_title.setText(f"{self._month.month()}月 {self._month.year()}年")
-        start = self._month.addDays(-(self._month.dayOfWeek() % 7))
         today = QDate.currentDate()
+        self.cal_title.setText(f"{self._month.month()}月")
+        self.cal_year.setText(f"{self._month.year()}年")
+        # 跨年时年份标蓝：手输「2027年3月5日」这类，标题上不留个记号就会看错年
+        widgets._apply_property(
+            self.cal_year, "otherYear",
+            "true" if self._month.year() != today.year() else "false")
+        start = self._month.addDays(-(self._month.dayOfWeek() % 7))
         for i, btn in enumerate(self._day_btns):
             d = start.addDays(i)
             btn.setText(str(d.day()))
@@ -729,6 +1078,99 @@ class DatePickerPopup(QFrame):
             self.hour_list.setCurrentRow(h)
             self.minute_list.setCurrentRow(m)
 
+    # ---- 时间段（持续日期）----
+    def _range_row(self, lay, label: str) -> tuple[QPushButton, QPushButton]:
+        """一行「开始 [11/01] [16:00]」：两格各自弹小月历 / 时分两列。"""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        cap = QLabel(label)
+        cap.setObjectName("RangeCap")
+        row.addWidget(cap)
+        d = QPushButton()
+        d.setObjectName("RangeField")
+        d.setCursor(Qt.CursorShape.PointingHandCursor)
+        t = QPushButton()
+        t.setObjectName("RangeField")
+        t.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.addWidget(d, 1)
+        row.addWidget(t, 1)
+        lay.addLayout(row)
+        which = "start" if label == "开始" else "end"
+        d.clicked.connect(lambda _c=False, w=which, a=d: self._pick_range_date(w, a))
+        t.clicked.connect(lambda _c=False, w=which, a=t: self._pick_range_time(w, a))
+        return d, t
+
+    def _set_mode(self, key: str) -> None:
+        self._mode = key
+        if key == "range":
+            # 日期页那张网格改过起始日，切过来时得重新对齐（结束不许倒挂到前面）
+            if self._end < self._selected:
+                self._end = self._selected
+            self._sync_range()
+        self.page_date.setVisible(key == "date")
+        self.page_range.setVisible(key == "range")
+        for k, b in self._tabs.items():
+            widgets._apply_property(b, "on", "true" if k == key else "false")
+        self.adjustSize()
+
+    def _sync_range(self) -> None:
+        """四个格子上的字跟着状态走；勾了全天就把两个时刻格清空禁用。"""
+        all_day = self.all_day.isChecked()
+        self._rb_start_date.setText(self._selected.toString("MM/dd"))
+        self._rb_end_date.setText(self._end.toString("MM/dd"))
+        for btn, val in ((self._rb_start_time, self._time),
+                         (self._rb_end_time, self._end_time)):
+            btn.setText(dateparse.human_time(val) if val else "--:--")
+            btn.setEnabled(not all_day)
+
+    def _on_all_day(self, on: bool) -> None:
+        """全天 = 两个时刻清空（我们的模型里 due_time 为空就是全天）。"""
+        if on:
+            self._time = ""
+            self._end_time = ""
+            self.time_panel.hide()
+        else:
+            self._time = self._time or "09:00"
+            self._end_time = self._end_time or "18:00"
+        self._sync_time_btn()
+        self._sync_range()
+
+    def _pick_range_date(self, which: str, anchor: QPushButton) -> None:
+        cur = self._selected if which == "start" else self._end
+        pop = MonthPickPopup(cur.toString("yyyy-MM-dd"), self)
+        pop.picked.connect(lambda s: self._set_range_date(which, s))
+        popups.place_popup(pop, anchor)
+        pop.show()
+
+    def _set_range_date(self, which: str, iso: str) -> None:
+        d = QDate.fromString(iso, "yyyy-MM-dd")
+        if not d.isValid():
+            return
+        if which == "start":
+            self._selected = d
+            if self._end < d:
+                self._end = d      # 结束早于开始没有意义，跟着抬上来
+        else:
+            self._end = d if d >= self._selected else self._selected
+        self._month = QDate(self._selected.year(), self._selected.month(), 1)
+        self._refresh_calendar()
+        self._sync_range()
+
+    def _pick_range_time(self, which: str, anchor: QPushButton) -> None:
+        cur = self._time if which == "start" else self._end_time
+        pop = TimePickPopup(cur, self)
+        pop.picked.connect(lambda s: self._set_range_time(which, s))
+        popups.place_popup(pop, anchor)
+        pop.show()
+
+    def _set_range_time(self, which: str, hhmm: str) -> None:
+        if which == "start":
+            self._time = hhmm
+        else:
+            self._end_time = hhmm
+        self._sync_time_btn()
+        self._sync_range()
+
     # ---- 交互 ----
     def _shift_month(self, delta: int) -> None:
         self._month = self._month.addMonths(delta)
@@ -740,7 +1182,11 @@ class DatePickerPopup(QFrame):
         self._refresh_calendar()
 
     def _pick_day(self, idx: int) -> None:
-        self._selected = self._day_btns[idx]._date
+        d = self._day_btns[idx]._date
+        self._selected = d
+        if (d.year(), d.month()) != (self._month.year(), self._month.month()):
+            # 点上下月那几行灰日子：整页翻过去，标题才和选中的那天对得上
+            self._month = QDate(d.year(), d.month(), 1)
         self._refresh_calendar()
 
     def _quick_date(self, d: QDate) -> None:
@@ -770,7 +1216,14 @@ class DatePickerPopup(QFrame):
     def _accept(self) -> None:
         if not self._selected.isValid():
             self._selected = QDate.currentDate()
-        self.accepted.emit(self._selected.toString("yyyy-MM-dd"), self._time)
+        if self._mode == "range":
+            end_d = self._end.toString("yyyy-MM-dd")
+            end_t = "" if self.all_day.isChecked() else self._end_time
+        else:
+            # 从时间段切回日期页 = 这条不再是跨天的了，结束端要一起清掉
+            end_d = end_t = ""
+        self.accepted.emit(self._selected.toString("yyyy-MM-dd"), self._time,
+                           end_d, end_t)
         self.close()
 
     def _clear(self) -> None:
@@ -855,12 +1308,16 @@ class _MenuRow(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(8 + indent, 0, 8, 0)
         lay.setSpacing(8)
-        # 三个子控件都必须当场就认这个 parent：没有父对象的 QWidget 是「顶层窗口」，
-        # 下面那句 setVisible(True) 会把对勾当成一个独立弹窗 show 出来，
-        # 弹层因此抢不住鼠标抓取，整个菜单闪一下就 self-deleteLater 了
-        self.icon = TickIcon(icon_kind or "circle", 14,
-                             "red" if danger else (color or "text"), self)
-        lay.addWidget(self.icon)
+        self.icon = None
+        # icon_kind 给 None = 这一行不要图标列（滴答的二级菜单就是纯文字，
+        # 图标只在一级菜单当扫视锚点，二级里再放一排反而把文字推歪）
+        if icon_kind is not None:
+            # 三个子控件都必须当场就认这个 parent：没有父对象的 QWidget 是「顶层窗口」，
+            # 下面那句 setVisible(True) 会把对勾当成一个独立弹窗 show 出来，
+            # 弹层因此抢不住鼠标抓取，整个菜单闪一下就 self-deleteLater 了
+            self.icon = TickIcon(icon_kind or "circle", 14,
+                                 "red" if danger else (color or "text"), self)
+            lay.addWidget(self.icon)
         lbl = QLabel(text, self)
         lbl.setObjectName("TickMenuLabel")
         if danger:
@@ -871,8 +1328,10 @@ class _MenuRow(QFrame):
         self.tick = TickIcon("check", 14, "accent", self)
         self.tick.setVisible(on)
         lay.addWidget(self.tick)
+        self.arrow = None
         if arrow:
-            lay.addWidget(TickIcon("chevron_right", 12, "muted", self))
+            self.arrow = TickIcon("chevron_right", 12, "muted", self)
+            lay.addWidget(self.arrow)
 
     def set_on(self, on: bool) -> None:
         self.tick.setVisible(bool(on))
@@ -891,15 +1350,20 @@ class _MenuRow(QFrame):
 class TickMenu(QFrame):
     """滴答式弹层菜单。
 
-    ``items`` 是 ``(取值, 图标 kind, 文案[, 图标颜色])`` —— 取值和图标名分开，
-    是因为优先级 / 重复这类菜单里多行会共用同一个图标（三面旗子），
-    若按图标回传就会全部落到第一行；第四位可选，给需要单独上色的图标
-    （优先级四档要红 / 黄 / 蓝，见 `_prio_items`）。
+    ``items`` 里可以混三种东西：
+
+    - ``(取值, 图标 kind, 文案[, 图标颜色])`` —— 一行普通项。取值和图标名分开，
+      是因为优先级 / 重复这类菜单里多行会共用同一个图标（三面旗子），
+      若按图标回传就会全部落到第一行；第四位可选，给需要单独上色的图标
+      （优先级四档要红 / 黄 / 蓝，见 `_prio_items`）。
+    - ``(SEP,)`` 一条分隔线、``(CAP, "日期")`` 一段小标题 —— 滴答把右键菜单
+      分成了「日期 / 优先级 / 操作 / 危险」几段，平铺一长条读不出层次。
+    - ``(STRIP, 控件)`` 一整格自定义行，给日期五宫格和优先级四旗那种横排图标条。
     """
 
     picked = Signal(object)
 
-    def __init__(self, items: list[tuple[object, str, str]], parent=None,
+    def __init__(self, items: list[tuple], parent=None,
                  checked: object = None, danger: tuple[object, ...] = (),
                  width: int = 176, arrows: tuple[object, ...] = ()):
         # 必须用 POPUP_FLAGS：裸 Qt.Popup 在 Windows 上会按矩形加原生投影，
@@ -916,6 +1380,19 @@ class TickMenu(QFrame):
         lay.setContentsMargins(5, 5, 5, 5)
         lay.setSpacing(1)
         for item in items:
+            if len(item) == 1:
+                lay.addWidget(_Hairline(parent=card))
+                continue
+            if item[0] == CAP:
+                cap = QLabel(item[1], card)
+                cap.setObjectName("MenuSection")
+                lay.addWidget(cap)
+                continue
+            if item[0] == STRIP:
+                strip = item[1]
+                strip.setParent(card)
+                lay.addWidget(strip)
+                continue
             value, icon_kind, label = item[:3]
             color = item[3] if len(item) > 3 else ""
             on = (value in checked) if isinstance(
@@ -936,6 +1413,10 @@ class TickMenu(QFrame):
             self.close()
         except RuntimeError:  # noqa: BLE001
             pass
+
+    def pick(self, value: object) -> None:
+        """给菜单里的自定义控件（图标条）用：点一格 = 点一行，选完就关。"""
+        self._fire(value)
 
     def exec_at(self, global_pos: QPoint) -> None:
         self.adjustSize()
@@ -1055,9 +1536,8 @@ class MoreMenuPopup(QFrame):
         self._views: dict[str, _ViewBtn] = {}
         for key, kind, tip in (("list", "list", "列表视图"),
                                ("board", "board", "看板视图"),
-                               ("timeline", "timeline", "时间线视图（暂未支持）")):
+                               ("timeline", "timeline", "时间线视图（甘特）")):
             b = _ViewBtn(kind, tip, card)
-            b.setEnabled(key != "timeline")
             b.set_active(state.get("view") == key)
             b.clicked.connect(lambda _c=False, k=key: self.viewPicked.emit(k))
             row.addWidget(b, 1)
@@ -1117,6 +1597,241 @@ class MoreMenuPopup(QFrame):
     def hideEvent(self, event) -> None:  # noqa: N802
         super().hideEvent(event)
         self.deleteLater()
+
+
+class _PrioBtn(QPushButton):
+    """优先级弹层里的一格旗子：选中那一格描一圈框（滴答就是这么标的）。"""
+
+    def __init__(self, value: int, kind: str, color_key: str, tip: str,
+                 parent=None):
+        super().__init__(parent)
+        self.value = value
+        self.setObjectName("PrioBtn")
+        self.setFixedSize(36, 32)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tip)
+        widgets._apply_property(self, "on", "false")
+        self.icon = TickIcon(kind, 17, color_key or "border_strong", self)
+
+    def set_on(self, on: bool) -> None:
+        widgets._apply_property(self, "on", "true" if on else "false")
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.icon.move((self.width() - self.icon.width()) // 2,
+                       (self.height() - self.icon.height()) // 2)
+
+
+class _IconStrip(QFrame):
+    """菜单里那一横排图标按钮（日期五宫格 / 优先级四旗）。
+
+    滴答把「改期」和「改优先级」做成一排点一下就完事的格子，而不是五个 / 四个
+    菜单行 —— 这两件事用户是扫一眼就选的，摊成文字行会把整张菜单撑长一半。
+    """
+
+    picked = Signal(object)
+
+    def __init__(self, specs: list[tuple], parent=None, margin: int = 8):
+        super().__init__(parent)
+        self.setObjectName("MenuStrip")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(margin, 2, margin, 4)
+        lay.setSpacing(2)
+        for spec in specs:
+            value, kind, tip, glyph, on = spec[:5]
+            color = spec[5] if len(spec) > 5 else "muted"
+            btn = _ViewBtn(kind, tip, self)
+            if glyph:
+                btn.icon.set_glyph(glyph)
+            # 不用 _ViewBtn.set_active：它会把图标一起染成主色，
+            # 优先级那四格要的正是「红黄蓝各自保持自己的色，只有一格有底色」
+            widgets._apply_property(btn, "active", "true" if on else "false")
+            if color and color != "muted":
+                btn.icon.set_color_key(color)
+            btn.clicked.connect(lambda _=False, v=value: self.picked.emit(v))
+            lay.addWidget(btn)
+
+
+def _date_strip_specs(due: str, repeat: str) -> list[tuple]:
+    """日期那一排：今天 / 明天 / 下周 / 选日期 / 清除日期。
+
+    「下周」就是 +7 天（滴答的 +7 格）；重复任务没有「这一周期没日期」这个状态，
+    清除那一格改成「跳过这一周期」，图标不变、tooltip 说清楚。
+    """
+    today = QDate.currentDate()
+    return [
+        ("d0", "sun", "今天", "", due == today.toString("yyyy-MM-dd")),
+        ("d1", "sunrise", "明天", "", due == today.addDays(1).toString("yyyy-MM-dd")),
+        ("d7", "calendar", "下周", "+7",
+         due == today.addDays(7).toString("yyyy-MM-dd")),
+        ("pick", "calendar", "选择日期", "", False),
+        ("none", "calendar", "跳过此周期" if repeat else "清除日期", "×", False),
+    ]
+
+
+def _prio_strip_specs(prio: int) -> list[tuple]:
+    """优先级那一排四格旗子：红 / 黄 / 蓝 / 空心。
+
+    没选中的那三格也照色画 —— 滴答就是靠颜色本身当图例，不像文字菜单那样
+    只在选中项上上色。
+    """
+    return [("p%d" % v, "flag_none" if v == 0 else "flag", label, "", v == prio,
+             color or "border_strong")
+            for v, _kind, label, color in _prio_items()]
+
+
+class QuickMorePopup(QFrame):
+    """快速添加条上那枚旗子的弹层：滴答把优先级和「添加到 清单 / 标签」放一起。
+
+    这四个值（优先级 / 清单 / 标签 / 日期）原来只有日期有入口，其余全靠标题里
+    的 ``!`` / ``#清单`` / ``@标签`` 语法，打不出来就没有入口。
+    """
+
+    prioPicked = Signal(int)
+    listRequested = Signal()
+    tagsRequested = Signal()
+
+    def __init__(self, prio: int, list_name: str, tags, parent=None):
+        super().__init__(parent, POPUP_FLAGS)
+        self.setObjectName("TickMenu")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        card = QFrame(self)
+        card.setObjectName("TickMenuCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(6, 8, 6, 6)
+        lay.setSpacing(1)
+
+        cap = QLabel("优先级")
+        cap.setObjectName("MenuSection")
+        lay.addWidget(cap)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for value, kind, label, color in _prio_items():
+            b = _PrioBtn(value, kind, color, label, card)
+            b.set_on(value == int(prio or 0))
+            b.clicked.connect(lambda _c=False, v=value: self._pick_prio(v))
+            row.addWidget(b, 1)
+        lay.addLayout(row)
+        lay.addSpacing(3)
+        lay.addWidget(_Hairline(card))
+        lay.addSpacing(3)
+
+        cap2 = QLabel("添加到")
+        cap2.setObjectName("MenuSection")
+        lay.addWidget(cap2)
+        lr = _MenuRow("list", list_name or "收集箱", arrow=True, parent=card)
+        lr.clicked_.connect(self._ask_list)
+        lay.addWidget(lr)
+        tr = _MenuRow("tag", "标签" + (f"（{len(tags)}）" if tags else ""),
+                      arrow=True, parent=card)
+        tr.clicked_.connect(self._ask_tags)
+        lay.addWidget(tr)
+        self.setFixedWidth(198)
+
+    def _pick_prio(self, value: int) -> None:
+        self.prioPicked.emit(value)
+        self.close()
+
+    def _ask_list(self) -> None:
+        # 二级菜单要盖在别处，先收自己再开：两个 Qt.Popup 叠着会把父层
+        # deleteLater 掉，子层是它的孩子就一起没了（同 MoreMenuPopup）
+        self.listRequested.emit()
+        self.close()
+
+    def _ask_tags(self) -> None:
+        self.tagsRequested.emit()
+        self.close()
+
+    def exec_at(self, global_pos: QPoint) -> None:
+        self.adjustSize()
+        self.move(global_pos)
+        self.show()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.deleteLater()
+
+
+class UndoBar(QFrame):
+    """完成之后浮在中栏底部中间的撤销条：滴答那版是「标题 已完成 ↺」。
+
+    整条都能点，点一下退回未完成；6 秒自己收。同一时刻只留最新一条 ——
+    连着勾好几条时，最早那条已经不是用户要撤的对象了。
+    """
+
+    undone = Signal(object)          # ("todo", id, occ) / ("habit", id, date)
+    HOLD = 6000
+
+    def __init__(self, host: QWidget):
+        super().__init__(host)
+        self.setObjectName("UndoBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._payload = None
+        self.setFixedHeight(40)
+        self.setCursor(Qt.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 0, 12, 0)
+        lay.setSpacing(8)
+        self.text_lbl = QLabel("")
+        self.text_lbl.setObjectName("UndoText")
+        self.verb_lbl = QLabel("已完成")
+        self.verb_lbl.setObjectName("UndoVerb")
+        # 深底上一条，图标和字都得是白的（QSS 管不到自绘图标）
+        self.icon = TickIcon("restore", 16, "text")
+        self.icon.set_color_hex("#ffffff")
+        lay.addWidget(self.text_lbl)
+        lay.addWidget(self.verb_lbl)
+        lay.addSpacing(2)
+        lay.addWidget(self.icon)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+
+    def payload(self):
+        return self._payload
+
+    def show_for(self, payload, text: str, verb: str = "已完成") -> None:
+        self._payload = payload
+        self.verb_lbl.setText(verb)
+        f = QFont(self.text_lbl.font())
+        f.setPixelSize(13)
+        # 标题长到一定程度就截断：这条只有 260px 左右宽，不截会把撤销箭头顶出去
+        self.text_lbl.setText(QFontMetrics(f).elidedText(
+            text or "", Qt.ElideRight, 260))
+        self.text_lbl.setFont(f)
+        self.verb_lbl.setFont(f)
+        self.adjustSize()
+        self.place()
+        self.show()
+        self.raise_()
+        self._timer.start(self.HOLD)
+
+    def place(self) -> None:
+        host = self.parentWidget()
+        if host is None:
+            return
+        want = self.sizeHint().width()
+        w = max(160, min(want, host.width() - 24))
+        self.setFixedWidth(w)
+        self.move(max(8, (host.width() - w) // 2),
+                  max(8, host.height() - self.height() - 18))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        event.accept()        # 别冒到 canvas 上被「点空白收起详情」吃掉
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (event.button() == Qt.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            payload, self._payload = self._payload, None
+            self.hide()
+            if payload is not None:
+                self.undone.emit(payload)
+            return
+        super().mouseReleaseEvent(event)
 
 
 class TaskListArea(QScrollArea):
@@ -1208,8 +1923,7 @@ class TaskListArea(QScrollArea):
             it = self._layout.takeAt(0)
             w = it.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+                widgets.drop_widget(w)
         self._widgets.clear()
         self._hide_indicator()
 
@@ -1436,8 +2150,7 @@ class BoardArea(QScrollArea):
             it = self._lay.takeAt(0)
             w = it.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+                widgets.drop_widget(w)
         self._widgets.clear()
         self._columns.clear()
         self._current = None
@@ -1583,8 +2296,7 @@ class QuadArea(QScrollArea):
             it = self._grid.takeAt(0)
             w = it.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+                widgets.drop_widget(w)
         self._widgets.clear()
         self._cards.clear()
 
@@ -1616,6 +2328,289 @@ class QuadArea(QScrollArea):
         return super().eventFilter(obj, event)
 
 
+class TimelineLane(QWidget):
+    """一条任务一行，按日期画一根横条。"""
+
+    clicked_ = Signal(object)            # 把 TodoRow 原样交回页面（要 occ / 显示日）
+    blank = Signal()
+
+    H = 34
+    BAR_H = 26
+
+    def __init__(self, row: "TodoRow", x0: int, span: int, overdue: bool,
+                 area: "TimelineArea", parent=None):
+        super().__init__(parent)
+        self.row = row
+        self.x0 = x0
+        self.w = max(28, span * area.DAY_W - 6)
+        self.overdue = overdue
+        self.area = area
+        self._hover = False
+        self.setFixedHeight(self.H)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def bar_rect(self) -> QRectF:
+        return QRectF(self.x0 + 3, (self.H - self.BAR_H) / 2,
+                      self.w, self.BAR_H)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        self.area.paint_background(p, self.H)
+        r = self.bar_rect()
+        sel = self.row._todo_id == self.area.selected_id
+        key = ("red" if self.overdue and not sel
+               else "accent_hi" if sel else "accent")
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.get(key)))
+        p.drawRoundedRect(r, 6, 6)
+        # 条上的字：标题 + 跨天时带上日期，短到放不下就省略号
+        p.setPen(QColor("#ffffff"))
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        p.setFont(f)
+        text = self.row.data.get("title") or ""
+        if self.overdue:
+            text = "%s  已逾期" % text
+        box = r.adjusted(9, 0, -6, 0)
+        # drawText 的重载不接受 ElideMode 和 AlignmentFlag 相或，自己量着截
+        text = QFontMetrics(f).elidedText(text, Qt.ElideRight, int(box.width()))
+        p.drawText(box, Qt.AlignVCenter, text)
+        if self._hover and not sel:
+            p.setBrush(QColor(255, 255, 255, 34))
+            p.drawRoundedRect(r, 6, 6)
+        p.end()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            return
+        if self.bar_rect().contains(event.position().toPoint()):
+            self.clicked_.emit(self.row)
+        else:
+            self.blank.emit()
+
+
+class TimelineGroup(QWidget):
+    """时间线里的分组标题行（「未分组 4」「已过期 2」那一行）。"""
+
+    blank = Signal()
+
+    def __init__(self, header: GroupHeader, area: "TimelineArea", parent=None):
+        super().__init__(parent)
+        self.header = header
+        self.area = area
+        self.setFixedHeight(30)
+        self.setCursor(Qt.PointingHandCursor)
+        header.toggled.connect(lambda _k, _on: self.update())
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.blank.emit()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        # 标题钉在视口左边：这一行和横条一样宽（5000 多 px），跟着滚动走的话
+        # 往右一拖组名就没了
+        x = self.area.hbar().value() + 10.0
+        f = QFont(self.font())
+        f.setPixelSize(12.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(theme.get("text_hi")))
+        p.drawText(QRectF(x, 0, 300, self.height()),
+                   Qt.AlignVCenter, self.header.title_text)
+        p.end()
+
+
+class TimelineArea(QWidget):
+    """时间线（甘特）视图：滴答那排「视图」里的第三档。
+
+    顶上是一条日期轴（今天标红、周末 / 法定假带 休、调休带 班），下面每条任务
+    一根横条 —— 单日的就是一格，持续时间段的拉成一条长的。reload 那套
+    add_widget 契约和看板一样，所以列表 / 看板 / 时间线共用一条渲染路径。
+    """
+
+    emptyClicked = Signal()
+    barClicked = Signal(object)
+    DAY_W = 92
+    LEAD = 7            # 轴从今天往前再多铺 7 天，逾期任务不至于看不见
+    SPAN = 60
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TimelineWrap")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.start = QDate.currentDate().addDays(-self.LEAD)
+        self.selected_id = 0
+        self.head = QWidget()
+        self.head.setObjectName("TimelineHead")
+        self.head.setFixedHeight(34)
+        # 轴上的格子直接按 x 摆，不走布局：走布局的话这条 5500px 宽的轴会把
+        # 整个窗口顶出一个缩不下去的下限（窗口直接变全屏宽）。子控件超出
+        # 父控件的部分本来就被裁掉，所以不用额外做视口。
+        self.head_inner = QWidget(self.head)
+        self.head_inner.setGeometry(0, 0, self.SPAN * self.DAY_W, 34)
+        lay.addWidget(self.head)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("TimelineScroll")
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setWidgetResizable(True)
+        self.inner = QWidget()
+        self.inner.setObjectName("TimelineContainer")
+        # widgetResizable 会把内容压到视口宽，横向往滚就没有范围了 ——
+        # 撑住最小宽度，横向滚动条才有得滚
+        self.inner.setMinimumWidth(self.SPAN * self.DAY_W)
+        self.lay = QVBoxLayout(self.inner)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(0)
+        self.lay.addStretch(1)
+        self.scroll.setWidget(self.inner)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.verticalScrollBar().valueChanged.connect(
+            lambda _v: self.head_inner.move(-self.hbar().value(), 0))
+        self.hbar().valueChanged.connect(
+            lambda _v: self.head_inner.move(-_v, 0))
+        lay.addWidget(self.scroll, 1)
+        # _container 这个名字是给页面复用的：折叠分组时它拿
+        # _area._container.layout().activate()
+        self._container = self.inner
+        self._widgets: list[QWidget] = []
+        self._lanes: list[QWidget] = []
+        self._build_head()
+
+    def _build_head(self) -> None:
+        for i in range(self.SPAN):
+            strip = TimelineHeadStrip(self.start.addDays(i), self.head_inner)
+            strip.move(i * self.DAY_W, 0)
+
+    def hbar(self):
+        return self.scroll.horizontalScrollBar()
+
+    # ---- 与 TaskListArea / BoardArea 同形的最小接口 ----
+    def clear_items(self) -> None:
+        while self.lay.count() > 1:
+            it = self.lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                widgets.drop_widget(w)
+        self._widgets.clear()
+        self._lanes.clear()
+
+    def add_widget(self, widget: QWidget) -> None:
+        if isinstance(widget, GroupHeader):
+            g = TimelineGroup(widget, self, self.inner)
+            g.blank.connect(self.emptyClicked.emit)
+            self.lay.insertWidget(self.lay.count() - 1, g)
+            self._lanes.append(g)
+            self._widgets.append(widget)
+            return
+        if not isinstance(widget, TodoRow):
+            # 打卡行之类的别的行控件：时间线上没有日期可摆，摘掉父级收走
+            # （不能 deleteLater，页面的 _checkin_rows_by_id 还可能指着它）
+            widget.hide()
+            widget.setParent(None)
+            return
+        data = widget.data
+        # 行控件本身在时间线上没地方摆，但页面的 _items / _mark_selected 还指着
+        # 它们，删掉就成了野指针。挂进布局藏起来：隐藏的控件在布局里不占位，
+        # 下次 clear_items 又能连着一起收走。
+        due = QDate.fromString(data.get("due_date") or "", "yyyy-MM-dd")
+        self._widgets.append(widget)
+        self.lay.insertWidget(self.lay.count() - 1, widget)
+        widget.hide()
+        if not due.isValid():
+            # 没有日期的任务在时间线上没有位置可放；列表 / 看板里照常看得见
+            return
+        end = QDate.fromString(data.get("end_date") or "", "yyyy-MM-dd")
+        if not end.isValid() or end < due:
+            end = due
+        x0 = self.start.daysTo(due) * self.DAY_W
+        span = max(1, due.daysTo(end) + 1)
+        lane = TimelineLane(widget, x0, span, end < QDate.currentDate(), self)
+        lane.clicked_.connect(self.barClicked.emit)
+        lane.blank.connect(self.emptyClicked.emit)
+        self.lay.insertWidget(self.lay.count() - 1, lane)
+        self._lanes.append(lane)
+
+    def scroll_value(self) -> int:
+        return self.scroll.verticalScrollBar().value()
+
+    def set_scroll_value(self, v: int) -> None:
+        self.scroll.verticalScrollBar().setValue(v)
+
+    def finalize_layout(self) -> None:
+        self.lay.activate()
+        # 打开就滚到「今天」附近，不然得手动拖半天。滚动范围要等这一轮布局
+        # 走完才算得出来，当场 setValue 会被 0 上限夹掉。
+        today_x = max(0, (self.start.daysTo(QDate.currentDate()) - 1) * self.DAY_W)
+        QTimer.singleShot(0, lambda: self.hbar().setValue(today_x))
+
+    def set_reorder_enabled(self, on: bool) -> None:
+        """时间线上不做拖拽排序：横条的位置就是它的日期，拖法只能是改日期。"""
+
+    def paint_background(self, p: QPainter, h: float) -> None:
+        """周末 / 今天的底纹。每行自己画，横向滚动天然跟着走。"""
+        hol = _holidays()
+        for i in range(self.SPAN):
+            d = self.start.addDays(i)
+            x = i * self.DAY_W
+            if d == QDate.currentDate():
+                p.fillRect(QRectF(x, 0, self.DAY_W, h), QColor(theme.get("accent_soft")))
+            elif hol.day_type(d) == "休":
+                p.fillRect(QRectF(x, 0, self.DAY_W, h), QColor(theme.get("surface_hi")))
+            p.setPen(QPen(QColor(theme.get("border")), 1))
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
+
+
+class TimelineHeadStrip(QWidget):
+    """日期轴上的一格：日号 + 周末 / 假期的 休 / 班 角标。"""
+
+    def __init__(self, day: QDate, parent=None):
+        super().__init__(parent)
+        self.day = day
+        self.setFixedSize(TimelineArea.DAY_W, 34)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        today = self.day == QDate.currentDate()
+        mark = _holidays().day_type(self.day)
+        if today:
+            p.fillRect(self.rect(), QColor(theme.get("accent_soft")))
+        elif mark == "休":
+            p.fillRect(self.rect(), QColor(theme.get("surface_hi")))
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setBold(today)
+        p.setFont(f)
+        p.setPen(QColor(theme.get("red" if today else "muted")))
+        p.drawText(QRectF(0, 0, self.width() - 16, self.height()),
+                   Qt.AlignCenter, str(self.day.day()))
+        if mark:
+            g = QFont(self.font())
+            g.setPixelSize(9)
+            p.setFont(g)
+            p.setPen(QColor(theme.get("green" if mark == "休" else "muted")))
+            p.drawText(QRectF(self.width() - 18, 4, 16, 14),
+                       Qt.AlignCenter, mark)
+        p.setPen(QPen(QColor(theme.get("border")), 1))
+        p.drawLine(QPointF(self.width() - 1, 0), QPointF(self.width() - 1, self.height()))
+        p.end()
+
+
 class _RowSub(QFrame):
     """「显示检查事项」打开时，行内列出的那条子任务。
 
@@ -1624,20 +2619,23 @@ class _RowSub(QFrame):
     """
 
     toggled_sub = Signal(object, bool)
+    subClicked = Signal(dict)
 
     def __init__(self, sub: dict, indent: int = 0, parent=None):
         super().__init__(parent)
         self.sub = sub
         self.setObjectName("RowSub")
-        self.setFixedHeight(22)
+        self.setFixedHeight(24)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(indent, 0, 0, 0)
         lay.setSpacing(7)
-        self.check = PrioCheckBox(bool(sub["done"]), 14)
+        self.check = PrioCheckBox(bool(sub["done"]), 15)
         self.check.toggled.connect(lambda c: self.toggled_sub.emit(sub, c))
         lay.addWidget(self.check)
-        self.lbl = QLabel(sub["title"])
+        # 复习条目点标题 = 跳到刷题页那一题（大任务那一行点开是详情，不是跳转）
+        self.lbl = ClickableLabel(sub["title"])
         self.lbl.setObjectName("RowSubText")
+        self.lbl.clicked.connect(lambda _p: self.subClicked.emit(self.sub))
         widgets._apply_property(self.lbl, "done", "true" if sub["done"] else "false")
         f = QFont()
         f.setStrikeOut(bool(sub["done"]))
@@ -1657,6 +2655,8 @@ class TodoRow(QFrame):
     contextRequested = Signal(int, object)   # (todo_id, 行内坐标)
     dragGroup = Signal(str)                  # 拖拽开始 / 结束时把所属分组报给列表
     subToggled = Signal(object, bool)        # (子任务 dict, 勾选)
+    subClicked = Signal(dict)                # 点行内某条子任务的标题
+    doneToggled = Signal(int, str, bool)     # (todo_id, 周期日, 最终是否完成)
 
     def __init__(self, data: dict, show_list: bool = True, disp: dict | None = None):
         super().__init__()
@@ -1758,7 +2758,8 @@ class TodoRow(QFrame):
             list_lbl.setObjectName("TodoList")
             m.addWidget(list_lbl)
         text, state = _date_state(data["due_date"], data.get("due_time", ""),
-                                  bool(disp.get("countdown")))
+                                  bool(disp.get("countdown")),
+                                  data.get("end_date") or "")
         date_ws: list[QWidget] = []
         if text:
             if state == "overdue":
@@ -1813,11 +2814,27 @@ class TodoRow(QFrame):
             outer.addWidget(ll)
             extra += ll.sizeHint().height()
         if disp.get("checks"):
-            for s in (data.get("subs") or []):
+            subs = data.get("subs") or []
+            # 复习大任务默认折着：一天十几道题摊开会把整屏占满，点开详情再逐条勾。
+            cap = 0 if data.get("review_group") else SUB_INLINE_MAX
+            for s in subs[:cap]:
                 row = _RowSub(s, 27)
                 row.toggled_sub.connect(self.subToggled.emit)
+                row.subClicked.connect(self.subClicked.emit)
                 outer.addWidget(row)
-                extra += 22
+                extra += row.height()
+            left = len(subs) - cap
+            if left > 0:
+                # 复习行一条都没摊，那行是「共几项」；普通行摊了三条，才是「还剩几项」
+                text = ("%d 项待复习" % len(subs)) if cap == 0 else "还有 %d 项" % left
+                more = ClickableLabel(text)
+                more.setObjectName("RowSubMore")
+                more.setIndent(SUB_TEXT_INDENT)
+                more.setFixedHeight(20)
+                more.clicked.connect(
+                    lambda _p: self.titleClicked.emit(self._todo_id))
+                outer.addWidget(more)
+                extra += 20
         self.setFixedHeight(40 + extra)
 
         self._refresh_style()
@@ -1831,6 +2848,9 @@ class TodoRow(QFrame):
         f.setStrikeOut(done)
         self.title_lbl.setFont(f)
         self.check.set_checked(done)
+        # 放弃的那条框里画 ✕：滴答用这一笔把「做完了」和「不做了」分开，
+        # 划掉 + 灰字两边一样，只有勾本身能看出来
+        self.check.set_cross(bool(self.data.get("abandoned")) and not int(self.data["done"] or 0))
         self.check.set_priority(self.data.get("priority", 0))
 
     def set_selected(self, on: bool) -> None:
@@ -1897,12 +2917,15 @@ class TodoRow(QFrame):
         self.data["done"] = int(checked)
         # occ_set_done 内部区分「重复系列的某周期写 todo_occ」和「普通任务写 todos.done」
         services.occ_set_done(self._todo_id, self._occ, checked)
-        if checked and not _review_ask(self, self._todo_id, self._occ):
+        if checked and not _review_ask_group(self, self._todo_id):
+            services.occ_set_done(self._todo_id, self._occ, False)
             self.data["done"] = 0       # 复习结论没答，这条已经退回未完成
         elif checked and not services.review_kind_of_todo(self._todo_id):
             sounds.play("todo_done")
         self._refresh_style()
         self.changed.emit()
+        # 复习没答完会退回 0，所以发的是「最终状态」而不是入参
+        self.doneToggled.emit(self._todo_id, self._occ, bool(self.data["done"]))
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         """改名编辑框上的两件事：Esc 取消；按住标题横向拖改成拖整行。
@@ -2008,6 +3031,7 @@ class GroupHeader(QFrame):
                  icon_kind: str = "", icon_hex: str = ""):
         super().__init__()
         self.key = key
+        self.title_text = title      # 时间线那一栏要重画这个标题，得留个副本
         self.expanded = expanded
         self.setObjectName("GroupHeader")
         self.setFixedHeight(34)
@@ -2041,8 +3065,35 @@ class GroupHeader(QFrame):
     def _set_arrow(self) -> None:
         self.arrow.set_kind("chevron_down" if self.expanded else "chevron_right")
 
+    def _blank_span(self) -> tuple[int, int]:
+        """标题内容右边缘 ~ 右侧动作按钮左边缘之间那段空白。
+
+        布局里只有一根 stretch，它两边就是「有字的地方」和「按钮」，
+        中间这段没有控件，点它应当算点空白而不是折叠分组。
+        """
+        lay = self.layout()
+        gap = next((i for i in range(lay.count())
+                    if lay.itemAt(i).spacerItem() is not None), -1)
+        if gap < 0:
+            return self.width(), self.width()
+        left, right = 0, self.width()
+        for i in range(gap):
+            w = lay.itemAt(i).widget()
+            if w is not None:
+                left = max(left, w.x() + w.width())
+        for i in range(gap + 1, lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is not None:
+                right = min(right, w.x())
+        return left, right
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.LeftButton:
+            return
+        lo, hi = self._blank_span()
+        if lo <= event.position().x() <= hi:
+            # 冒泡到列表容器，走「点空白收起详情」那条路
+            event.ignore()
             return
         self.expanded = not self.expanded
         self._set_arrow()
@@ -2058,6 +3109,7 @@ class SideRow(QWidget):
 
     picked = Signal(str)
     dropped = Signal(str, int)
+    moved = Signal(str, str, bool)        # 组内排序：(被拖的 key, 目标 key, 拖到其后)
     addRequested = Signal(str)
     moreRequested = Signal(str, object)
     expandToggled = Signal(str)
@@ -2066,13 +3118,16 @@ class SideRow(QWidget):
                  icon_key: str = "muted", icon_hex: str = "", tint: str = "",
                  count: int | str = "", indent: int = 0, expandable: bool = False,
                  expanded: bool = True, show_add: bool = False,
-                 dot_hex: str = "", parent=None):
+                 dot_hex: str = "", parent=None, reorderable: bool = False):
         super().__init__(parent)
         self.key = key
         self._checked = False
         self._hover = False
         self._expandable = expandable
         self._expanded = expanded
+        # 只有同组的两行之间能排序（清单不能拖去和标签换位置）
+        self._reorderable = reorderable
+        self._press = None
         self.setObjectName("SideRow")
         # 裸 QWidget 默认不理会 QSS 的 background，选中/悬停的底色必须显式打开
         # WA_StyledBackground，否则切 tab 只看到文字变化、完全没有滴答那层高亮。
@@ -2192,34 +3247,91 @@ class SideRow(QWidget):
         self._hover = False
         self._sync_hover()
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() != Qt.LeftButton:
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press = event.position().toPoint()
+            # 吃掉：不吃的话按下会冒到导航容器上，也拿不到后续的 move 事件
+            event.accept()
             return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        start = self._press
+        if (self._reorderable and start is not None
+                and event.buttons() & Qt.LeftButton
+                and (event.position().toPoint() - start).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._press = None
+            mime = QMimeData()
+            mime.setData(MIME_NAV, self.key.encode())
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            pix = self.grab()
+            drag.setPixmap(pix)
+            drag.setHotSpot(QPoint(16, pix.height() // 2))
+            drag.exec(Qt.MoveAction)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 起过拖就没有「按下点」了，松手不再当一次点击（否则拖完顺手切了视图）
+        if event.button() != Qt.LeftButton or self._press is None:
+            self._press = None
+            return
+        self._press = None
         if self._expandable and event.position().x() < 26:
             self.set_expanded(not self._expanded)
             self.expandToggled.emit(self.key)
             return
         self.picked.emit(self.key)
 
+    def _nav_drag_ok(self, event) -> bool:
+        md = event.mimeData()
+        if not md.hasFormat(MIME_NAV):
+            return False
+        src = bytes(md.data(MIME_NAV)).decode()
+        grp = _nav_group(src)
+        return bool(grp) and src != self.key and grp == _nav_group(self.key) \
+            and _nav_parent(src) == _nav_parent(self.key)
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._nav_drag_ok(event):
+            event.acceptProposedAction()
+            return
         if event.mimeData().hasFormat(MIME_TODO):
             event.acceptProposedAction()
             self._set_drop_hot(True)
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self._nav_drag_ok(event):
+            event.acceptProposedAction()
+            self._set_nav_edge("below" if event.position().y()
+                               > self.height() // 2 else "above")
+            return
         if event.mimeData().hasFormat(MIME_TODO):
             event.acceptProposedAction()
             self._set_drop_hot(True)
 
     def dragLeaveEvent(self, event) -> None:  # noqa: N802
         self._set_drop_hot(False)
+        self._set_nav_edge("")
 
     def dropEvent(self, event) -> None:  # noqa: N802
         self._set_drop_hot(False)
+        self._set_nav_edge("")
+        if self._nav_drag_ok(event):
+            src = bytes(event.mimeData().data(MIME_NAV)).decode()
+            after = event.position().y() > self.height() // 2
+            self.moved.emit(src, self.key, after)
+            event.acceptProposedAction()
+            return
         if event.mimeData().hasFormat(MIME_TODO):
             tid = int(bytes(event.mimeData().data(MIME_TODO)).decode())
             self.dropped.emit(self.key, tid)
             event.acceptProposedAction()
+
+    def _set_nav_edge(self, edge: str) -> None:
+        widgets._apply_property(self, "navEdge", edge)
 
     def _set_drop_hot(self, on: bool) -> None:
         """拖任务悬在左栏某行上时把那行点亮。
@@ -2374,10 +3486,12 @@ class DetailPane(QFrame):
     收进右下角「⋯」菜单，和滴答一样保持面板紧凑。
     """
 
+    doneFlipped = Signal(int, str, bool)
     taskSaved = Signal(int)
     taskDeleted = Signal(int)
     tagsChanged = Signal()        # 只改标签：刷角标就够，别整页重建
     backRequested = Signal()      # 窄屏整页化时的「← 返回列表」
+    subClicked = Signal(dict)     # 点某条子任务标题（复习条目 → 跳到那一题）
 
     def __init__(self):
         super().__init__()
@@ -2693,9 +3807,16 @@ class DetailPane(QFrame):
             self.date_chip.icon.set_color_key("muted")
             self.date_chip.repeat_icon.setVisible(False)
             return
-        self.date_chip.text.setText(_detail_date_label(date, time_v))
+        self.date_chip.text.setText(
+            _detail_date_label(date, time_v,
+                               "" if self._occ else t.get("end_date") or ""))
         widgets._apply_property(self.date_chip.text, "placeholder", "false")
-        left = QDate.currentDate().daysTo(QDate.fromString(date, "yyyy-MM-dd"))
+        # 跨天的任务要过了结束日才算逾期，按起始日判会提前红起来
+        ref = (t.get("end_date") or "") if not self._occ else ""
+        rd = QDate.fromString(ref, "yyyy-MM-dd")
+        if not (rd.isValid() and rd > QDate.fromString(date, "yyyy-MM-dd")):
+            rd = QDate.fromString(date, "yyyy-MM-dd")
+        left = QDate.currentDate().daysTo(rd)
         self.date_chip.icon.set_color_key("red" if left < 0 else "accent")
         self.date_chip.text.setStyleSheet(
             f"color: {theme.get('red') if left < 0 else theme.get('text')};")
@@ -2704,11 +3825,10 @@ class DetailPane(QFrame):
     def _sync_list_rows(self) -> None:
         """底栏显示所属清单的图标 + 名字（顶栏那个位置现在是完成勾选框）。"""
         name = self._task.get("list_name") or "收集箱"
-        hex_value, icon_kind = "", "inbox"
+        icon_kind = "inbox"
         if name != "收集箱":
             for lst in services.list_all():
                 if lst["name"] == name:
-                    hex_value = lst.get("color") or ""
                     icon_kind = lst.get("icon") or "list"
                     break
         else:
@@ -2720,8 +3840,6 @@ class DetailPane(QFrame):
         for ch in self.foot_list_btn.findChildren(TickIcon):
             ch.deleteLater()
         ic = TickIcon(icon_kind, 15, "muted", self.foot_list_btn)
-        if hex_value:
-            ic.set_color_hex(hex_value)
         ic.move(4, 6)
         ic.show()
 
@@ -2740,10 +3858,13 @@ class DetailPane(QFrame):
             return
         self._task["done"] = int(checked)
         services.occ_set_done(self._task["id"], self._occ, checked)
-        if checked and not _review_ask(self, self._task["id"], self._occ):
+        if checked and not _review_ask_group(self, self._task["id"]):
+            services.occ_set_done(self._task["id"], self._occ, False)
             self._task["done"] = 0      # 复习结论没答，这条已经退回未完成
         elif checked and not services.review_kind_of_todo(self._task["id"]):
             sounds.play("todo_done")
+        self.doneFlipped.emit(self._task["id"], self._occ,
+                              bool(self._task["done"]))
         self.taskSaved.emit(self._task["id"])
 
     def _on_title_edited(self) -> None:
@@ -2840,7 +3961,8 @@ class DetailPane(QFrame):
             ("repeat", "repeat", ("重复：" + rep) if rep else "重复"),
             ("duration", "duration",
              ("时长：" + _human_duration(dur)) if dur else "时长"),
-            ("archive", "archive", "归档任务"),
+            ("archive", "archive",
+             "取消归档" if t.get("archived") else "归档任务"),
             ("delete", "trash", "删除")]
         self._menu(items, self._pick_more, self._foot_more, danger=("delete",))
 
@@ -2854,7 +3976,8 @@ class DetailPane(QFrame):
             self._open_duration_menu()
         elif v == "archive":
             tid = self._task["id"]
-            services.todo_update(tid, archived=1)
+            # 右键菜单照滴答改窄之后，这里是「取消归档」的唯一入口（在已归档视图里）
+            services.todo_update(tid, archived=0 if self._task.get("archived") else 1)
             self.clear()
             self.taskDeleted.emit(tid)
         elif v == "delete":
@@ -2934,7 +4057,11 @@ class DetailPane(QFrame):
                               (self._disp_time if self._disp_date
                                else t.get("due_time")) or "",
                               repeat=t.get("repeat") or "",
-                              reminder=t.get("reminder") or "")
+                              reminder=t.get("reminder") or "",
+                              end_date="" if self._occ else t.get("end_date") or "",
+                              end_time="" if self._occ else t.get("end_time") or "",
+                              # 单个重复周期没有「跨天」可存（occ 表只有改期字段）
+                              allow_range=not self._occ)
         pop.accepted.connect(self._on_date_picked)
         pop.cleared.connect(self._on_date_cleared)
         pop.repeatPicked.connect(self._on_repeat_picked)
@@ -2959,7 +4086,8 @@ class DetailPane(QFrame):
         self._task["reminder"] = value
         self._save()
 
-    def _on_date_picked(self, date: str, time_v: str) -> None:
+    def _on_date_picked(self, date: str, time_v: str, end_date: str = "",
+                        end_time: str = "") -> None:
         if not self._task:
             return
         if self._occ:
@@ -2968,6 +4096,7 @@ class DetailPane(QFrame):
             self._disp_date, self._disp_time = date, time_v
         else:
             self._task["due_date"], self._task["due_time"] = date, time_v
+            self._task["end_date"], self._task["end_time"] = end_date, end_time
         self._sync_date_row()
         self._save()
 
@@ -2979,6 +4108,7 @@ class DetailPane(QFrame):
             self._disp_date = self._disp_time = ""
         else:
             self._task["due_date"] = self._task["due_time"] = ""
+            self._task["end_date"] = self._task["end_time"] = ""
             # 提醒是挂在截止日上的，日期清掉不清提醒的话，行上会一直留着
             # 一枚点了没反应的闹钟图标
             self._task["reminder"] = ""
@@ -2991,9 +4121,8 @@ class DetailPane(QFrame):
             it = self.sub_list.takeAt(0)
             w = it.widget()
             if w is not None:
-                # setParent(None) 之后 item 就不再持有该控件，必须只取一次
-                w.setParent(None)
-                w.deleteLater()
+                # takeAt 之后 item 就不再持有该控件，必须只取一次
+                widgets.drop_widget(w)
         self.sub_add_row.setVisible(False)   # 换任务就收回去，点按钮再出来
         if not self._task:
             self.sub_wrap.setVisible(False)
@@ -3008,6 +4137,7 @@ class DetailPane(QFrame):
         row.toggled_sub.connect(self._on_subtask_check)
         row.deleted_sub.connect(self._del_subtask)
         row.moved.connect(self._on_sub_moved)
+        row.subClicked.connect(self.subClicked.emit)
         self.sub_list.addWidget(row)
 
     def _on_sub_moved(self, src_id: int, over_id: int, after: bool) -> None:
@@ -3026,7 +4156,11 @@ class DetailPane(QFrame):
     def _on_subtask_check(self, sub: dict, checked: bool) -> None:
         services.subtask_update(sub["id"], done=int(checked))
         sub["done"] = int(checked)
-        if checked:
+        if checked and not _review_ask_sub(self, sub):
+            return            # 复习结论没答，这条已经退回未勾，不用刷音也不用重建
+        # 答完结论的复习条目会被重排到别的日子、这一条直接从库里消失，
+        # 所以那两种情况不再叠一层「子任务完成」音（答对/答错音已经响过了）
+        if checked and not services.review_kind_of_sub(sub["id"]):
             sounds.play("subtask_done")
         if self._task:
             self.taskSaved.emit(self._task["id"])
@@ -3075,8 +4209,7 @@ class DetailPane(QFrame):
             it = lay.takeAt(1)
             w = it.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+                widgets.drop_widget(w)
         by_id = {t["id"]: t for t in services.tag_all()}
         for tid in self._task_tag_ids():
             tg = by_id.get(tid)
@@ -3158,6 +4291,8 @@ class DetailPane(QFrame):
         if not self._occ:
             fields["due_date"] = self._task.get("due_date", "")
             fields["due_time"] = self._task.get("due_time", "")
+            fields["end_date"] = self._task.get("end_date", "")
+            fields["end_time"] = self._task.get("end_time", "")
         services.todo_update(self._task["id"], **fields)
         self.taskSaved.emit(self._task["id"])
 
@@ -3177,6 +4312,7 @@ class _SubRow(QFrame):
 
     toggled_sub = Signal(dict, bool)
     deleted_sub = Signal(int)
+    subClicked = Signal(dict)               # 点标题：复习条目是跳转，别的是改名
     moved = Signal(int, int, bool)      # (被拖的 id, 落到哪一行, 落在它后面吗)
 
     def __init__(self, sub: dict, parent=None):
@@ -3201,7 +4337,7 @@ class _SubRow(QFrame):
         self.title.setObjectName("SubTaskTitle")
         widgets._apply_property(self.title, "done",
                                 "true" if sub["done"] else "false")
-        self.title.clicked.connect(self._rename)
+        self.title.clicked.connect(self._title_clicked)
         lay.addWidget(self.title, 1)
         self.edit = QLineEdit(sub["title"])
         self.edit.setObjectName("SubRename")
@@ -3288,6 +4424,16 @@ class _SubRow(QFrame):
         widgets._apply_property(self, "drop", val)
 
     # ---- 改名 ----
+    def _title_clicked(self, at: QPoint | None = None) -> None:
+        """复习条目点标题 = 跳到刷题页那一题。
+
+        给它改名没意义：标题是从题干拼出来的，改完下一次对账又被覆盖。
+        """
+        if services.review_kind_of_sub(self.sub["id"]):
+            self.subClicked.emit(self.sub)
+            return
+        self._rename(at)
+
     def eventFilter(self, obj, ev) -> bool:  # noqa: N802
         if (obj is self.edit and ev.type() == QEvent.KeyPress
                 and ev.key() == Qt.Key_Escape):
@@ -3414,6 +4560,7 @@ class CheckinRow(QFrame):
 
     def set_state(self, done: bool, streak: int) -> None:
         self.check.set_checked(done)          # set_checked 不发 toggled，不会回灌
+        widgets._apply_property(self.name_lbl, "done", "true" if done else "false")
         self.streak_lbl.setText(f"{streak} 天")
         self.streak_lbl.setVisible(bool(streak))
         self.streak_icon.setVisible(bool(streak))
@@ -3484,7 +4631,8 @@ class TodoPage(QWidget):
     """待办清单主页：导航 + 任务列表 + 详情三栏。"""
 
     openHabits = Signal()     # 请求切到「习惯」页（点今日打卡行的空白处）
-    openReview = Signal(str, int)   # (kind, 题目 id) 点复习待办 → 跳到刷题页那道题
+    openReview = Signal(str, int)   # (kind, 题目 id) 点复习条目 → 跳到刷题页那道题
+    focusRequested = Signal(str, str)   # (任务名, "pomodoro"|"countup") 右键「开始专注」
 
     def __init__(self):
         super().__init__()
@@ -3511,7 +4659,11 @@ class TodoPage(QWidget):
         self._pending_list = ""
         self._pending_tags: list[str] = []
         self._pending_prio = 0
+        self._pending_end = ""           # 持续时间段：结束日 / 结束时刻
+        self._pending_end_time = ""
         self._date_popup: DatePickerPopup | None = None
+        self._quick_more_popup: QuickMorePopup | None = None
+        self._quick_tag_popup: TagPickPopup | None = None
         self._show_done_inline = True
 
         # 三栏用分割器：左右都能拖宽拖窄，拖到最边就整栏收起（滴答的做法）。
@@ -3528,6 +4680,8 @@ class TodoPage(QWidget):
         self.detail.taskDeleted.connect(lambda _id: self.reload())
         self.detail.tagsChanged.connect(self._on_tags_changed)
         self.detail.backRequested.connect(self._close_detail)
+        self.detail.doneFlipped.connect(self._on_done_flipped)
+        self.detail.subClicked.connect(self._open_sub_review)
         # 习惯详情直接复用习惯页那个面板（统计卡 + 月历 + 打卡日志），
         # 不另写一套，两边长相和口径才不会漂
         from .habits import HabitDetail
@@ -3587,7 +4741,9 @@ class TodoPage(QWidget):
         self._mode_pref = (db.get_setting("todo_view_mode") or "list")
         self._row_detail = db.get_setting("todo_row_detail") == "1"
         self._show_countdown = db.get_setting("todo_show_countdown") == "1"
-        self._show_checks = db.get_setting("todo_show_checks") == "1"
+        # 行内检查事项默认就摊开（滴答的默认也是这样）：藏起来的话，
+        # 一条任务有几个勾选项在列表里完全看不出来
+        self._show_checks = db.get_setting("todo_show_checks", "1") == "1"
         self._collapsed = {k for k in db.get_setting("todo_collapsed").split(",") if k}
         self._open_folders = {int(x) for x in db.get_setting("todo_folders").split(",")
                               if x.isdigit()}
@@ -3605,6 +4761,13 @@ class TodoPage(QWidget):
         self._seen_habit_rev = rev
         if seen is not None and seen != rev:
             self.reload()
+        # 同理，复习排期也是「在别的页面改的」：在八股/算法页改了下次复习日，
+        # 切回清单必须看到那条子任务挪到新的一天。
+        seen_rv = getattr(self, "_seen_review_rev", None)
+        rev_rv = services.review_rev()
+        self._seen_review_rev = rev_rv
+        if seen_rv is not None and seen_rv != rev_rv:
+            self.reload()
         if getattr(self, "_sizes_applied", False) or not self._want_sizes:
             return
         self._sizes_applied = True
@@ -3621,12 +4784,16 @@ class TodoPage(QWidget):
 
     @staticmethod
     def _view_exists(kind: str, ident: str) -> bool:
+        # 清单的导航 key 是 `list:{名字}`、文件夹是 `folder:{id}`，两种都得认。
+        # 原来这里先 int(ident)，清单那一档永远抛 ValueError 直接 False，于是
+        # 「上次开的是哪张清单」从来没被恢复过 —— 每次启动都回到「今天」。
+        if kind in ("list", "folder"):
+            rows = services.list_all(include_archived=True)
+            return any(e["name"] == ident or str(e["id"]) == ident for e in rows)
         try:
             i = int(ident)
         except ValueError:
             return False
-        if kind == "list" or kind == "folder":
-            return services.list_get(i) is not None
         if kind == "tag":
             return any(t["id"] == i for t in services.tag_all())
         if kind == "filter":
@@ -3667,10 +4834,14 @@ class TodoPage(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._sync_detail_mode()
+        self._sync_detail_mode(from_resize=True)
 
-    def _sync_detail_mode(self) -> None:
-        """在「分割器里的一栏」和「浮在右侧的抽屉」之间切换。"""
+    def _sync_detail_mode(self, from_resize: bool = False) -> None:
+        """在「分割器里的一栏」和「浮在右侧的抽屉」之间切换。
+
+        from_resize：这次是窗口尺寸变了引起的。窄到放不下三栏时详情只能盖在
+        列表上，留着等于挡住用户正在看的东西，所以直接收起（点任务仍会开抽屉）。
+        """
         overlay = self._want_overlay()
         if overlay == self._overlay:
             if overlay:
@@ -3686,7 +4857,9 @@ class TodoPage(QWidget):
             self.right.setParent(self)
             # 没开着详情时别把抽屉 show 出来：它自带「点标题看详情」的空状态，
             # 盖在四象限这种整页版式上就像凭空多出一栏
-            if self._detail_open():
+            if self._detail_open() and from_resize:
+                self._close_detail()
+            elif self._detail_open():
                 self.right.show()
                 self.right.raise_()
             else:
@@ -3755,7 +4928,7 @@ class TodoPage(QWidget):
         holder = QWidget()
         self._nav_lay = QVBoxLayout(holder)
         self._nav_lay.setContentsMargins(8, 12, 8, 12)
-        self._nav_lay.setSpacing(1)
+        self._nav_lay.setSpacing(5)
         self._nav_lay.addStretch(1)
         self._nav_scroll.setWidget(holder)
         outer.addWidget(self._nav_scroll)
@@ -3786,7 +4959,7 @@ class TodoPage(QWidget):
         return w
 
     def _side_row(self, key: str, text: str, **kw) -> SideRow:
-        row = SideRow(key, text, **kw)
+        row = SideRow(key, text, reorderable=bool(_nav_group(key)), **kw)
         # 只有 _nav_more 认得的 key 才有右键菜单，别给智能视图挂空按钮
         row.set_has_menu(key.startswith(("list:", "folder:", "tag:", "filter:"))
                          or key == "trash")
@@ -3795,9 +4968,62 @@ class TodoPage(QWidget):
         row.moreRequested.connect(self._nav_more)
         row.addRequested.connect(self._nav_add_into)
         row.expandToggled.connect(self._toggle_folder)
+        row.moved.connect(self._on_nav_reorder)
         self._nav_rows[key] = row
         self._nav_insert(row)
         return row
+
+    # ---- 左栏排序 ----
+    def _nav_order(self, group: str, parent: str) -> list[str]:
+        """这一串当前从上到下的 key。串与串之间互不相干。"""
+        if group == "list":
+            keys = []
+            for e in services.list_all():
+                kind, fid = e.get("kind"), int(e.get("folder_id") or 0)
+                pid = "0" if kind == "folder" else str(fid)
+                if pid == parent:
+                    keys.append(f"folder:{e['id']}" if kind == "folder"
+                                else f"list:{e['name']}")
+            return keys
+        if group == "tag":
+            # 标签的顺序就存在 tags.sort_order 里，父级在前、子级跟在父级后面
+            return [f"tag:{t['id']}" for t in services.tag_all()
+                    if str(int(t.get("parent_id") or 0)) == parent]
+        if group in ("smart", "foot"):
+            keys = list(NAV_SMART if group == "smart" else NAV_FOOT)
+        else:
+            # 四格优先级是写死的（不在 todo_filters 表里），和自建过滤器排同一串
+            keys = list(QUAD_KEYS) + [f"filter:{fl['id']}"
+                                      for fl in services.filter_all()]
+        raw = (db.get_setting(NAV_SETTINGS[group]) or "").split(",")
+        order = [k for k in raw if k in keys]
+        order += [k for k in keys if k not in order]   # 新建的排在末尾
+        return order
+
+    def _on_nav_reorder(self, src: str, dst: str, after: bool) -> None:
+        """拖完把这一串重排后写回去：清单 / 标签落 sort_order，其余落 settings。"""
+        grp, par = _nav_group(src), _nav_parent(src)
+        if not grp or src == dst or grp != _nav_group(dst) or par != _nav_parent(dst):
+            return
+        order = self._nav_order(grp, par)
+        if src not in order or dst not in order:
+            return
+        order.remove(src)
+        order.insert(order.index(dst) + (1 if after else 0), src)
+        if grp == "list":
+            # 导航 key 里清单用名字、文件夹用 id，写 sort_order 要的是 id
+            key2id = {}
+            for e in services.list_all():
+                key2id[f"folder:{e['id']}" if e.get("kind") == "folder"
+                       else f"list:{e['name']}"] = e["id"]
+            services.list_reorder([key2id[k] for k in order if k in key2id])
+        elif grp == "tag":
+            services.tag_reorder([int(k[4:]) for k in order])
+        else:
+            db.set_setting(NAV_SETTINGS[grp], ",".join(order))
+        # 拖完重建要推迟一帧：现在还在 QDrag.exec() 的栈里，当场把发起拖拽的那行
+        # 删掉是 Qt 明确说过会崩的（源控件在 exec 返回前被销毁）。
+        QTimer.singleShot(0, self._rebuild_nav)
 
     def _smart_counts(self) -> dict:
         """左栏角标。
@@ -3810,22 +5036,26 @@ class TodoPage(QWidget):
         today = QDate.currentDate()
         today_s = today.toString("yyyy-MM-dd")
         in7_s = today.addDays(7).toString("yyyy-MM-dd")
-        plain = lambda t: (not t["done"] and not t.get("abandoned")   # noqa: E731
+        plain = lambda t: (not _settled(t)   # noqa: E731
                            and not (t.get("repeat") or "").strip()
                            and (t.get("list_name") or "收集箱") not in hidden)
         spans = {"today": (today_s, today_s), "soon7": (today_s, in7_s)}
         bounds = {"today": lambda d: d <= today_s, "soon7": lambda d: d <= in7_s}
+        # 放弃的重复任务：列表里那行会被归到已完成，角标却还在数周期，
+        # 两边口径要一致
+        gone = {t["id"] for t in todos if int(t.get("abandoned") or 0)}
         out: dict[str, int] = {}
         for view, (start, end) in spans.items():
             n = sum(1 for t in todos
                     if plain(t) and t["due_date"] and bounds[view](t["due_date"]))
             n += sum(1 for o in services.cal_occurrences(start, end)
-                     if o["repeat"] and not o["done"]
+                     if o["repeat"] and not o["done"] and o["id"] not in gone
                      and (o["list_name"] or "收集箱") not in hidden)
             out[view] = n
-        out["inbox"] = sum(1 for t in todos if not t["done"]
+        out["inbox"] = sum(1 for t in todos if not _settled(t)
                            and (t.get("list_name") or "收集箱") == "收集箱")
-        out["done"] = sum(1 for t in todos if t["done"])
+        # 「已完成」那一栏本来就收放弃的，角标也得一起算，不然点进去数字对不上
+        out["done"] = sum(1 for t in todos if _settled(t))
         out["trash"] = len(services.trash_list())
         return out
 
@@ -3835,18 +5065,21 @@ class TodoPage(QWidget):
             it = self._nav_lay.takeAt(0)
             w = it.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+                widgets.drop_widget(w)
         self._nav_rows.clear()
 
         todos = services.todo_list()
         sc = self._smart_counts()
-        self._side_row("soon7", "最近7天", icon_kind="week", count=sc["soon7"])
-        self._side_row("today", "今天", icon_kind="today", count=sc["today"])
-        # 滴答把这个入口放在左侧图标栏，我们沿用文字导航，就排在「今天」下面。
-        # 四格全铺时中栏要占满宽度，详情走抽屉（见 _want_overlay）。
-        self._side_row("quad", "四象限", icon_kind="quad", icon_hex="#3d8bff",
-                       icon_key="accent")
+        smart = {"soon7": dict(text="最近7天", icon_kind="week", count=sc["soon7"]),
+                 "today": dict(text="今天", icon_kind="today", count=sc["today"]),
+                 # 滴答把这个入口放在左侧图标栏，我们沿用文字导航，就排在「今天」
+                 # 下面。四格全铺时中栏要占满宽度，详情走抽屉（见 _want_overlay）。
+                 "quad": dict(text="四象限", icon_kind="quad",
+                              icon_hex="#3d8bff", icon_key="accent"),
+                 "inbox": dict(text="收集箱", icon_kind="inbox",
+                               count=sc["inbox"])}
+        for key in self._nav_order("smart", "0"):
+            self._side_row(key, **smart[key])
         # 滴答这两个日历图标格子里分别写着今天的日期号和星期两字母缩写（9/19 周六
         # 就是「19」和「Sa」），是这两个入口最主要的辨识点。格子要容得下两位数字，
         # 所以比其它导航图标略大一号。
@@ -3856,27 +5089,30 @@ class TodoPage(QWidget):
             _row = self._nav_rows[_k]
             _row.icon.setFixedSize(17, 17)
             _row.icon.set_glyph(_g)
-        self._side_row("inbox", "收集箱", icon_kind="inbox", count=sc["inbox"])
 
         # ---- 清单（含文件夹）----
         self._nav_insert(self._section_header("清单", self._add_list))
         entries = services.list_all()
-        folders = [e for e in entries if e.get("kind") == "folder"]
-        for f in folders:
-            kids = [e for e in entries
-                    if e.get("kind") != "folder" and e.get("folder_id") == f["id"]]
-            opened = f["id"] in self._open_folders
-            fcount = sum(1 for t in todos if not t["done"]
-                         and t.get("list_name") in {k["name"] for k in kids})
-            self._side_row(f"folder:{f['id']}", f["name"], icon_kind="folder_open"
-                           if opened else "folder", icon_hex=f.get("color") or "",
-                           expandable=True, expanded=opened, count=fcount,
-                           show_add=True)
-            if opened:
-                for k in kids:
-                    self._list_row(k, todos, indent=18)
+        # 按 list_all 的顺序一路排下来（文件夹和顶层清单是同一串，能互相拖），
+        # 文件夹后面紧跟它的子清单。原来文件夹永远整块排在顶层清单前面。
         for e in entries:
-            if e.get("kind") != "folder" and not e.get("folder_id"):
+            if e.get("kind") == "folder":
+                kids = [x for x in entries
+                        if x.get("kind") != "folder"
+                        and x.get("folder_id") == e["id"]]
+                opened = e["id"] in self._open_folders
+                fcount = sum(1 for t in todos if not _settled(t)
+                             and t.get("list_name") in {k["name"] for k in kids})
+                self._side_row(f"folder:{e['id']}", e["name"],
+                               icon_kind="folder_open"
+                               if opened else "folder",
+                               dot_hex=e.get("color") or "",
+                               expandable=True, expanded=opened, count=fcount,
+                               show_add=True)
+                if opened:
+                    for k in kids:
+                        self._list_row(k, todos, indent=18)
+            elif not e.get("folder_id"):
                 self._list_row(e, todos, indent=0)
         # 归档掉的清单默认不列出来，原来就没有任何入口能把它取回来 ——
         # 归档等于永久删除。这里补一行，点开逐个取消归档。
@@ -3903,23 +5139,31 @@ class TodoPage(QWidget):
 
         # ---- 过滤器 ----
         self._nav_insert(self._section_header("过滤器", self._add_filter))
-        for key, name, color, square in QUADRANTS:
-            self._side_row(key, name, icon_kind="quad", icon_hex=square,
-                           tint=color,
-                           count=sum(1 for t in todos if not t["done"]
-                                     and t["priority"] == int(key[1:])))
-        for fl in services.filter_all():
-            self._side_row(f"filter:{fl['id']}", fl["name"], icon_kind="filter",
-                           count=self._filter_count(fl, todos))
-        self._side_row("done", "已完成", icon_kind="done")
-        self._side_row("trash", "垃圾桶", icon_kind="trash")
+        quads = {k: (name, color, square) for k, name, color, square in QUADRANTS}
+        fls = {f"filter:{fl['id']}": fl for fl in services.filter_all()}
+        # 四格优先级和自建过滤器是同一串，顺序可以互相拖着换
+        for key in self._nav_order("filter", "0"):
+            if key in quads:
+                name, color, square = quads[key]
+                self._side_row(key, name, icon_kind="quad", icon_hex=square,
+                               tint=color,
+                               count=sum(1 for t in todos if not _settled(t)
+                                         and t["priority"] == int(key[1:])))
+            elif key in fls:
+                fl = fls[key]
+                self._side_row(key, fl["name"], icon_kind="filter",
+                               count=self._filter_count(fl, todos))
+        for key in self._nav_order("foot", "0"):
+            self._side_row(key, "已完成" if key == "done" else "垃圾桶",
+                           icon_kind="done" if key == "done" else "trash")
 
     def _list_row(self, lst: dict, todos: list, indent: int) -> None:
-        count = sum(1 for t in todos if not t["done"]
+        count = sum(1 for t in todos if not _settled(t)
                     and t.get("list_name") == lst["name"])
+        # 颜色只落到右边那枚小圆点上（滴答就是这个意思）：图标本身一律中性灰，
+        # 否则同一张清单会出现「图标一个色、圆点一个色」两种说法
         self._side_row(f"list:{lst['name']}", lst["name"],
                        icon_kind=lst.get("icon") or "list",
-                       icon_hex=lst.get("color") or "",
                        dot_hex=lst.get("color") or "",
                        count=count, indent=indent, show_add=True)
 
@@ -4034,6 +5278,12 @@ class TodoPage(QWidget):
         self._chip_icon.show()
         self.quick_chip.hide()
         q.addWidget(self.quick_chip)
+        # 旗子是优先级 / 清单 / 标签三个值的入口。原来这三个只能靠标题里写
+        # ``!`` / ``#清单`` / ``@标签``，打不出来就没有任何地方能设。
+        self.quick_flag = FlagButton(0, 26, quick)
+        self.quick_flag.setToolTip("优先级 / 清单 / 标签")
+        self.quick_flag.clicked_.connect(self._open_quick_more)
+        q.addWidget(self.quick_flag)
         lay.addWidget(quick)
 
         self.list_widget = TaskListArea()
@@ -4052,29 +5302,57 @@ class TodoPage(QWidget):
         self.board.hide()
         lay.addWidget(self.board, 1)
 
+        # 时间线（甘特）：清单对话框「视图」第三档
+        self.timeline = TimelineArea()
+        self.timeline.emptyClicked.connect(self._close_detail)
+        self.timeline.barClicked.connect(self._on_timeline_bar)
+        self.timeline.hide()
+        lay.addWidget(self.timeline, 1)
+
         # 四象限：左栏那个 tab 的整页版式，同样占中栏这一格
         self.quad = QuadArea()
         self.quad.emptyClicked.connect(self._close_detail)
         self.quad.hide()
         lay.addWidget(self.quad, 1)
+
+        # 完成后浮在中间的撤销条：挂在 canvas 上跟着中栏走，不进布局（浮层）
+        self._undo_bar = UndoBar(canvas)
+        self._undo_bar.undone.connect(self._undo_last)
+
+        # 顶栏那一行、快速添加条的留白、这几处四周的边距都落在 canvas 本体上
+        # （QLabel / QFrame 不吃按下事件，会冒到父控件），所以只过滤 canvas
+        # 就能覆盖中栏除条目以外的全部区域。
+        canvas.installEventFilter(self)
         return canvas
+
+    def _current_list(self) -> dict | None:
+        """当前视图对应的那张清单，不在清单里返回 None。
+
+        导航 key 用的是 `list:{名字}`（历史如此，重命名不用换 key），
+        而表里的主键是 id —— 之前两处都直接 `int(key[5:])`，一定抛 ValueError
+        然后退回全局那档，于是清单对话框里选的「看板 / 时间线」从来没生效过。
+        """
+        if not self._view.startswith("list:"):
+            return None
+        want = self._view[5:]
+        for e in services.list_all(include_archived=True):
+            if e["name"] == want or str(e["id"]) == want:
+                return e
+        return None
 
     @property
     def _view_mode(self) -> str:
         """当前该用哪个视图。
 
-        滴答把「列表 / 看板」存在清单自己身上（清单对话框里那排「视图」），
+        滴答把「列表 / 看板 / 时间线」存在清单自己身上（清单对话框里那排「视图」），
         所以进了某个清单就以它自己的 view_kind 为准；智能清单 / 文件夹 / 标签 /
         过滤器没有这个字段，才用 ⋯ 菜单存的全局那档。
         """
-        if self._view.startswith("list:"):
-            try:
-                lid = int(self._view[5:])
-            except ValueError:
-                return self._mode_pref
-            vk = (services.list_get(lid) or {}).get("view_kind") or ""
-            if vk == "kanban":
-                return "board"
+        lst = self._current_list()
+        if lst is not None:
+            vk = lst.get("view_kind") or ""
+            if vk in ("kanban", "timeline"):
+                return "board" if vk == "kanban" else vk
             if vk == "list":
                 return "list"
         return self._mode_pref
@@ -4087,7 +5365,12 @@ class TodoPage(QWidget):
         """
         if self._view == "quad":
             return self.quad
-        return self.board if self._view_mode == "board" else self.list_widget
+        mode = self._view_mode
+        if mode == "board":
+            return self.board
+        if mode == "timeline":
+            return self.timeline
+        return self.list_widget
 
     def _toggle_nav(self) -> None:
         # 收起时 Qt 只把宽度压到 0，isVisible() 依旧为 True，所以判据用尺寸
@@ -4114,11 +5397,7 @@ class TodoPage(QWidget):
                     self.title_icon.set_kind(
                         "folder_open" if lst.get("kind") == "folder"
                         else (lst.get("icon") or "list"))
-                    hex_value = lst.get("color") or ""
-                    if hex_value:
-                        self.title_icon.set_color_hex(hex_value)
-                    else:
-                        self.title_icon.set_color_key("muted")
+                    self.title_icon.set_color_key("muted")
                     self.title_icon.setVisible(True)
                     return
         self.title_icon.setVisible(False)
@@ -4131,6 +5410,17 @@ class TodoPage(QWidget):
         属性都得先取一次再用，不能直接 self.xxx。
         """
         quick = getattr(self, "quick_input", None)
+        if event.type() == QEvent.Resize and obj is getattr(self, "_canvas", None):
+            # 中栏一改变宽，撤销条要重新居中（它是浮层，不在布局里）
+            bar = getattr(self, "_undo_bar", None)
+            if bar is not None:
+                bar.place()
+        if (event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton
+                and (obj is getattr(self, "_canvas", None) or obj is quick)):
+            # 快速添加条上那行占位文字就是输入框本体，不单独算一次的话，
+            # 点它仍然收不起抽屉 —— 用户圈的正是这一整条。
+            self._close_detail()
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
             if obj is getattr(self, "search_input", None):
                 self._toggle_search()
@@ -4149,6 +5439,12 @@ class TodoPage(QWidget):
         self.quick_input.clear()        # textChanged 会把日期 chip 一起清掉
         self._pending_repeat = ""
         self._pending_reminder = ""
+        self._pending_prio = 0
+        self._pending_list = ""
+        self._pending_tags = []
+        self._pending_end = ""
+        self._pending_end_time = ""
+        self._sync_quick_flag()
         self._update_chip()
 
     # ==================================================================
@@ -4234,7 +5530,8 @@ class TodoPage(QWidget):
         if not due:
             return "nodate"
         if due < today:
-            return "overdue"
+            # 跨天的还没走完就不算过期，留在「今天」这一组
+            return "today" if (t.get("end_date") or "") > today else "overdue"
         if due == today:
             return "today"
         if due <= in7:
@@ -4247,7 +5544,7 @@ class TodoPage(QWidget):
 
     def _filter_count(self, fl: dict, todos: list) -> int:
         return sum(1 for t in todos
-                   if not t["done"] and self._match_filter(t, fl["cond"]))
+                   if not _settled(t) and self._match_filter(t, fl["cond"]))
 
     def _match_filter(self, t: dict, c: dict) -> bool:
         lists = c.get("lists") or []
@@ -4296,23 +5593,27 @@ class TodoPage(QWidget):
 
     def _occurrence_rows(self, start: str, end: str) -> list[dict]:
         """把区间内的重复周期摊平成与 todos 同形的行，供分组 / 渲染复用。"""
-        base = {t["id"]: t for t in services.todo_list()}
+        base = {t["id"]: t for t in services.todo_list(include_archived=True)}
         rows = []
         for o in services.cal_occurrences(start, end, include_notes=True):
             if not o["repeat"]:
                 continue            # 非重复任务仍由原始 todo 那条路径处理
-            src = base.get(o["id"], {})
-            rows.append({
+            src = base.get(o["id"]) or {}
+            # 以库里原始那条为底，只覆盖「展开后会变」的那几列。以前是逐列手抄，
+            # 漏一列就少一块功能还查不出来：漏 pinned 时今天视图里置顶没反应，
+            # 漏 abandoned 时放弃的周期行既画不出 ✕ 也不会归到已完成。
+            row = dict(src)
+            row.update({
                 "id": o["id"], "occ": o["occ"],
                 "title": o["title"], "note": o["note"],
                 "priority": o["priority"], "list_name": o["list_name"],
                 "due_date": o["date"], "due_time": o["time"],
                 "done": int(o["done"]), "repeat": o["repeat"],
-                "reminder": src.get("reminder") or "",
-                "kind": o["kind"], "created_at": src.get("created_at") or "",
+                "kind": o["kind"],
                 "sub_done": o["sub_done"], "sub_total": o["sub_total"],
                 "sort_order": o["sort"],
             })
+            rows.append(row)
         return rows
 
     def _collect(self) -> tuple[dict, list]:
@@ -4355,10 +5656,10 @@ class TodoPage(QWidget):
             if view == "done":
                 # 「已完成」这一栏顺带收放弃的：两者都是「不再出现在待做里」，
                 # 滴答也是把它们放在同一个视图里靠划线的样子区分
-                if t["done"] or t.get("abandoned"):
+                if _settled(t):
                     flat.append(t)
                 continue
-            if t["done"] or t.get("abandoned"):
+            if _settled(t):
                 if self._show_done_inline:
                     buckets["done"].append(t)
                 continue
@@ -4399,7 +5700,7 @@ class TodoPage(QWidget):
                     continue
                 if (t.get("list_name") or "收集箱") in hidden:
                     continue
-                if t["done"]:
+                if _settled(t):
                     if self._show_done_inline:
                         buckets["done"].append(t)
                 else:
@@ -4470,9 +5771,12 @@ class TodoPage(QWidget):
     def reload(self) -> None:
         # 视图档和控件显隐要对齐：偏好是从库里读回来的，构造期不知道
         quad = self._view == "quad"
-        board = self._view_mode == "board" and not quad
-        self.list_widget.setVisible(not board and not quad)
+        mode = "" if quad else self._view_mode
+        board = mode == "board"
+        line = mode == "timeline"
+        self.list_widget.setVisible(not (board or line or quad))
         self.board.setVisible(board)
+        self.timeline.setVisible(line)
         self.quad.setVisible(quad)
         if quad:
             self._reload_quad()
@@ -4492,13 +5796,18 @@ class TodoPage(QWidget):
         view = self._view
 
         # 子任务进度要在建行之前的取数阶段带上
-        for lst in list(buckets.values()) + [flat]:
+        review_ids = services.review_todo_ids()
+        groups = list(buckets.values()) + [flat]
+        subs_map = services.subtasks_by_ids(
+            [t["id"] for lst in groups for t in lst])
+        for lst in groups:
             for t in lst:
-                subs = services.subtask_list(t["id"])
+                subs = subs_map.get(t["id"], [])
                 t["sub_total"] = len(subs)
                 t["sub_done"] = sum(1 for s in subs if s["done"])
                 if self._show_checks:
                     t["subs"] = subs     # 行内列出检查事项要用
+                t["review_group"] = t["id"] in review_ids
 
         self._refresh_nav_counts()
 
@@ -4516,6 +5825,9 @@ class TodoPage(QWidget):
 
         # 今日打卡：滴答把它排在「今天」这一组后面
         checkin_rows = []
+        # 每轮重建都要清空：这一轮没算打卡（比如标签 / 过滤器视图）时，
+        # 留着上一轮的行控件会把已删除的对象再塞进布局
+        self._done_checkins = []
         # 「打卡设置」那个开关只管两个智能清单；清单视图里始终显示
         in_smart = view in ("today", "soon7") and services.habit_checkin_in_smart()
         if in_smart or view.startswith("list:"):
@@ -4544,7 +5856,8 @@ class TodoPage(QWidget):
                 emit_checkin()
                 checkin_done = True
             items = buckets.get(key) or []
-            if not items:
+            extra = self._done_checkins if key == "done" else []
+            if not (items or extra):
                 continue
             if key == "flat":          # 分组=无：不画组标题，直接铺列表
                 for t in items:
@@ -4560,7 +5873,8 @@ class TodoPage(QWidget):
                 lm = list_meta.get(key[7:]) or {}
                 icon_kind = lm.get("icon") or "list"
                 icon_hex = lm.get("color") or ""
-            header = GroupHeader(key, _group_label(key, items), len(items),
+            header = GroupHeader(key, _group_label(key, items),
+                                 len(items) + len(extra),
                                  expanded, action, icon_kind=icon_kind,
                                  icon_hex=icon_hex)
             header.toggled.connect(self._on_group_toggle)
@@ -4570,6 +5884,12 @@ class TodoPage(QWidget):
             self._groups[key] = []
             for t in items:
                 w = self._append_task(t, group=key, card=board)
+                self._groups[key].append(w)
+                if not expanded:
+                    w.setHidden(True)
+            for w in extra:
+                # 打过卡的习惯：滴答也是把它从「今日打卡」挪到「已完成」里
+                self._area.add_widget(w)
                 self._groups[key].append(w)
                 if not expanded:
                     w.setHidden(True)
@@ -4677,14 +5997,25 @@ class TodoPage(QWidget):
         w.contextRequested.connect(self._row_menu)
         w.dragGroup.connect(self.list_widget.set_drag_group)
         w.subToggled.connect(self._on_row_sub_toggle)
+        w.subClicked.connect(self._open_sub_review)
+        w.doneToggled.connect(self._on_done_flipped)
         (into if into is not None else self._area).add_widget(w)
         self._items[t["id"]] = w
         return w
 
     def _on_row_sub_toggle(self, sub: dict, checked: bool) -> None:
-        """行内勾选子任务：写库 + 只改这一条，不整页 reload（reload 会打断连续勾）。"""
+        """行内勾选子任务：写库 + 只改这一条，不整页 reload（reload 会打断连续勾）。
+
+        复习条目是例外：勾了要问结论，结论又会把它挪到别的日子（这一行连同
+        计数都得重排），所以那一支走完整页重建 —— 但推到下一轮事件循环再做，
+        正在发信号的控件就是这一行里的，当场删掉它会炸。
+        """
         services.subtask_update(sub["id"], done=int(checked))
         sub["done"] = int(checked)
+        if checked and services.review_kind_of_sub(sub["id"]):
+            _review_ask_sub(self, sub)      # 答对/答错音在里面响，不再补完成音
+            QTimer.singleShot(0, self.reload)
+            return
         if checked:
             sounds.play("subtask_done")
         w = self._items.get(sub["todo_id"])
@@ -4701,6 +6032,16 @@ class TodoPage(QWidget):
                             lbl, "subState",
                             "full" if w.data["sub_done"] == total else "")
                         break
+
+    def _open_sub_review(self, sub: dict) -> None:
+        """点复习条目那一行 → 跳到刷题页的那一道题。
+
+        以前这个跳转挂在大任务那一行上（一题一行时行就是题）；现在一天一行，
+        行本身点开是「这天要复习的题目」，跳转挪到了每一道题目上。
+        """
+        kind, item_id = services.review_owner_of_sub(sub["id"])
+        if kind:
+            self.openReview.emit(kind, item_id)
 
     def _append_empty_hint(self, text: str) -> None:
         holder = QWidget()
@@ -4743,8 +6084,43 @@ class TodoPage(QWidget):
             w.toggled.connect(self._on_checkin)
             w.opened.connect(self._show_habit)
             self._checkin_rows_by_id[h["id"]] = w
-            out.append(w)
+            (self._done_checkins if done else out).append(w)
         return out
+
+    def _on_done_flipped(self, todo_id: int, occ: str, checked: bool) -> None:
+        """勾上就浮撤销条；反向操作时如果条上正是这条，顺手收掉。"""
+        cur = self._undo_bar.payload()
+        if not checked:
+            if cur and cur[0] == "todo" and cur[1] == todo_id:
+                self._undo_bar.hide()
+            return
+        if services.review_kind_of_todo(todo_id):
+            # 复习大任务不浮撤销条：那天题目是按「答对/没答上来」逐条记进排期的，
+            # 撤销只能把这条待办退回未勾，回收不了十几笔复习结论 —— 
+            # 浮一个点了什么也不会退回来的条，不如不浮。
+            if cur and cur[0] == "todo" and cur[1] == todo_id:
+                self._undo_bar.hide()
+            return
+        t = services.todo_get(todo_id) or {}
+        self._undo_bar.show_for(("todo", todo_id, occ), t.get("title") or "")
+
+    def _on_habit_checkin(self, habit: dict, date: str, checked: bool) -> None:
+        cur = self._undo_bar.payload()
+        if not checked:
+            if cur and cur[0] == "habit" and cur[1] == habit["id"]:
+                self._undo_bar.hide()
+            return
+        self._undo_bar.show_for(("habit", habit["id"], date), habit["name"])
+
+    def _undo_last(self, payload) -> None:
+        kind = payload[0]
+        if kind == "todo":
+            _, tid, occ = payload
+            services.occ_set_done(tid, occ, False)
+        else:
+            _, hid, date_s = payload
+            services.habit_set_count(hid, date_s, 0)
+        QTimer.singleShot(0, self.reload)
 
     def _on_checkin(self, habit_id: int, date: str) -> None:
         from ..services import (habit_checks_map, habit_goal_count, habit_get,
@@ -4758,6 +6134,7 @@ class TodoPage(QWidget):
         habit_set_count(habit_id, date, target)
         if target:
             sounds.play("habit_checkin")
+        self._on_habit_checkin(h, date, bool(target))
         # 只改这一行。整表 reload 会在鼠标事件还开着的时候把正在收事件的行
         # 销毁掉，表现就是「点勾选框弹一堆窗口、勾反而没生效」，
         # 而且每勾一下都要重建全部行 —— 白付一次全表刷新。
@@ -4770,6 +6147,9 @@ class TodoPage(QWidget):
         shown = getattr(self.habit_detail, "_habit", None)
         if shown and shown["id"] == habit_id:
             self.habit_detail.reload()
+        # 打过卡的那行要搬去「已完成」组，必须重排一次。推迟一帧：现在还在
+        # 这行的鼠标事件里，当场重建会把正在收事件的行销毁（老 bug）。
+        QTimer.singleShot(0, self.reload)
 
     def _refresh_nav_counts(self) -> None:
         todos = services.todo_list()
@@ -4778,15 +6158,15 @@ class TodoPage(QWidget):
             if k in counts:
                 row.set_count(counts[k])
             elif k in ("p3", "p2", "p1", "p0"):
-                row.set_count(sum(1 for t in todos if not t["done"]
+                row.set_count(sum(1 for t in todos if not _settled(t)
                                   and t["priority"] == int(k[1])))
             elif k.startswith("list:"):
-                row.set_count(sum(1 for t in todos if not t["done"]
+                row.set_count(sum(1 for t in todos if not _settled(t)
                                   and t.get("list_name") == k[5:]))
             elif k.startswith("folder:"):
                 names = {l["name"] for l in services.list_all()
                          if l.get("folder_id") == int(k[7:])}
-                row.set_count(sum(1 for t in todos if not t["done"]
+                row.set_count(sum(1 for t in todos if not _settled(t)
                                   and t.get("list_name") in names))
             elif k.startswith("tag:"):
                 ids = {int(k[4:])} | {c["id"] for c in services.tag_all()
@@ -4794,7 +6174,7 @@ class TodoPage(QWidget):
                 linked = set()
                 for tid in ids:
                     linked.update(services.tag_todo_ids(tid))
-                row.set_count(sum(1 for t in todos if not t["done"]
+                row.set_count(sum(1 for t in todos if not _settled(t)
                                   and t["id"] in linked))
         for fl in services.filter_all():
             row = self._nav_rows.get(f"filter:{fl['id']}")
@@ -4929,11 +6309,20 @@ class TodoPage(QWidget):
     def _set_nav_visible(self, on: bool) -> None:
         self._tween_pane(0, self._pane_w.get(0, NAV_DEFAULT_W) if on else 0)
 
+    def _on_timeline_bar(self, row: "TodoRow") -> None:
+        """点时间线上的横条 = 点列表里的这一行，开详情的上下文都一样。"""
+        self._show_detail(row._todo_id, row._occ,
+                          row.data.get("due_date", "") if row._occ else "",
+                          row.data.get("due_time", "") if row._occ else "")
+
     def _mark_selected(self) -> None:
         """把选中底色落到「当前打开详情那一条」上。reload 会重建行，所以
         建完行也要再调一次。"""
         for tid, row in self._items.items():
             row.set_selected(tid == self._selected_id)
+        self.timeline.selected_id = self._selected_id
+        for lane in self.timeline._lanes:
+            lane.update()
         for w in self._area._widgets:
             if w.__class__.__name__ == "CheckinRow":
                 w.set_selected(w._habit_id == self._selected_habit)
@@ -4985,13 +6374,8 @@ class TodoPage(QWidget):
 
     def _show_detail(self, todo_id: int, occ: str = "", disp_date: str = "",
                      disp_time: str = "") -> None:
-        # 复习待办不是一条能编辑的任务：在待办里改它的标题、备注都毫无意义，
-        # 真正的「做完」发生在刷题页那边，做完会自动把这条勾掉。
-        # 所以点它 = 跳到那道题。勾选项（复选框）不受影响，仍然能就地判定。
-        kind, item_id = services.review_owner_of_todo(todo_id)
-        if kind:
-            self.openReview.emit(kind, item_id)
-            return
+        # 复习大任务点开就是详情：这天要复习的题目都挂在下面的检查事项里，
+        # 点某一道题才跳到刷题页那一题（跳转从「一行一题」挪到了子任务上）。
         task = services.todo_get(todo_id)
         if task:
             self._selected_id = todo_id
@@ -5144,13 +6528,12 @@ class TodoPage(QWidget):
     def _on_view_mode(self, mode: str) -> None:
         if self._view_mode == mode:
             return
-        if self._view.startswith("list:"):
+        lst = self._current_list()
+        if lst is not None and mode in ("list", "board", "timeline"):
             # 在某个清单里切视图 = 改这个清单自己的设置，下次进来还是它
-            try:
-                services.list_update(int(self._view[5:]),
-                                     view_kind="kanban" if mode == "board" else "list")
-            except ValueError:
-                self._mode_pref = mode
+            services.list_update(
+                lst["id"], view_kind={"board": "kanban",
+                                      "timeline": "timeline"}.get(mode, "list"))
         else:
             self._mode_pref = mode
         self._save_prefs()
@@ -5218,7 +6601,9 @@ class TodoPage(QWidget):
                         line += '<div class="s">%s %s</div>' % (
                             "☑" if s["done"] else "☐", escape(s["title"]))
                 if t.get("due_date"):
-                    txt, _state = _date_state(t["due_date"], t.get("due_time", ""))
+                    txt, _state = _date_state(t["due_date"],
+                                              t.get("due_time", ""),
+                                              end=t.get("end_date") or "")
                     if txt:
                         line += '<div class="d">%s · %s</div>' % (
                             escape(txt), escape(t.get("list_name") or "收集箱"))
@@ -5279,58 +6664,53 @@ class TodoPage(QWidget):
                           pick_trash, danger=("purge",))
             return
         items = [
-            ("d0", "today", "今天"),
-            ("d1", "calendar", "明天"),
-            ("d2", "calendar", "后天"),
+            (CAP, "日期"), (STRIP, _IconStrip(_date_strip_specs(
+                t.get("due_date") or "", (t.get("repeat") or "").strip()))),
+            (CAP, "优先级"), (STRIP, _IconStrip(_prio_strip_specs(
+                int(t.get("priority") or 0)))),
+            (SEP,),
+            ("sub", "subtask_list", "添加子任务"),
+            ("pin", "pin", "取消置顶" if t.get("pinned") else "置顶"),
+            ("abandon", "abandon", "取消放弃" if t.get("abandoned") else "放弃"),
+            ("move", "move_out", "移动到"),
+            ("tags", "tag", "标签"),
+            (SEP,),
+            ("focus", "focus", "开始专注"),
+            (SEP,),
+            ("copy", "copy", "创建副本"),
+            ("link", "link", "复制链接"),
+            (SEP,),
+            ("sticky", "note", "打开便签"),
+            ("tonote", "floppy", "转换为笔记"),
+            ("trash", "trash", "删除"),
         ]
-        if recurring:
-            # 系列没有「移除日期」这个状态，能做的只有跳过这一周期
-            items.append(("skip", "close", "跳过此周期"))
-        else:
-            items.append(("none", "circle", "移除日期"))
-        # 四档旗子的颜色和行上勾选框描边同源，见 _prio_items
-        items += [("p%d" % v, kind, label, color)
-                  for v, kind, label, color in _prio_items()]
-        items += [("sub", "subtask_list", "添加子任务"),
-                  ("pin", "pin", "取消置顶" if t.get("pinned") else "置顶"),
-                  ("abandon", "restore" if t.get("abandoned") else "close",
-                   "取消放弃" if t.get("abandoned") else "放弃"),
-                  ("move", "folder_open", "移动到"),
-                  ("tags", "tag", "标签"),
-                  ("sticky", "note", "打开便签"),
-                  ("tonote", "edit", "转换为笔记"),
-                  ("link", "link", "复制链接")]
-        # 归档任务在归档视图里要能退回来；平时则给一个归档入口。
-        # 原来「归档任务」写进去之后全项目没有任何地方读，等于把任务丢进黑洞。
-        if t.get("archived"):
-            items.append(("unarchive", "restore", "取消归档"))
-        else:
-            items.append(("archive", "archive", "归档"))
-        items.append(("copy", "copy", "创建副本"))
-        items.append(("trash", "trash", "删除此周期" if recurring else "删除"))
         menu = TickMenu(items, anchor, danger=("trash",),
-                        arrows=("move", "tags"))
+                        arrows=("move", "tags", "focus"))
+        # 图标条在菜单里，点一格要走「选完就关」这条路（Popup 里点自己不会自动关）。
+        # 反过来先接 menu.pick 再接 pick：先关菜单，避免二级弹层和它抢鼠标抓取。
+        for strip in (menu.findChildren(_IconStrip)):
+            strip.picked.connect(menu.pick)
 
         def pick(v: object) -> None:
             v = str(v)
-            if v.startswith("d"):
-                new_date = today.addDays(int(v[1:])).toString("yyyy-MM-dd")
+            if v.startswith("d") and v[1:].isdigit():
+                days = {"0": 0, "1": 1, "7": 7}[v[1:]]
+                new_date = today.addDays(days).toString("yyyy-MM-dd")
                 # 重复任务只挪这一个周期；普通任务 occ_move 会直接改截止日
                 services.occ_move(todo_id, occ or t["due_date"], new_date)
-            elif v == "skip":
-                services.occ_delete(todo_id, occ)
-                self.reload()
+            elif v == "pick":
+                # 推到下一轮再开：现在 TickMenu 这个 Qt.Popup 还握着鼠标抓取，
+                # 日历弹层是 Qt.Tool 窗，这时候 show 会被自己那条「没被激活就收起」
+                # 的逻辑当场关掉（表现为点了日历那格什么也没发生）。
+                QTimer.singleShot(0, lambda: self._pick_row_date(
+                    todo_id, occ, t, anchor, pos))
                 return
             elif v == "none":
-                services.todo_update(todo_id, due_date="", due_time="")
+                self._clear_due(todo_id, occ, recurring)
             elif v == "pin":
                 services.todo_update(todo_id, pinned=0 if t.get("pinned") else 1)
-            elif v.startswith("p"):
+            elif v.startswith("p") and v[1:].isdigit():
                 services.todo_update(todo_id, priority=int(v[1:]))
-            elif v == "archive":
-                services.todo_update(todo_id, archived=1)
-            elif v == "unarchive":
-                services.todo_update(todo_id, archived=0)
             elif v == "copy":
                 # 副本要连重复 / 提醒 / 时长 / 标签一起抄，原来只抄了标题四件套，
                 # 复制一个每天重复的任务出来会变成一次性的
@@ -5370,6 +6750,9 @@ class TodoPage(QWidget):
             elif v == "tags":
                 self._open_tags_menu(anchor, pos, todo_id)
                 return
+            elif v == "focus":
+                self._open_focus_menu(anchor, pos, t)
+                return
             elif v == "sub":
                 self._show_detail(todo_id)
                 self.detail._toggle_subs()
@@ -5379,6 +6762,98 @@ class TodoPage(QWidget):
                 return
             self.reload()
         menu.picked.connect(pick)
+        menu.exec_at(anchor.mapToGlobal(QPoint(pos.x(), pos.y())))
+
+    def _clear_due(self, todo_id: int, occ: str, recurring: bool) -> None:
+        """「清除日期」：普通任务清掉截止日，重复系列是跳过这一周期。
+
+        重复任务没有「这一周期不排日期」这种状态 —— 日期是规则算出来的，
+        唯一等价的表达就是这一次不做。
+        """
+        if recurring and occ:
+            services.occ_delete(todo_id, occ)
+        else:
+            services.todo_update(todo_id, due_date="", due_time="",
+                                 end_date="", end_time="")
+        self.reload()
+
+    def _pick_row_date(self, todo_id: int, occ: str, t: dict, anchor, pos) -> None:
+        """右键菜单里点「选择日期」那一格：开日历弹层，选完落库。
+
+        重复任务只能改这一个周期（日历里那些日期是排期算出来的，没有存字段），
+        所以跨天范围那一档对它没意义，只走 occ_move。
+        """
+        init = t.get("due_date") or QDate.currentDate().toString("yyyy-MM-dd")
+        pop = DatePickerPopup(init, t.get("due_time") or "",
+                              repeat=t.get("repeat") or "",
+                              reminder=t.get("reminder") or "",
+                              end_date=t.get("end_date") or "",
+                              end_time=t.get("end_time") or "",
+                              allow_range=not bool(occ))
+
+        def on_ok(d: str, tm: str, end_d: str = "", end_t: str = "") -> None:
+            if occ:
+                services.occ_move(todo_id, occ, d)
+            else:
+                services.todo_update(todo_id, due_date=d, due_time=tm,
+                                     end_date=end_d, end_time=end_t)
+            self.reload()
+
+        pop.accepted.connect(on_ok)
+        # 弹层里那颗「清除」不能是死的：和菜单里「清除日期」那一格同一件事
+        pop.cleared.connect(lambda: self._clear_due(todo_id, occ, bool(occ)))
+        self._row_date_popup = pop        # 不给引用的话会被 Python 提前回收
+        pop.adjustSize()
+        pop.move(anchor.mapToGlobal(QPoint(pos.x(), pos.y())))
+        pop.show()
+
+    def _open_focus_menu(self, anchor, pos, t: dict) -> None:
+        """开始专注 ›：两种计时 + 两个「预计」，滴答收在同一个二级里。
+
+        二级菜单不带图标列（icon_kind 给 None），和滴答那张图一样是纯文字。
+        """
+        dur = int(t.get("duration_min") or 0)
+        plan = int(t.get("pomo_plan") or 0)
+        items = [
+            ("pomodoro", None, "开始番茄专注"),
+            ("countup", None, "开始正计时"),
+            (SEP,),
+            ("plan", None, ("预计番茄：%d 个" % plan) if plan else "预计番茄"),
+            ("duration", None, ("时长：" + _human_duration(dur)) if dur else "时长"),
+        ]
+        menu = TickMenu(items, anchor, width=176)
+
+        def pick(v: object) -> None:
+            v = str(v)
+            if v in ("pomodoro", "countup"):
+                self.focusRequested.emit(t["title"], v)
+            elif v == "plan":
+                self._open_plan_menu(anchor, pos, t)
+            elif v == "duration":
+                self._open_duration_menu(anchor, pos, t)
+        menu.picked.connect(pick)
+        menu.exec_at(anchor.mapToGlobal(QPoint(pos.x(), pos.y())))
+
+    def _open_duration_menu(self, anchor, pos, t: dict) -> None:
+        """预计时长：和详情面板 ⋯ 里那一份同一套档位、同一个字段。"""
+        cur = int(t.get("duration_min") or 0)
+        items = [(m, None, _human_duration(m)) for m in DURATION_OPTIONS]
+        items.append((0, None, "无时长"))
+        menu = TickMenu(items, anchor, width=176,
+                        checked=cur if cur in DURATION_OPTIONS else None)
+        menu.picked.connect(lambda v: (
+            services.todo_update(t["id"], duration_min=int(v or 0)), self.reload()))
+        menu.exec_at(anchor.mapToGlobal(QPoint(pos.x(), pos.y())))
+
+    def _open_plan_menu(self, anchor, pos, t: dict) -> None:
+        """预计番茄：几个番茄能做完这条。滴答存在任务上，专注统计按它算完成率。"""
+        cur = int(t.get("pomo_plan") or 0)
+        items = [(n, None, "%d 个" % n) for n in range(1, 9)]
+        items.append((0, None, "不设"))
+        menu = TickMenu(items, anchor, width=176,
+                        checked=cur if cur in range(1, 9) else None)
+        menu.picked.connect(lambda v: (
+            services.todo_update(t["id"], pomo_plan=int(v or 0)), self.reload()))
         menu.exec_at(anchor.mapToGlobal(QPoint(pos.x(), pos.y())))
 
     def _open_move_menu(self, anchor, pos, t: dict) -> None:
@@ -5499,9 +6974,10 @@ class TodoPage(QWidget):
                               .toString("yyyy-MM-dd"))
         elif key == "done":
             services.todo_update(tid, done=1, completed_at=_now())
-            # 拖到「已完成」也是一次勾选，复习待办同样要问结论
-            _review_ask(self, tid, occ)
-            if not services.review_kind_of_todo(tid):
+            # 拖到「已完成」也是一次勾选，复习大任务同样要问结论
+            if not _review_ask_group(self, tid):
+                services.todo_update(tid, done=0, completed_at="")
+            elif not services.review_kind_of_todo(tid):
                 sounds.play("todo_done")
         elif key == "inbox":
             services.todo_update(tid, list_name="收集箱")
@@ -5529,24 +7005,48 @@ class TodoPage(QWidget):
         if not text.strip():
             self._pending_date = self._pending_time = ""
             self._date_pinned = False
+            # 清空输入框 = 一切退回默认，旗子上手选的优先级 / 清单 / 标签也一样
+            self._pending_prio = 0
+            self._pending_list = ""
+            self._pending_tags = []
+            self._pending_end = self._pending_end_time = ""
+            self._sync_quick_flag()
         elif parsed.date or parsed.time:
             self._pending_date = parsed.date or self._pending_date
             self._pending_time = parsed.time
             # 文字里已经有日期词了，之前从弹层手选的那次就不作数了
             self._date_pinned = False
+            if parsed.date:
+                # 手打的日期是单点，跨天范围跟着一起作废
+                self._pending_end = self._pending_end_time = ""
         elif not self._date_pinned:
             # 把「明天开会」退格成「开会」，日期 chip 得跟着没；
             # 但用户是从日历弹层手选的日期（_date_pinned）时不能清，
             # 否则选完日期再多打几个字，日期就莫名其妙消失了。
             self._pending_date = self._pending_time = ""
-        self._pending_list = parsed.list_name
-        self._pending_tags = parsed.tags
-        self._pending_prio = parsed.priority
+            self._pending_end = self._pending_end_time = ""
+        # 这三项只在标题里真写了语法时才覆盖：手选的优先级 / 清单 / 标签
+        # 要跟着这一条走到落库，不能因为用户又敲了两个字就没了
+        if parsed.list_name:
+            self._pending_list = parsed.list_name
+        if parsed.tags:
+            self._pending_tags = parsed.tags
+        if parsed.priority:
+            self._set_quick_prio(parsed.priority)
         self._update_chip()
 
     def _update_chip(self) -> None:
         if self._pending_date:
-            parts = [dateparse.human_date(self._pending_date)]
+            end = self._pending_end
+            e = QDate.fromString(end, "yyyy-MM-dd") if end else QDate()
+            s = QDate.fromString(self._pending_date, "yyyy-MM-dd")
+            if e.isValid() and e > s:
+                # 跨天的不写「周六-9月30日」这种半截相对半截绝对，两端都写死日期
+                parts = [f"{s.month()}月{s.day()}日-"
+                         + (f"{e.year()}年" if e.year() != s.year() else "")
+                         + f"{e.month()}月{e.day()}日"]
+            else:
+                parts = [dateparse.human_date(self._pending_date)]
             if self._pending_time:
                 parts.append(dateparse.human_time(self._pending_time))
             self.quick_chip.setText(f"{', '.join(parts)}  ⌄")
@@ -5560,7 +7060,10 @@ class TodoPage(QWidget):
         init = self._pending_date or QDate.currentDate().toString("yyyy-MM-dd")
         pop = DatePickerPopup(init, self._pending_time,
                               repeat=self._pending_repeat,
-                              reminder=self._pending_reminder)
+                              reminder=self._pending_reminder,
+                              end_date=self._pending_end,
+                              end_time=self._pending_end_time,
+                              allow_range=True)
         pop.accepted.connect(self._on_popup_accepted)
         pop.cleared.connect(self._on_popup_cleared)
         pop.repeatPicked.connect(lambda v: setattr(self, '_pending_repeat', v))
@@ -5572,16 +7075,82 @@ class TodoPage(QWidget):
         pop.move(max(anchor.x() - pop.width() + 10, 8), anchor.y() + 6)
         pop.show()
 
-    def _on_popup_accepted(self, date: str, time_v: str) -> None:
+    def _on_popup_accepted(self, date: str, time_v: str, end_date: str = "",
+                           end_time: str = "") -> None:
         self._pending_date, self._pending_time = date, time_v
+        self._pending_end, self._pending_end_time = end_date, end_time
         self._date_pinned = bool(date or time_v)
         self._update_chip()
 
     def _on_popup_cleared(self) -> None:
         self._pending_date = ""
         self._pending_time = ""
+        self._pending_end = ""
+        self._pending_end_time = ""
         self._date_pinned = False
         self._update_chip()
+
+    # ---- 快速添加：优先级 / 清单 / 标签 ----
+    def _sync_quick_flag(self) -> None:
+        """旗子跟着待设的优先级上色，「这条设过了」才看得见。"""
+        flag = getattr(self, "quick_flag", None)
+        if flag is not None:
+            flag.set_priority(self._pending_prio)
+
+    def _quick_target_list(self) -> str:
+        return self._pending_list or self._default_list_for_view()
+
+    def _open_quick_more(self) -> None:
+        pop = QuickMorePopup(self._pending_prio, self._quick_target_list(),
+                             self._pending_tags, self)
+        pop.prioPicked.connect(self._set_quick_prio)
+        pop.listRequested.connect(self._quick_pick_list)
+        pop.tagsRequested.connect(self._quick_pick_tags)
+        self._quick_more_popup = pop
+        popups.place_popup(pop, self.quick_flag)
+        pop.show()
+
+    def _set_quick_prio(self, value: int) -> None:
+        self._pending_prio = int(value or 0)
+        self._sync_quick_flag()
+
+    def _quick_pick_list(self) -> None:
+        cur = self._quick_target_list()
+        names = [x["name"] for x in services.list_all()
+                 if x.get("kind") != "folder"]
+        if "收集箱" not in names:
+            names.insert(0, "收集箱")
+        items = [(n, "inbox" if n == "收集箱" else "list", n) for n in names]
+        menu = TickMenu(items, self, checked={cur})
+        menu.picked.connect(lambda v: setattr(self, "_pending_list", str(v)))
+        popups.place_popup(menu, self.quick_flag)
+        menu.show()
+
+    def _quick_pick_tags(self) -> None:
+        tags = services.tag_all()
+        if not tags:
+            popups.notify(self, "还没有标签", "在左栏「标签」旁边加一个，再回来挂。")
+            return
+        on = {g["id"] for g in tags if g["name"] in self._pending_tags}
+        pop = TagPickPopup(tags, on, self)
+        pop.toggled.connect(self._quick_toggle_tag)
+        self._quick_tag_popup = pop
+        popups.place_popup(pop, self.quick_flag)
+        pop.show()
+
+    def _quick_toggle_tag(self, tag_id: int) -> None:
+        """连选几个标签不用反复开菜单（TagPickPopup 点一项不关）。"""
+        g = next((t for t in services.tag_all() if t["id"] == tag_id), None)
+        if g is None:
+            return
+        name = g["name"]
+        if name in self._pending_tags:
+            self._pending_tags = [t for t in self._pending_tags if t != name]
+        else:
+            self._pending_tags = self._pending_tags + [name]
+        self._quick_tag_popup.set_checked(
+            {t["id"] for t in services.tag_all()
+             if t["name"] in self._pending_tags})
 
     def _quick_add(self) -> None:
         text = self.quick_input.text().strip()
@@ -5591,22 +7160,26 @@ class TodoPage(QWidget):
         parsed = dateparse.parse_title(text, lists, tag_names)
         title = parsed.cleaned or text
         view = self._view
-        priority = parsed.priority
+        # 优先级 / 清单 / 标签一律读 _pending_*：那是「语法 + 旗子手选」合流后的
+        # 那一份，直接读 parsed 会把从弹层选的值丢掉
+        priority = self._pending_prio
         if not priority and view in ("p3", "p2", "p1", "p0"):
             priority = int(view[1])
         due = self._pending_date or parsed.date
         if not due:
             if view in ("today", "soon7"):
                 due = QDate.currentDate().toString("yyyy-MM-dd")
-        list_name = parsed.list_name or self._default_list_for_view()
+        list_name = self._pending_list or self._default_list_for_view()
         tid = services.todo_add(title, priority=priority, due_date=due,
                                 due_time=self._pending_time or parsed.time,
                                 list_name=list_name,
                                 repeat=self._pending_repeat,
-                                reminder=self._pending_reminder)
+                                reminder=self._pending_reminder,
+                                end_date=self._pending_end,
+                                end_time=self._pending_end_time)
         sounds.play("todo_created")
         tag_ids = [t["id"] for t in services.tag_all()
-                   if t["name"] in (parsed.tags or [])]
+                   if t["name"] in (self._pending_tags or [])]
         if view.startswith("tag:"):
             tag_ids.append(int(view[4:]))
         if tag_ids:

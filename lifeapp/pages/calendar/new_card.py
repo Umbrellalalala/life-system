@@ -438,7 +438,8 @@ class NewTaskCard(QFrame):
         pop.move(anchor.x(), anchor.y() + 4)
         pop.show()
 
-    def _apply_date(self, new_date: str, new_time: str) -> None:
+    def _apply_date(self, new_date: str, new_time: str, *_rest) -> None:
+        # *_rest：日期弹层的 accepted 带结束端，新建卡这一侧没有范围可存
         d = QDate.fromString(new_date, "yyyy-MM-dd")
         if d.isValid():
             self._date = d

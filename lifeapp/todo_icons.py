@@ -19,6 +19,20 @@ def _c(name: str) -> QColor:
     return QColor(theme.get(name))
 
 
+def is_emoji_icon(value: str) -> bool:
+    """清单图标是不是一个 emoji（线性图标的 kind 全是 ASCII 名字）。"""
+    return any(ord(ch) > 0x2000 for ch in value)
+
+
+def emoji_text(value: str) -> str:
+    """补 U+FE0F 强制走彩色 emoji 呈现。
+
+    ✏ ⌨  ❤ ☕ 这些默认是「文本呈现」，Windows 会拿 Segoe UI Symbol 画成
+    单色剪影；带上变体选择符才交给 Segoe UI Emoji 上色。库里存的还是原样。
+    """
+    return value if value.endswith("\uFE0F") else value + "\uFE0F"
+
+
 class TickIcon(QWidget):
     """单色线性图标。``color_key`` 走主题色表，``color_hex`` 用于清单/标签自定义色。"""
 
@@ -82,6 +96,16 @@ class TickIcon(QWidget):
             p.setBrush(Qt.NoBrush)
 
         k = self._kind
+        if is_emoji_icon(k):
+            # 清单图标可以直接放一个 emoji（和主窗口左侧那条模块栏同一套画法）。
+            # 不上主题色也不加粗 —— 交给系统的彩色 emoji 字体画，描边反而会把它压成
+            # 单色块。判据用码位：线性图标的 kind 全是 ASCII 名字。
+            f = QFont(self.font())
+            f.setPixelSize(max(9, round(s * 0.88)))
+            p.setFont(f)
+            p.setPen(QColor(theme.get("text")))
+            p.drawText(QRectF(0, 0, s, s), Qt.AlignCenter, emoji_text(k))
+            return
         pt = QPointF
         rl = lambda x, y, w, h, r: p.drawRoundedRect(QRectF(x, y, w, h), r, r)  # noqa: E731
 
@@ -462,6 +486,38 @@ class TickIcon(QWidget):
             p.drawLine(pt(s * .50, s * .50), pt(s * .86, s * .14))
             p.drawLine(pt(s * .64, s * .14), pt(s * .86, s * .14))
             p.drawLine(pt(s * .86, s * .14), pt(s * .86, s * .36))
+        elif k == "abandon":
+            # 放弃：方框里一个叉（和「清除日期」那种纯叉号区分开）
+            rl(s * .14, s * .14, s * .72, s * .72, s * .16)
+            p.drawLine(pt(s * .36, s * .36), pt(s * .64, s * .64))
+            p.drawLine(pt(s * .64, s * .36), pt(s * .36, s * .64))
+        elif k == "move_out":
+            # 移动到：左边一个抽屉框，右边一个出去的箭头
+            p.drawLine(pt(s * .30, s * .14), pt(s * .12, s * .14))
+            p.drawLine(pt(s * .12, s * .14), pt(s * .12, s * .86))
+            p.drawLine(pt(s * .12, s * .86), pt(s * .30, s * .86))
+            p.drawLine(pt(s * .22, s * .50), pt(s * .80, s * .50))
+            p.drawLine(pt(s * .64, s * .34), pt(s * .80, s * .50))
+            p.drawLine(pt(s * .64, s * .66), pt(s * .80, s * .50))
+        elif k == "floppy":
+            # 转换为笔记：软盘 —— 右上角切一刀，上面写口、下面标签
+            path = QPainterPath()
+            path.moveTo(s * .16, s * .16)
+            path.lineTo(s * .70, s * .16)
+            path.lineTo(s * .84, s * .30)
+            path.lineTo(s * .84, s * .84)
+            path.lineTo(s * .16, s * .84)
+            path.closeSubpath()
+            p.drawPath(path)
+            rl(s * .34, s * .16, s * .26, s * .22, s * .04)
+            rl(s * .30, s * .56, s * .40, s * .28, s * .04)
+        elif k == "focus":
+            # 开始专注：一圈一点的目标
+            p.drawEllipse(QRectF(s * .14, s * .14, s * .72, s * .72))
+            fill()
+            r = s * .16
+            p.drawEllipse(QRectF(s * .50 - r, s * .50 - r, r * 2, r * 2))
+            stroke()
         # 未知 kind 留白，不画任何东西（避免崩）
 
 
@@ -508,6 +564,7 @@ class PrioCheckBox(QWidget):
         super().__init__(parent)
         self._checked = checked
         self._prio = 0
+        self._cross = False
         self._shape = shape
         self._hover = False
         self.setFixedSize(size, size)
@@ -517,6 +574,16 @@ class PrioCheckBox(QWidget):
     def set_checked(self, checked: bool) -> None:
         if self._checked != checked:
             self._checked = checked
+            self.update()
+
+    def set_cross(self, on: bool) -> None:
+        """勾里画 ✕ 而不是 ✓：滴答用这个区分「放弃」和「完成」。
+
+        只换笔画，尺寸 / 底色都跟着完成态走 —— 放弃项同样不再出现在待做里。
+        """
+        on = bool(on)
+        if self._cross != on:
+            self._cross = on
             self.update()
 
     def toggle(self) -> None:
@@ -580,6 +647,11 @@ class PrioCheckBox(QWidget):
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
             p.setPen(pen)
+            if self._cross:
+                # 放弃：同一个灰底方框里画叉，位置笔画粗细都跟着勾不变
+                p.drawLine(QPointF(s * .32, s * .32), QPointF(s * .68, s * .68))
+                p.drawLine(QPointF(s * .68, s * .32), QPointF(s * .32, s * .68))
+                return
             p.drawLine(QPointF(s * .28, s * .52), QPointF(s * .44, s * .68))
             p.drawLine(QPointF(s * .44, s * .68), QPointF(s * .73, s * .33))
             return

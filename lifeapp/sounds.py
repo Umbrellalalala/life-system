@@ -27,7 +27,9 @@ from . import config
 # 文件名（assets/sounds/<name>.wav）→ 中文标签。按音长大致从短到长排列，
 # 下拉框里短音在前，方便给高频事件挑不吵的。
 CLIPS: dict[str, str] = {
+    "jingle": "叮当",
     "beep": "哔哔",
+    "spiral": "螺旋",
     "music_box": "八音盒",
     "blocks": "积木",
     "pulse": "脉冲",
@@ -68,14 +70,15 @@ EVENTS: list[tuple[str, str, str, str, bool]] = [
     ("pomodoro_abandon",     "放弃本轮",                "番茄钟", "lattice",   False),
     ("countup_recorded",     "正计时结束并记录",        "番茄钟", "beep",      False),
 
-    # 「叮」：实测这几个音色里 crystal（水晶，主峰 1047Hz≈C6、能量最集中）最接近
-    # 滴答完成时那一声；原来的 blocks 是 208Hz 的低沉木块「咔」，听着像敲桌子。
-    ("todo_done",            "完成待办",                "待办",   "crystal",   True),
+    # 滴答自己的完成音，从 E:\滴答清单\completion_sound_*.wav 转来的：
+    # 立体声 48k → 单声道 44.1k，并按这套素材的响度目标（RMS -20dBFS）归一化过，
+    # 不然会和老素材差 8dB。
+    ("todo_done",            "完成待办",                "待办",   "jingle",    True),
     ("subtask_done",         "完成子任务",              "待办",   "music_box", False),
     ("todo_created",         "新建待办",                "待办",   "beep",      False),
     ("todo_deleted",         "删除待办",                "待办",   "lattice",   False),
 
-    ("habit_checkin",        "习惯打卡",                "习惯",   "harp",      True),
+    ("habit_checkin",        "习惯打卡",                "习惯",   "spiral",    True),
     ("habit_streak_record",  "刷新最长连续记录",        "习惯",   "chimes",    True),
     ("habit_target_reached", "达成习惯目标",            "习惯",   "crystal",   True),
 

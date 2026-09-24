@@ -12,15 +12,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    Qt, QEvent, QTimer, QEventLoop, QPoint, QRectF, Signal,
+    Qt, QEvent, QObject, QTimer, QEventLoop, QPoint, QRectF, Signal,
 )
 from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QWidget, QFrame, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
-    QScrollArea, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QApplication,
+    QScrollArea, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit,
+    QApplication,
 )
 
-from . import theme, widgets
+from . import sounds, theme, widgets
 
 SHADOW = 10          # 卡片四周给阴影留的空白
 RADIUS = 12
@@ -72,6 +73,7 @@ class PopupCard(QFrame):
         self._value = None
         self._done = False
         self._child = None   # 本弹层又打开的子弹层，见 eventFilter
+        self._enter_btn = None   # 按回车等于点它，见 keyPressEvent
 
     # ---- 子类用 ----
     def _accept(self, value) -> None:
@@ -96,6 +98,7 @@ class PopupCard(QFrame):
         row.addWidget(ok, 1)
         row.addWidget(cancel, 1)
         self.lay.addLayout(row)
+        self._enter_btn = ok
 
     def _caption(self, text: str) -> None:
         if not text:
@@ -103,6 +106,22 @@ class PopupCard(QFrame):
         cap = QLabel(text)
         cap.setObjectName("PopupCap")
         self.lay.addWidget(cap)
+
+    def _body(self, text: str, object_name: str = "ConfirmText") -> QLabel:
+        """放一段会自动折行的正文。
+
+        宽度必须钉成卡片的内容宽：wordWrap 的 QLabel 在被给定宽度之前，它的
+        sizeHint 按「整句不折行」算高度，弹层照那个高度长，最后一行就被裁掉
+        （实测要 118px 的内容只分到 73px）。钉住宽度后 sizeHint 自己会按折行算，
+        不用再补最小高度。
+        """
+        lbl = QLabel(text)
+        lbl.setObjectName(object_name)
+        lbl.setWordWrap(True)
+        # 卡片左右 margin 各 14
+        lbl.setFixedWidth(self.maximumWidth() - 2 * SHADOW - 28)
+        self.lay.addWidget(lbl)
+        return lbl
 
     def focus_editor(self) -> None:
         ed = getattr(self, "editor", None)
@@ -152,6 +171,13 @@ class PopupCard(QFrame):
         if event.key() == Qt.Key.Key_Escape:
             self._reject()
             return
+        # 回车走默认那颗按钮。不用 QPushButton.setDefault：那会让 QSS 里的
+        # 按钮多出默认帧，界面上和「取消」看着不一样；直接点它，视觉零变化。
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            b = self._enter_btn
+            if b is not None and b.isVisible() and b.isEnabled():
+                b.click()
+                return
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
@@ -304,6 +330,10 @@ class ChoicePopup(PopupCard):
                                     "accent" if it == current else "muted")
             b.clicked.connect(lambda _=False, v=it: self._submit(v))
             col.addWidget(b)
+            if it == current:
+                # 列表已经打亮了一项（比如「答对了/没答上来」里的上一选），
+                # 回车就按它走：Tab 到的那颗不一定是打亮的这颗。
+                self._enter_btn = b
         col.addStretch(1)
         area = QScrollArea()
         area.setWidgetResizable(True)
@@ -325,10 +355,7 @@ class ConfirmPopup(PopupCard):
     def __init__(self, text: str, ok_text: str = "删除",
                  parent: QWidget | None = None, width: int = 276):
         super().__init__(parent, width)
-        lbl = QLabel(text)
-        lbl.setObjectName("ConfirmText")
-        lbl.setWordWrap(True)
-        self.lay.addWidget(lbl)
+        self._body(text, "ConfirmText")
         row = QHBoxLayout()
         row.setSpacing(8)
         ok = QPushButton(ok_text)
@@ -341,6 +368,7 @@ class ConfirmPopup(PopupCard):
         row.addWidget(ok)
         row.addWidget(cancel)
         self.lay.addLayout(row)
+        self._enter_btn = ok
 
 
 class NotifyPopup(PopupCard):
@@ -350,12 +378,9 @@ class NotifyPopup(PopupCard):
                  parent: QWidget | None = None, width: int = 310):
         super().__init__(parent, width)
         self._caption(title)
-        body = QLabel(text)
-        body.setObjectName("NotifyText")
-        body.setWordWrap(True)
+        body = self._body(text, "NotifyText")
         if danger:
             widgets._apply_property(body, "danger", "true")
-        self.lay.addWidget(body)
         ok = QPushButton("知道了")
         ok.setObjectName("Ghost")
         ok.clicked.connect(self._reject)
@@ -363,6 +388,7 @@ class NotifyPopup(PopupCard):
         row.addStretch(1)
         row.addWidget(ok)
         self.lay.addLayout(row)
+        self._enter_btn = ok        # 「知道了」按回车就收，和点它一样
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +405,7 @@ def _exec(pop: PopupCard, owner: QWidget, center: bool = False):
     """
     loop = QEventLoop(pop)
     pop.finished.connect(loop.quit)
-    host = owner if isinstance(owner, PopupCard) else None
+    host = owner if owner is not None and hasattr(owner, "_child") else None
     if host is not None:
         host._child = pop
         pop.finished.connect(lambda: setattr(host, "_child", None))
@@ -452,5 +478,201 @@ def confirm(parent: QWidget, title: str, text: str,
 def notify(parent: QWidget, title: str, text: str,
            danger: bool = False, center: bool = True,
            width: int = 310) -> None:
+    if danger:
+        # 设置页里「出错提示」有开关、能试听，但之前全仓没有任何地方播它 ——
+        # 16 处 danger=True 全是无声的。
+        sounds.play("popup_danger")
     _exec(NotifyPopup(title, text, danger, parent=parent, width=width),
           parent, center)
+
+
+# ---------------------------------------------------------------------------
+# 文本框的右键菜单
+# ---------------------------------------------------------------------------
+# 系统自带那套是英文的（Undo / Cut / Copy…），和 app 里其它自绘弹层对不上，
+# 换深色主题也不跟着变。这里整层换掉：外观走 TickMenu 同一套 QSS，
+# 行为仍然调控件自己的 undo/cut/copy/paste，不做任何自创语义。
+_EDIT_ITEMS = (
+    ("undo", "撤销", "Ctrl+Z"),
+    ("redo", "重做", "Ctrl+Y"),
+    ("", "", ""),                      # 空标题 = 分隔线
+    ("cut", "剪切", "Ctrl+X"),
+    ("copy", "复制", "Ctrl+C"),
+    ("paste", "粘贴", "Ctrl+V"),
+    ("delete", "删除", "Del"),
+    ("", "", ""),
+    ("all", "全选", "Ctrl+A"),
+)
+
+
+class _EditRow(QFrame):
+    """菜单里的一行：左边文案、右边快捷键。不能做的整行发灰，也不吃点击。"""
+
+    clicked_ = Signal(str)
+
+    def __init__(self, key: str, text: str, hint: str, enabled: bool,
+                 parent=None):
+        super().__init__(parent)
+        self._key = key
+        self._enabled = enabled
+        self.setObjectName("TickMenuRow")
+        widgets._apply_property(self, "hover", "false")
+        self.setFixedHeight(30)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(14)
+        lbl = QLabel(text, self)
+        lbl.setObjectName("TickMenuLabel")
+        widgets._apply_property(lbl, "disabled", "true" if not enabled else "false")
+        lay.addWidget(lbl, 1)
+        if hint:
+            cap = QLabel(hint, self)
+            cap.setObjectName("MenuHint")
+            widgets._apply_property(cap, "disabled", "true" if not enabled else "false")
+            lay.addWidget(cap)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        if self._enabled:
+            widgets._apply_property(self, "hover", "true")
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        widgets._apply_property(self, "hover", "false")
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self._enabled:
+            self.clicked_.emit(self._key)
+
+
+class EditMenu(QFrame):
+    """文本框右键菜单。和 TickMenu 一样是 Qt.Popup：点外面 / Esc 自己收起。"""
+
+    picked = Signal(str)
+
+    def __init__(self, states: dict, parent: QWidget | None = None,
+                 width: int = 184):
+        super().__init__(parent, Qt.WindowType.Popup
+                         | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.setObjectName("TickMenu")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        card = QFrame(self)
+        card.setObjectName("TickMenuCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(5, 5, 5, 5)
+        lay.setSpacing(1)
+        for key, text, hint in _EDIT_ITEMS:
+            if not key:
+                line = QFrame(card)
+                line.setObjectName("MenuSep")
+                line.setFixedHeight(1)
+                lay.addWidget(line)
+                continue
+            row = _EditRow(key, text, hint, bool(states.get(key)), card)
+            row.clicked_.connect(self._fire)
+            lay.addWidget(row)
+        self.setFixedWidth(width)
+
+    def _fire(self, key: str) -> None:
+        self.picked.emit(key)
+        try:
+            self.close()
+        except RuntimeError:  # noqa: BLE001
+            pass
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.deleteLater()
+
+
+def edit_states(w: QWidget) -> dict:
+    """每一项能不能做，全按控件此刻的状态算。"""
+    if isinstance(w, QLineEdit):
+        has_sel = w.hasSelectedText()
+        undo = w.isUndoAvailable()
+        redo = w.isRedoAvailable()
+        body = w.text()
+        can_edit = not w.isReadOnly()
+    else:
+        cur = w.textCursor()
+        has_sel = cur.hasSelection()
+        doc = w.document()
+        undo = doc.isUndoAvailable()
+        redo = doc.isRedoAvailable()
+        body = w.toPlainText()
+        can_edit = not w.isReadOnly()
+    clip = QApplication.clipboard()
+    has_clip = bool(clip is not None and clip.mimeData().hasText())
+    return {"undo": undo, "redo": redo, "cut": has_sel and can_edit,
+            "copy": has_sel, "paste": has_clip and can_edit,
+            "delete": has_sel and can_edit, "all": bool(body)}
+
+
+def run_edit_action(w: QWidget, key: str) -> None:
+    if key == "undo":
+        w.undo()
+    elif key == "redo":
+        w.redo()
+    elif key == "cut":
+        w.cut()
+    elif key == "copy":
+        w.copy()
+    elif key == "paste":
+        w.paste()
+    elif key == "delete":
+        if isinstance(w, QLineEdit):
+            w.del_()
+        else:
+            cur = w.textCursor()
+            cur.removeSelectedText()
+            w.setTextCursor(cur)
+    elif key == "all":
+        w.selectAll()
+    w.setFocus()
+
+
+def show_edit_menu(w: QWidget, global_pos: QPoint) -> None:
+    """在 global_pos 弹出这条文本框自己的右键菜单。
+
+    父对象给的是控件所在的容器而不是 None：Qt.Popup 是顶层窗，但 C++ 侧没父对象
+    时 Python 会接管它的生命周期，show() 返回后局部变量一丢就被 GC 掉。
+    """
+    pop = EditMenu(edit_states(w), w.parentWidget() or w)
+    pop.picked.connect(lambda key: run_edit_action(w, key))
+    pop.adjustSize()
+    pop.move(global_pos)
+    pop.show()
+
+
+class _EditMenuGuard(QObject):
+    """装在 QApplication 上的事件过滤器：把文本框的原生右键菜单换成上面那个。
+
+    只接 contextMenuPolicy 还是默认值的控件 —— 哪个框自己设过菜单（例如日历的
+    右键菜单），就不来抢它的事件。
+    """
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() != QEvent.ContextMenu:
+            return False
+        if not isinstance(obj, (QLineEdit, QPlainTextEdit, QTextEdit)):
+            return False
+        if obj.contextMenuPolicy() != Qt.DefaultContextMenu:
+            return False
+        if not obj.isVisible():
+            return False
+        pos = getattr(event, "globalPosition", None)
+        gp = pos().toPoint() if callable(pos) else event.pos()
+        show_edit_menu(obj, gp)
+        return True
+
+
+_GUARD = None
+
+
+def install_edit_menu_guard(app: QApplication) -> None:
+    """让全应用所有文本框的右键菜单长一个样。main() 里建好 app 就调。"""
+    global _GUARD
+    _GUARD = _EditMenuGuard(app)
+    app.installEventFilter(_GUARD)

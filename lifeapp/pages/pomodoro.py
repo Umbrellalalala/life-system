@@ -5,7 +5,7 @@ import json
 import random
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import (
     Qt, QTimer, Signal, QDateTime, QRectF, QRect, QPoint, QPointF, QSize,
@@ -890,9 +890,18 @@ class TaskPickerPopup(popups.PopupCard):
     """
 
     picked = Signal(str)
+    fav_picked = Signal(dict)
+    manage_favs = Signal()
     closed = Signal()
 
-    def __init__(self, page: "PomodoroPage", parent: QWidget | None = None):
+    def __init__(self, page: "PomodoroPage", parent: QWidget | None = None,
+                 fav_tab: bool = False):
+        """``fav_tab=True`` 才多出「常用专注」那一签。
+
+        只有主页那枚「专注 ›」要它（点了就是开始一个专注）。补录记录、Mini 窗、
+        以及「添加常用专注」里那把 🔗 都只是在挑一个**任务名**，那一签点了没反应
+        —— 挑中一个常用专注对它们没有任何意义，留着就是个死路。
+        """
         super().__init__(parent, width=324)
         self.page = page
         self._filter = "today"
@@ -929,10 +938,14 @@ class TaskPickerPopup(popups.PopupCard):
 
         # tab 行：参考图里两颗胶囊**居中**、右上角没有关闭按钮，
         # 直接复用顶部那条 SegmentedControl（未选中也有灰底胶囊）。
+        # 用 _kinds 存每一签的语义，索引会随 fav_tab 变，不能再拿数字当签。
+        self._kinds = ["task", "fav", "habit"] if fav_tab else ["task", "habit"]
+        labels = {"task": "任务", "fav": "常用专注", "habit": "习惯"}
         tab_row = QHBoxLayout()
         tab_row.setContentsMargins(18, 14, 18, 10)
         tab_row.addStretch(1)
-        self._tabs = focus_ui.SegmentedControl(["任务", "习惯"], "pill", 28)
+        self._tabs = focus_ui.SegmentedControl(
+            [labels[k] for k in self._kinds], "pill", 28)
         self._tabs.changed.connect(lambda _i: self._refresh())
         tab_row.addWidget(self._tabs)
         tab_row.addStretch(1)
@@ -970,8 +983,10 @@ class TaskPickerPopup(popups.PopupCard):
         lay.addLayout(search_row)
 
         # 日期筛选：参考图是**无边框**的「📅 今天 」文字按钮，点开是一组
-        # 智能清单 / 清单 / 标签；不是带边框的 QComboBox。
-        date_row = QHBoxLayout()
+        # 智能清单 / 清单 / 标签；不是带边框的 QComboBox。放进一个可隐藏的容器，
+        # 因为「常用专注 / 习惯」两签没有日期维度，留着这行会误导。
+        self.filter_row = QWidget()
+        date_row = QHBoxLayout(self.filter_row)
         date_row.setContentsMargins(14, 0, 14, 8)
         date_row.setSpacing(5)
         self.date_btn = QPushButton("今天")
@@ -987,7 +1002,7 @@ class TaskPickerPopup(popups.PopupCard):
         date_row.addWidget(self.date_btn)
         date_row.addWidget(focus_ui.MenuIcon("chevron", 12, "muted"))
         date_row.addStretch(1)
-        lay.addLayout(date_row)
+        lay.addWidget(self.filter_row)
 
         # 浏览时列表只装「今天」，打字搜索却会跨到全部 —— 这个差别得说明白，
         # 否则「今天」为空时看起来像一条任务都没有。
@@ -1093,8 +1108,55 @@ class TaskPickerPopup(popups.PopupCard):
                     date_lbl.setProperty("today", "true")
         h.addWidget(date_lbl)
         row.mousePressEvent = lambda e, t=todo["title"]: self._pick(t)
-        self._rows.append((row, todo["title"]))
+        self._rows.append((row, lambda t=todo["title"]: self._pick(t)))
         return row
+
+    def _make_fav_row(self, fav: dict) -> QWidget:
+        """「常用专注」签里的一行：emoji + 名称 + 时长。点它 = 选这个专注并开始。"""
+        row = QFrame()
+        row.setObjectName("PickerRow")
+        row.setFixedHeight(40)
+        row.setCursor(Qt.PointingHandCursor)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 0, 10, 0)
+        h.setSpacing(9)
+        chip = QLabel(fav.get("emoji") or DEFAULT_EMOJI)
+        chip.setFixedWidth(20)
+        chip.setAlignment(Qt.AlignCenter)
+        h.addWidget(chip)
+        title = widgets.ElidedLabel(fav.get("name") or "未命名")
+        title.setObjectName("PickerTitle")
+        h.addWidget(title, 1)
+        dur = ("正计时" if fav.get("mode") == "countup"
+               else f"{fav.get('minutes', 25)}m")
+        sub = QLabel(dur)
+        sub.setObjectName("PickerDate")
+        h.addWidget(sub)
+        row.mousePressEvent = lambda e, f=fav: self._pick_fav(f)
+        self._rows.append((row, lambda f=fav: self._pick_fav(f)))
+        return row
+
+    def _pick_fav(self, fav: dict) -> None:
+        self.fav_picked.emit(fav)
+        self.close()
+
+    def _make_manage_row(self) -> QWidget:
+        """常用专注签底部的「管理」入口 → 打开整页。"""
+        box = QFrame()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(6, 6, 6, 2)
+        sep = QFrame()
+        sep.setObjectName("FocusSep")
+        sep.setFixedHeight(1)
+        v.addWidget(sep)
+        v.addSpacing(4)
+        btn = QPushButton("☰  管理常用专注")
+        btn.setObjectName("PickerAction")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(34)
+        btn.clicked.connect(lambda: (self.manage_favs.emit(), self.close()))
+        v.addWidget(btn)
+        return box
 
     # -- 键盘选择 --------------------------------------------------------
     def _set_sel(self, idx: int) -> None:
@@ -1102,7 +1164,7 @@ class TaskPickerPopup(popups.PopupCard):
             self._sel = -1
             return
         self._sel = max(0, min(idx, len(self._rows) - 1))
-        for i, (w, _t) in enumerate(self._rows):
+        for i, (w, _fn) in enumerate(self._rows):
             w.setProperty("sel", "true" if i == self._sel else "false")
             w.style().unpolish(w)
             w.style().polish(w)
@@ -1111,7 +1173,7 @@ class TaskPickerPopup(popups.PopupCard):
     def _pick_current(self) -> None:
         if self._rows:
             i = self._sel if 0 <= self._sel < len(self._rows) else 0
-            self._pick(self._rows[i][1])
+            self._rows[i][1]()
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         if obj is self.search and event.type() == QEvent.Type.KeyPress:
@@ -1160,17 +1222,23 @@ class TaskPickerPopup(popups.PopupCard):
             return today <= due <= today + timedelta(days=6)
         return True
 
+    def _kind(self) -> str:
+        return self._kinds[self._tabs.current_index()]
+
     def _refresh(self) -> None:
         """重建列表，并把键盘高亮放回第一条：搜索词一改，最该选的就是它。"""
         self._rows = []
         self.filter_hint.hide()
+        # 日期筛选行只对「任务」签有意义，另两签没有日期维度
+        self.filter_row.setVisible(self._kind() == "task")
         self._rebuild_rows()
         self._set_sel(0)
         self._show_filter_hint()
 
     def _show_filter_hint(self) -> None:
-        # 只在「浏览」时提示：打字搜索本来就已经跨出筛选了，再说一遍是噪音。
-        if self.search.text().strip() or self._filter == "all":
+        # 只在「任务」签的浏览态提示：打字搜索本来就已经跨出筛选了，再说一遍是噪音。
+        if (self._kind() != "task" or self.search.text().strip()
+                or self._filter == "all"):
             return
         self.filter_hint.setText(
             "只列「%s」，输入关键词可搜全部任务" % self.date_btn.text())
@@ -1183,7 +1251,27 @@ class TaskPickerPopup(popups.PopupCard):
             if w:
                 w.deleteLater()
         keyword = self.search.text().strip().lower()
-        if self._tabs.current_index() == 1:
+        kind = self._kind()
+        if kind == "fav":                  # 常用专注
+            favs = [f for f in _load_favorites()
+                    if not int(f.get("archived") or 0)]
+            if keyword:
+                favs = [f for f in favs
+                        if keyword in (f.get("name") or "").lower()]
+            for fav in favs:
+                self.list_layout.insertWidget(
+                    self.list_layout.count() - 1, self._make_fav_row(fav))
+            self.list_layout.insertWidget(
+                self.list_layout.count() - 1, self._make_manage_row())
+            if not favs:
+                hint = QLabel("没有匹配的常用专注" if keyword
+                              else "还没有常用专注，点下方「管理」去新建")
+                hint.setObjectName("Muted")
+                hint.setAlignment(Qt.AlignCenter)
+                hint.setFixedHeight(56)
+                self.list_layout.insertWidget(0, hint)
+            return
+        if kind == "habit":                # 习惯
             try:
                 habit_names = [h["name"] for h in services.habit_list(archived=0)]
             except Exception:
@@ -1238,7 +1326,7 @@ class TaskPickerPopup(popups.PopupCard):
                 self.list_layout.insertWidget(self.list_layout.count() - 1, self._make_row(t))
                 inserted = True
         if not inserted:
-            hint = QLabel("暂无任务")
+            hint = QLabel("无匹配任务" if keyword else "暂无任务")
             hint.setObjectName("Muted")
             hint.setAlignment(Qt.AlignCenter)
             hint.setFixedHeight(80)
@@ -1519,14 +1607,30 @@ def _load_favorites() -> list[dict]:
         data = data if isinstance(data, list) else []
     except (ValueError, TypeError):
         data = []
-    # 老数据没有 id：补一个并写回去。删除必须按 id，之前按「name + emoji」
-    # 过滤，建两条同名同表情的常用专注，删一条会把两条一起删掉。
-    missing = [f for f in data if isinstance(f, dict) and not f.get("id")]
-    if missing:
-        for f in missing:
+    # 老数据可能缺 id（删除要按 id，之前按「name + emoji」过滤会把同名同表情的
+    # 两条一起删掉）或缺 archived（坚持中/已归档分栏要用）。缺哪个补哪个并写回。
+    dirty = False
+    for f in data:
+        if not isinstance(f, dict):
+            continue
+        if not f.get("id"):
             f["id"] = uuid.uuid4().hex
+            dirty = True
+        if "archived" not in f:
+            f["archived"] = 0
+            dirty = True
+    if dirty:
         _save_favorites(data)
     return data
+
+
+def _set_fav_archived(fav_id: str, archived: int) -> None:
+    """归档 / 取消归档一个常用专注（按 id）。"""
+    favs = _load_favorites()
+    for f in favs:
+        if f.get("id") == fav_id:
+            f["archived"] = 1 if archived else 0
+    _save_favorites(favs)
 
 
 def _save_favorites(favs: list[dict]) -> None:
@@ -1570,15 +1674,21 @@ class EmojiPicker(QDialog):
 
 
 class AddFocusDialog(QDialog):
-    """「添加常用专注」：emoji 头像 + 名称 + 计时模式，可关联待办任务。"""
+    """「添加/编辑常用专注」：emoji 头像 + 名称 + 计时模式，可关联待办任务。
 
-    def __init__(self, page: "PomodoroPage"):
+    传 ``fav`` 就是编辑：各字段预填，保存时保留原 id 与 archived（否则一改就把
+    它当新建、id 变了，历史记录的 fav_id 就接不上了）。
+    """
+
+    def __init__(self, page: "PomodoroPage", fav: dict | None = None):
         super().__init__(page)
         self.page = page
-        self.task = ""
+        self._fav = fav or {}
+        self.task = self._fav.get("task", "")
         self.result_fav: dict | None = None
-        self.emoji = DEFAULT_EMOJI
-        self.setWindowTitle("添加常用专注")
+        self.emoji = self._fav.get("emoji") or DEFAULT_EMOJI
+        editing = bool(fav)
+        self.setWindowTitle("编辑常用专注" if editing else "添加常用专注")
         self.setFixedWidth(440)
         self.setStyleSheet("QDialog { background: %s; }" % theme.get("bg_alt"))
 
@@ -1586,7 +1696,7 @@ class AddFocusDialog(QDialog):
         outer.setContentsMargins(24, 20, 24, 20)
         outer.setSpacing(16)
 
-        title = QLabel("添加常用专注")
+        title = QLabel("编辑常用专注" if editing else "添加常用专注")
         title.setAlignment(Qt.AlignCenter)
         # 参考图的标题是常规字重的近黑色，不是各设置页那种粗体
         title.setStyleSheet(
@@ -1657,7 +1767,8 @@ class AddFocusDialog(QDialog):
         pomo_row.addWidget(self.rb_pomo)
         pomo_row.addSpacing(6)
         pomo_row.addWidget(self.minutes_spin)
-        pomo_row.addWidget(QLabel("分钟"))
+        self.unit_lbl = QLabel("分钟")
+        pomo_row.addWidget(self.unit_lbl)
         pomo_row.addStretch(1)
         outer.addLayout(pomo_row)
 
@@ -1690,8 +1801,31 @@ class AddFocusDialog(QDialog):
         btn_row.addWidget(self.save_btn)
         btn_row.addWidget(cancel)
         outer.addLayout(btn_row)
+        if self._fav:
+            self._prefill()
         self._sync_save()
+        self.rb_pomo.toggled.connect(self._sync_minutes)
+        self._sync_minutes(self.rb_pomo.isChecked())   # 编辑正计时时要立刻灰掉
+        self.name_input.returnPressed.connect(
+            lambda: self._save() if self.save_btn.isEnabled() else None)
         focus_ui.fade_in(self, 140)
+
+    def _sync_minutes(self, pomo: bool) -> None:
+        """选了正计时，那个「分钟」框就没有意义了 —— 灰掉，别让它看着还能填。"""
+        self.minutes_spin.setEnabled(pomo)
+        self.unit_lbl.setEnabled(pomo)
+
+    def _prefill(self):
+        f = self._fav
+        self.avatar_emoji.setText(f.get("emoji") or DEFAULT_EMOJI)
+        self.name_input.setText(f.get("name", ""))
+        if f.get("mode") == "countup":
+            self.rb_count.setChecked(True)
+        else:
+            self.rb_pomo.setChecked(True)
+        self.minutes_spin.setValue(int(f.get("minutes") or 25))
+        if self.task:
+            self.task_tip.setText(f"已关联任务：{self.task}")
 
     def _sync_save(self):
         self.save_btn.setEnabled(bool(self.name_input.text().strip()))
@@ -1722,6 +1856,8 @@ class AddFocusDialog(QDialog):
         if not name:
             return
         self.result_fav = {
+            "id": self._fav.get("id") or uuid.uuid4().hex,
+            "archived": int(self._fav.get("archived") or 0),
             "name": name,
             "emoji": self.avatar_emoji.text(),
             "mode": "pomodoro" if self.rb_pomo.isChecked() else "countup",
@@ -1729,145 +1865,6 @@ class AddFocusDialog(QDialog):
             "task": self.task,
         }
         self.accept()
-
-
-class _FavRow(QFrame):
-    """常用专注行：emoji 色块 + 名称 + 时长；悬停时才露出删除按钮。"""
-
-    picked = Signal(dict)
-    removed = Signal(dict)
-
-    def __init__(self, fav: dict, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("PickerRow")
-        self.setFixedHeight(48)
-        self.setCursor(Qt.PointingHandCursor)
-        self._fav = fav
-
-        h = QHBoxLayout(self)
-        h.setContentsMargins(8, 0, 8, 0)
-        h.setSpacing(10)
-        chip = QLabel(fav.get("emoji") or DEFAULT_EMOJI)
-        chip.setObjectName("FavChip")
-        chip.setAlignment(Qt.AlignCenter)
-        chip.setFixedSize(32, 32)
-        h.addWidget(chip)
-
-        col = QVBoxLayout()
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(1)
-        title = widgets.ElidedLabel(fav.get("name") or "未命名")
-        title.setObjectName("PickerTitle")
-        col.addWidget(title)
-        desc = ("正计时" if fav.get("mode") == "countup"
-                else f"{fav.get('minutes', 25)} 分钟")
-        sub = QLabel(desc)
-        sub.setObjectName("PickerDate")
-        col.addWidget(sub)
-        h.addLayout(col, 1)
-
-        self.del_btn = QPushButton("×")
-        self.del_btn.setObjectName("PickerClose")
-        self.del_btn.setFixedSize(22, 22)
-        self.del_btn.setCursor(Qt.PointingHandCursor)
-        self.del_btn.setToolTip("删除这个常用专注")
-        self.del_btn.clicked.connect(lambda: self.removed.emit(self._fav))
-        self.del_btn.hide()
-        h.addWidget(self.del_btn)
-
-    def enterEvent(self, event) -> None:  # noqa: N802
-        self.del_btn.show()
-
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        self.del_btn.hide()
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.LeftButton:
-            self.picked.emit(self._fav)
-
-
-class FavoritePickerPopup(QFrame):
-    """常用专注选择弹窗（点击「专注 ›」弹出）。"""
-
-    picked = Signal(dict)
-    add_requested = Signal()
-    task_pick_requested = Signal()
-
-    def __init__(self, page: "PomodoroPage", parent: QWidget | None = None):
-        super().__init__(parent, focus_ui.POPUP_FLAGS)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        # 268 足够放下 emoji 块 + 中文名称 + 时长，再宽右侧会留大片空白
-        self.setFixedWidth(268)
-        self.page = page
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        card = QFrame()
-        card.setObjectName("PickerCard")
-        self.lay = QVBoxLayout(card)
-        self.lay.setContentsMargins(6, 10, 6, 10)
-        self.lay.setSpacing(2)
-        outer.addWidget(card)
-        self._refresh()
-
-    def _refresh(self):
-        while self.lay.count():
-            item = self.lay.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        favs = _load_favorites()
-        if not favs:
-            hint = QLabel("还没有常用专注，点下方添加")
-            hint.setObjectName("Muted")
-            hint.setAlignment(Qt.AlignCenter)
-            hint.setWordWrap(True)
-            hint.setFixedHeight(56)
-            self.lay.addWidget(hint)
-        for fav in favs:
-            self.lay.addWidget(self._make_row(fav))
-        self.lay.addWidget(self._make_action_row())
-        self.adjustSize()
-
-    def _make_row(self, fav: dict) -> QWidget:
-        row = _FavRow(fav)
-        row.picked.connect(self._pick)
-        row.removed.connect(self._remove)
-        return row
-
-    def _make_action_row(self) -> QWidget:
-        box = QFrame()
-        v = QVBoxLayout(box)
-        v.setContentsMargins(6, 6, 6, 2)
-        v.setSpacing(1)
-        sep = QFrame()
-        sep.setObjectName("FocusSep")
-        sep.setFixedHeight(1)
-        v.addWidget(sep)
-        v.addSpacing(4)
-        for text, sig in (("＋  添加常用专注", self.add_requested),
-                          ("☰  从待办中选择", self.task_pick_requested)):
-            btn = QPushButton(text)
-            btn.setObjectName("PickerAction")
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(34)
-            btn.clicked.connect(lambda _=False, s=sig: (s.emit(), self.close()))
-            v.addWidget(btn)
-        return box
-
-    def _pick(self, fav: dict):
-        self.picked.emit(fav)
-        self.close()
-
-    def _remove(self, fav: dict):
-        # 按 id 删。按 name+emoji 过滤会把两条同名同表情的记录一起删掉。
-        favs = [f for f in _load_favorites() if f.get("id") != fav.get("id")]
-        _save_favorites(favs)
-        if self.page._active_fav is fav or (
-                self.page._active_fav
-                and self.page._active_fav.get("id") == fav.get("id")):
-            self.page._active_fav = None
-            self.page.task_lbl.setText("专注 ›")
-        self._refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -2948,6 +2945,562 @@ class MiniWindow(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 常用专注：整页（列表 + 计时坞 + 每个专注的统计）
+# ---------------------------------------------------------------------------
+def _fmt_min(m: int) -> str:
+    """分钟数压成参考图那种紧凑写法：0m / 45m / 1h30m / 2h。"""
+    m = int(m or 0)
+    if m < 60:
+        return f"{m}m"
+    h, r = divmod(m, 60)
+    return f"{h}h{r}m" if r else f"{h}h"
+
+
+class _FavListRow(QFrame):
+    """常用专注整页左列表的一行：emoji + 名称 + 累计时长 + ▶。
+
+    单击选中（右侧看它的统计），点 ▶ 直接开始，右键出 编辑/添加记录/归档/删除。
+    行右侧那个数字是这个专注**累计专注了多少**（参考图口径），
+    配置的模式/时长只在右侧详情里显示，不放行内。
+    """
+
+    selected = Signal(dict)
+    started = Signal(dict)
+    menu_requested = Signal(dict, object)
+
+    def __init__(self, fav: dict, total_min: int = 0,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("FavListRow")
+        self.setFixedHeight(56)
+        self.setCursor(Qt.PointingHandCursor)
+        self._fav = fav
+        self._running = False
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 0, 12, 0)
+        h.setSpacing(12)
+        chip = QLabel(fav.get("emoji") or DEFAULT_EMOJI)
+        chip.setObjectName("FavChip")
+        chip.setAlignment(Qt.AlignCenter)
+        chip.setFixedSize(34, 34)
+        h.addWidget(chip)
+        title = widgets.ElidedLabel(fav.get("name") or "未命名")
+        title.setObjectName("FavName")
+        h.addWidget(title, 1)
+        self.total_lbl = QLabel(_fmt_min(total_min))
+        self.total_lbl.setObjectName("FavTotal")
+        h.addWidget(self.total_lbl)
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setObjectName("FavPlay")
+        self.play_btn.setFixedSize(30, 30)
+        self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.setToolTip("开始这个专注")
+        self.play_btn.clicked.connect(lambda: self.started.emit(self._fav))
+        h.addWidget(self.play_btn)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda pos, f=fav: self.menu_requested.emit(f, self.mapToGlobal(pos)))
+
+    def set_selected(self, on: bool) -> None:
+        self.setProperty("sel", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_running(self, on: bool) -> None:
+        """正在计时的这一个，行尾的 ▶ 换成 ⏸ —— 点它就是暂停。
+
+        整页开着时列表里有好几条，光看行分不出「现在跑的是哪个」，
+        左下角的坞又只报名字。
+        """
+        if self._running == on:
+            return
+        self._running = on
+        self.play_btn.setText("⏸" if on else "▶")
+        self.play_btn.setToolTip("暂停" if on else "开始这个专注")
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.selected.emit(self._fav)
+        super().mouseReleaseEvent(event)
+
+
+class _TimerDock(QFrame):
+    """常用专注页左下角的计时坞：显示当前专注，点它退回主计时器，点 ▶ 启停。"""
+
+    def __init__(self, page: "PomodoroPage", on_open_back, parent=None):
+        super().__init__(parent)
+        self.page = page
+        self.on_open_back = on_open_back
+        self.setObjectName("TimerDock")
+        self.setFixedHeight(64)
+        self.setCursor(Qt.PointingHandCursor)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 0, 12, 0)
+        h.setSpacing(12)
+        self.icon = QLabel("🍅")
+        self.icon.setObjectName("DockIcon")
+        self.icon.setFixedSize(30, 30)
+        self.icon.setAlignment(Qt.AlignCenter)
+        h.addWidget(self.icon)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
+        self.name_lbl = widgets.ElidedLabel("专注")
+        self.name_lbl.setObjectName("DockName")
+        col.addWidget(self.name_lbl)
+        self.time_lbl = QLabel("25:00")
+        self.time_lbl.setObjectName("DockTime")
+        col.addWidget(self.time_lbl)
+        h.addLayout(col, 1)
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setObjectName("DockPlay")
+        self.play_btn.setFixedSize(34, 34)
+        self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.clicked.connect(self._toggle)
+        h.addWidget(self.play_btn)
+
+    def _toggle(self):
+        self.page._toggle()
+        self.refresh()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 点坞体（非 ▶ 按钮）→ 收起常用专注页，回到原来的全屏计时界面
+        if event.button() == Qt.LeftButton:
+            self.on_open_back()
+        super().mouseReleaseEvent(event)
+
+    def refresh(self):
+        p = self.page
+        if p.mode in ("short", "long"):
+            # 休息阶段顶着任务名＋番茄图标，看着像还在专注
+            self.name_lbl.setText(MODE_META[p.mode][0])
+            self.icon.setText("☕")
+        else:
+            self.name_lbl.setText(p._task or "专注")
+            self.icon.setText("⏱" if p.timer_mode == "countup" else "🍅")
+        secs = p.countup_elapsed if p.timer_mode == "countup" else p.remaining
+        self.time_lbl.setText(p._fmt(secs))
+        self.play_btn.setText("⏸" if p.running else "▶")
+
+
+class FocusManagerView(QWidget):
+    """常用专注整页（参考图2）：左=坚持中/已归档 列表 + 底部计时坞，右=选中专注的统计。"""
+
+    def __init__(self, page: "PomodoroPage"):
+        super().__init__(page)
+        self.page = page
+        self.setObjectName("FocusManagerPage")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._tab = 0                 # 0 坚持中 / 1 已归档
+        self._selected: dict | None = None
+        self._grain = "week"          # week / month
+        self._offset = 0
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_left(), 5)
+        root.addWidget(self._build_right(), 4)
+        self._apply_style()
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
+
+    # ---- 样式 ----
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            "QWidget#FocusManagerPage { background: %s; }"
+            "QLabel { background: transparent; }"
+            "QFrame#FavListRow { background: transparent; border: none;"
+            "  border-bottom: 1px solid %s; }"
+            "QFrame#FavListRow:hover { background: %s; }"
+            "QFrame#FavListRow[sel=\"true\"] { background: %s; }"
+            "QLabel#FavChip { background: %s; border-radius: 17px; font-size: 17px; }"
+            "QLabel#FavName { color: %s; font-size: 15px; }"
+            "QLabel#FavSub { color: %s; font-size: 12px; }"
+            "QLabel#FavTotal { color: %s; font-size: 13px; }"
+            "QPushButton#FavPlay { background: transparent; border: none;"
+            "  color: %s; font-size: 14px; border-radius: 15px; }"
+            "QPushButton#FavPlay:hover { background: %s; }"
+            "QPushButton#DockPlay { background: %s; border: none;"
+            "  color: %s; font-size: 14px; border-radius: 17px; }"
+            "QPushButton#DockPlay:hover { background: %s; }"
+            "QFrame#TimerDock { background: %s; border-top: 1px solid %s; }"
+            "QLabel#DockName { color: %s; font-size: 12.5px; }"
+            "QLabel#DockTime { color: %s; font-size: 18px; font-weight: 600; }"
+            "QLabel#MgrTitle { color: %s; font-size: 20px; font-weight: 700; }"
+            "QLabel#MgrClose { color: %s; font-size: 13.5px; }"
+            "QLabel#MgrFavName { color: %s; font-size: 17px; font-weight: 600; }"
+            "QLabel#MgrFavSub { color: %s; font-size: 12.5px; }"
+            "QLabel#MgrBigNum { color: %s; font-size: 26px; font-weight: 700; }"
+            % (focus_ui.stats_bg().name(),
+               theme.get("border"),
+               theme.get("surface_hi"), theme.get("focus_soft"),
+               focus_ui.tile_bg().name(), theme.get("text_hi"),
+               focus_ui.neutral_text("group").name(),
+               focus_ui.neutral_text("label").name(), theme.get("focus"),
+               theme.get("surface_hi"),
+               theme.get("focus_soft"), theme.get("focus"),
+               theme.get("focus_soft"),
+               theme.get("surface"), theme.get("border"),
+               focus_ui.neutral_text("label").name(), theme.get("text_hi"),
+               theme.get("text_hi"), theme.get("focus"),
+               theme.get("text_hi"), focus_ui.neutral_text("label").name(),
+               theme.get("text_hi")))
+
+    def apply_theme(self) -> None:
+        self._apply_style()
+        for t in getattr(self, "tiles", []):
+            t.apply_theme()
+
+    # ---- 左：列表 + 计时坞 ----
+    def _build_left(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 18, 12, 0)
+        v.setSpacing(0)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title = QLabel("专注")
+        title.setObjectName("MgrTitle")
+        head.addWidget(title)
+        head.addSpacing(8)
+        self._tabs = focus_ui.SegmentedControl(["坚持中", "已归档"], "pill", 28)
+        self._tabs.changed.connect(self._on_tab)
+        head.addWidget(self._tabs)
+        head.addStretch(1)
+        add_btn = focus_ui.icon_button("+", "新建常用专注", 30)
+        add_btn.clicked.connect(lambda: self.page._open_add_favorite())
+        head.addWidget(add_btn)
+        more = focus_ui.icon_button("⋯", "更多", 30)
+        more.clicked.connect(lambda: self.page._open_more_menu())
+        head.addWidget(more)
+        v.addLayout(head)
+        v.addSpacing(12)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list_host = QWidget()
+        self.list_lay = QVBoxLayout(self.list_host)
+        self.list_lay.setContentsMargins(0, 0, 6, 0)
+        self.list_lay.setSpacing(2)
+        self.list_lay.addStretch(1)
+        self.scroll.setWidget(self.list_host)
+        v.addWidget(self.scroll, 1)
+
+        self.dock = _TimerDock(self.page, self.close)
+        # 坞横跨到左列底部（去掉左右内缩，贴边更像参考图）
+        v.setContentsMargins(20, 18, 12, 0)
+        v.addWidget(self.dock)
+        return w
+
+    # ---- 右：选中专注的统计 ----
+    def _build_right(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 18, 24, 20)
+        v.setSpacing(0)
+        head = QHBoxLayout()
+        close = QPushButton("关闭")
+        close.setObjectName("MgrClose")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFlat(True)
+        close.clicked.connect(self.close)
+        head.addWidget(close)
+        head.addStretch(1)
+        self.more_btn = focus_ui.icon_button("⋯", "更多操作", 30)
+        self.more_btn.clicked.connect(self._detail_menu)
+        head.addWidget(self.more_btn)
+        v.addLayout(head)
+        v.addSpacing(10)
+
+        info = QHBoxLayout()
+        info.setSpacing(12)
+        self.d_chip = QLabel("😊")
+        self.d_chip.setObjectName("FavChip")
+        self.d_chip.setFixedSize(44, 44)
+        self.d_chip.setAlignment(Qt.AlignCenter)
+        info.addWidget(self.d_chip)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self.d_name = widgets.ElidedLabel("未选择")
+        self.d_name.setObjectName("MgrFavName")
+        col.addWidget(self.d_name)
+        self.d_sub = QLabel("")
+        self.d_sub.setObjectName("MgrFavSub")
+        col.addWidget(self.d_sub)
+        info.addLayout(col, 1)
+        v.addLayout(info)
+        v.addSpacing(18)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(12)
+        self.tiles = []
+        for label in ("专注天数", "今日时长", "总时长"):
+            t = OverviewTile(label)
+            self.tiles.append(t)
+            tiles.addWidget(t, 1)
+        v.addLayout(tiles)
+        v.addSpacing(22)
+
+        # 趋势块：大号总时长 + 周/月粒度 + 日期导航 + 柱状图
+        top = QHBoxLayout()
+        self.d_total = QLabel("0m")
+        self.d_total.setObjectName("MgrBigNum")
+        top.addWidget(self.d_total)
+        top.addSpacing(6)
+        unit = QLabel("m")
+        unit.setObjectName("MgrFavSub")
+        top.addWidget(unit)
+        top.addStretch(1)
+        self.grain = widgets.ComboBox()
+        self.grain.setObjectName("FocusPillCombo")
+        self.grain.addItems(["周", "月"])
+        self.grain.setFixedSize(64, 28)
+        self.grain.setCursor(Qt.PointingHandCursor)
+        self.grain.currentIndexChanged.connect(self._on_grain)
+        top.addWidget(self.grain)
+        v.addLayout(top)
+        v.addSpacing(8)
+
+        nav = QHBoxLayout()
+        nav.setSpacing(2)
+        prev = QPushButton("‹")
+        nxt = QPushButton("›")
+        for b in (prev, nxt):
+            b.setObjectName("FocusLink")
+            b.setFixedSize(22, 24)
+            b.setCursor(Qt.PointingHandCursor)
+        prev.clicked.connect(self._prev_range)
+        nxt.clicked.connect(self._next_range)
+        self.range_lbl = QLabel("")
+        self.range_lbl.setObjectName("MgrFavSub")
+        nav.addWidget(prev)
+        nav.addWidget(self.range_lbl)
+        nav.addWidget(nxt)
+        nav.addStretch(1)
+        v.addLayout(nav)
+        v.addSpacing(6)
+
+        self.chart = focus_ui.MiniTrend("bar", "minutes", divisions=3)
+        self.chart.setMinimumHeight(200)
+        v.addWidget(self.chart, 1)
+        return w
+
+    # ---- 交互 ----
+    def _on_tab(self, idx: int) -> None:
+        self._tab = idx
+        self._refresh_list()
+
+    def _on_grain(self, idx: int) -> None:
+        self._grain = "week" if idx == 0 else "month"
+        self._offset = 0
+        self._refresh_detail()
+
+    def _prev_range(self) -> None:
+        self._offset += 1
+        self._refresh_detail()
+
+    def _next_range(self) -> None:
+        self._offset = max(0, self._offset - 1)
+        self._refresh_detail()
+
+    def _range(self) -> tuple[date, date, str]:
+        today = date.today()
+        if self._grain == "week":
+            # 参考图这一格是周日起
+            cur_sun = today - timedelta(days=(today.weekday() + 1) % 7)
+            start = cur_sun - timedelta(days=self._offset * 7)
+            end = start + timedelta(days=6)
+            return start, end, f"{start.month}月{start.day}日 - {end.month}月{end.day}日"
+        y, m = self._shift_month(today.year, today.month, -self._offset)
+        start = date(y, m, 1)
+        ny, nm = self._shift_month(y, m, 1)
+        return start, date(ny, nm, 1) - timedelta(days=1), f"{y}年{m}月"
+
+    @staticmethod
+    def _shift_month(y: int, m: int, delta: int) -> tuple[int, int]:
+        m = m + delta
+        return y + (m - 1) // 12, (m - 1) % 12 + 1
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.apply_theme()
+        self._refresh_list()
+        self.dock.refresh()
+        self.setFocus()          # ↑↓/Enter 要先进到这一页的 keyPressEvent
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.hide()
+        event.ignore()
+
+    def refresh_dock(self) -> None:
+        if self.isVisible():
+            self.dock.refresh()
+            self._sync_running_marks()
+
+    def _sync_running_marks(self) -> None:
+        act = (self.page._active_fav or {}).get("id") if self.page.running else None
+        for r in self.findChildren(_FavListRow):
+            r.set_running(bool(act) and r._fav.get("id") == act)
+
+    # ---- 列表 ----
+    def _refresh_list(self) -> None:
+        while self.list_lay.count() > 1:
+            item = self.list_lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        favs = [f for f in _load_favorites()
+                if int(f.get("archived") or 0) == self._tab]
+        totals = services.pomodoro_fav_totals()
+        if not favs:
+            hint = QLabel("还没有常用专注，点右上角 ＋ 新建" if self._tab == 0
+                          else "没有已归档的常用专注")
+            hint.setObjectName("FavSub")
+            hint.setAlignment(Qt.AlignCenter)
+            hint.setContentsMargins(0, 30, 0, 0)
+            self.list_lay.insertWidget(0, hint)
+            self._selected = None
+            self._refresh_detail()
+            return
+        # 保持选中项（切标签/新建后不丢焦点）
+        sel_id = (self._selected or {}).get("id")
+        if not any(f.get("id") == sel_id for f in favs):
+            self._selected = favs[0]
+        for fav in favs:
+            row = _FavListRow(fav, totals.get(fav.get("id") or "", 0))
+            row.selected.connect(self._select)
+            row.started.connect(self._start)
+            row.menu_requested.connect(self._row_menu)
+            row.set_selected(fav.get("id") == (self._selected or {}).get("id"))
+            self.list_lay.insertWidget(self.list_lay.count() - 1, row)
+        self._refresh_detail()
+
+    def _select(self, fav: dict) -> None:
+        self._selected = fav
+        for i in range(self.list_lay.count()):
+            w = self.list_lay.itemAt(i).widget()
+            if isinstance(w, _FavListRow) and w._fav.get("id") == fav.get("id"):
+                w.set_selected(True)
+                self.scroll.ensureWidgetVisible(w, 0, 24)
+            elif isinstance(w, _FavListRow):
+                w.set_selected(False)
+        self._refresh_detail()
+
+    # ---- 键盘：↑↓ 换选中、Enter 直接开始 ----
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        rows = self.findChildren(_FavListRow)
+        if not rows:
+            super().keyPressEvent(event)
+            return
+        cur = next((i for i, r in enumerate(rows)
+                    if r._fav.get("id") == (self._selected or {}).get("id")), -1)
+        key = event.key()
+        if key == Qt.Key_Down:
+            self._select(rows[min(cur + 1, len(rows) - 1)]._fav)
+        elif key == Qt.Key_Up:
+            self._select(rows[max(cur - 1, 0)]._fav)
+        elif key in (Qt.Key_Return, Qt.Key_Enter) and cur >= 0:
+            self._start(rows[cur]._fav)
+        else:
+            super().keyPressEvent(event)
+
+    def _start(self, fav: dict) -> None:
+        self._select(fav)
+        self.page._start_favorite(fav)
+        self.dock.refresh()
+
+    # ---- 右侧详情 ----
+    def _refresh_detail(self) -> None:
+        fav = self._selected
+        if not fav:
+            self.d_chip.setText("😊")
+            self.d_name.setText("未选择")
+            self.d_sub.setText("")
+            for t in self.tiles:
+                t.set_value("0")
+            self.d_total.setText("0")
+            self.chart.set_data([0.0] * 7, [""] * 7)
+            self.range_lbl.setText("")
+            return
+        self.d_chip.setText(fav.get("emoji") or DEFAULT_EMOJI)
+        self.d_name.setText(fav.get("name") or "未命名")
+        self.d_sub.setText("正计时" if fav.get("mode") == "countup"
+                           else f"番茄计时 {fav.get('minutes', 25)}m")
+        fav_id = fav.get("id") or ""
+        s = services.pomodoro_fav_summary(fav_id)
+        self.tiles[0].set_value(str(s["days"]))
+        self.tiles[1].set_value(f"{s['today_min']} m")
+        self.tiles[2].set_value(f"{s['total_min']} m")
+        start, end, label = self._range()
+        self.range_lbl.setText(label)
+        daily = services.pomodoro_fav_daily(fav_id, start.isoformat(), end.isoformat())
+        self.d_total.setText(str(sum(d["minutes"] for d in daily)))
+        if self._grain == "week":
+            labels = ["日", "一", "二", "三", "四", "五", "六"]
+        else:
+            labels = [d["date"][8:10] for d in daily]
+        today_iso = date.today().isoformat()
+        hi = next((i for i, d in enumerate(daily) if d["date"] == today_iso), -1)
+        self.chart.set_data([float(d["minutes"]) for d in daily], labels,
+                            highlight=hi)
+
+    # ---- 操作菜单（行右键 / 右上 ⋯）----
+    def _row_menu(self, fav: dict, global_pos) -> None:
+        self._select(fav)
+        self._fav_menu_at(global_pos, fav)
+
+    def _detail_menu(self) -> None:
+        if not self._selected:
+            return
+        self._fav_menu_at(self.more_btn.mapToGlobal(QPoint(-140, self.more_btn.height())),
+                          self._selected)
+
+    def _fav_menu_at(self, global_pos, fav: dict) -> None:
+        archived = int(fav.get("archived") or 0)
+        items = [("edit", "编辑"), ("add_record", "添加记录"),
+                 ("archive", "取消归档" if archived else "归档"),
+                 ("delete", "删除")]
+        menu = focus_ui.PopupMenu([tuple(x) for x in items], self)
+        slots = [lambda: self.page._open_add_favorite(fav),
+                 lambda: self.page._add_record_for_fav(fav),
+                 lambda: self._toggle_archive(fav),
+                 lambda: self._delete(fav)]
+        for row, slot in zip(menu.rows, slots):
+            row.clicked.connect(slot)
+            row.clicked.connect(menu.close)
+            row.installEventFilter(_HoverFilter(menu))
+        menu.move(global_pos)
+        menu.show()
+
+    def _toggle_archive(self, fav: dict) -> None:
+        _set_fav_archived(fav.get("id"), 0 if int(fav.get("archived") or 0) else 1)
+        self._selected = None
+        self._refresh_list()
+
+    def _delete(self, fav: dict) -> None:
+        # 删下去就找不回来了，而且它名下的记录会一起变成「不属于任何常用专注」，
+        # 所以先确认一次，并说清记录留不留（习惯页删习惯是同一种口径）。
+        n = services.pomodoro_fav_summary(fav.get("id") or "")["count"]
+        tail = (f"它已产生的 {n} 条专注记录仍会留在记录列表里。" if n
+                else "它还没有专注记录。")
+        if not popups.confirm(
+                self, "删除常用专注",
+                f"确定删除「{fav.get('name') or '未命名'}」吗？{tail}"):
+            return
+        favs = [f for f in _load_favorites() if f.get("id") != fav.get("id")]
+        _save_favorites(favs)
+        if self.page._active_fav and self.page._active_fav.get("id") == fav.get("id"):
+            self.page._active_fav = None
+            self.page._fav_id = ""
+            self.page.task_lbl.setText("专注 ›")
+        self._selected = None
+        self._refresh_list()
+
+
+# ---------------------------------------------------------------------------
 # 主页面
 # ---------------------------------------------------------------------------
 class PomodoroPage(Page):
@@ -2966,6 +3519,8 @@ class PomodoroPage(Page):
         self.session_count: int = 0
         self._task: str = ""
         self._active_fav: dict | None = None
+        # 本轮计时归属的常用专注 id（落库时写进记录的 fav_id，供其统计归集）
+        self._fav_id: str = ""
         self._auto_done_in_round: int = 0
         # 本轮计时的真实开始时刻（落库用），None = 还没开始
         self._session_start: datetime | None = None
@@ -2988,6 +3543,7 @@ class PomodoroPage(Page):
         self._mini_shown: bool = False
         self._immersive: ImmersiveOverlay | None = None
         self._stats: StatsView | None = None
+        self._fav_manager: FocusManagerView | None = None
         self._mini_shortcut: QShortcut | None = None
         self._hotkey_global: bool = False
         # 首次装配时页面还没挂到主窗口上，取不到 HWND，转一圈事件循环再注册
@@ -3011,6 +3567,8 @@ class PomodoroPage(Page):
         self._apply_surface_colors()
         if self._stats is not None:
             self._stats.apply_theme()
+        if self._fav_manager is not None:
+            self._fav_manager.apply_theme()
         for tile in getattr(self, "tiles", []):
             tile.apply_theme()
         for line in self.findChildren(_RecordLine):
@@ -3113,8 +3671,8 @@ class PomodoroPage(Page):
         rb.setContentsMargins(0, 0, 0, 0)
         rb.setSpacing(2)
         rb.addStretch(1)
-        add_btn = focus_ui.icon_button("+", "添加常用专注")
-        add_btn.clicked.connect(self._open_add_favorite)
+        add_btn = focus_ui.icon_button("+", "常用专注")
+        add_btn.clicked.connect(self._open_fav_manager)
         rb.addWidget(add_btn)
         self._more_btn = focus_ui.icon_button("⋯", "更多")
         self._more_btn.clicked.connect(self._open_more_menu)
@@ -3377,6 +3935,8 @@ class PomodoroPage(Page):
             self.ring.set_text(self._fmt(max(self.remaining, 0)))
         self.ring.set_progress(prog)
         self._refresh_status()
+        if self._fav_manager is not None and self._fav_manager.isVisible():
+            self._fav_manager.refresh_dock()
 
     def _set_state(self, text: str):
         """记录当前状态文案，并刷新环下方那行小字。"""
@@ -3503,7 +4063,8 @@ class PomodoroPage(Page):
         self._persist_timer.stop()
         self.running = False
         minutes = max(1, round(self.countup_elapsed / 60))
-        services.pomodoro_add(minutes, self._task, 1, started_at=self._started_at())
+        services.pomodoro_add(minutes, self._task, 1,
+                              started_at=self._started_at(), fav_id=self._fav_id)
         self._notify("专注已记录", f"本次专注 {minutes} 分钟")
         sounds.play("countup_recorded")
         self.countup_elapsed = 0
@@ -3522,7 +4083,7 @@ class PomodoroPage(Page):
         self._clear_session()
         if self.mode == "work":
             services.pomodoro_add(max(1, self.total // 60), self._task, 1,
-                                  started_at=started)
+                                  started_at=started, fav_id=self._fav_id)
             self.session_count += 1
             self._auto_done_in_round += 1
             self._notify("番茄完成", f"已完成 {self.session_count} 个番茄")
@@ -3576,28 +4137,23 @@ class PomodoroPage(Page):
     # 任务选择
     # ------------------------------------------------------------------
     def _open_task_picker(self):
-        """「专注 ›」→ 常用专注选择弹窗。"""
-        popup = FavoritePickerPopup(self, self)
-        popup.picked.connect(self._on_fav_picked)
-        popup.add_requested.connect(self._open_add_favorite)
-        popup.task_pick_requested.connect(self._open_todo_picker)
-        pos = self.task_lbl.mapToGlobal(QPoint(0, self.task_lbl.height()))
-        popup.move(pos.x() + self.task_lbl.width() // 2 - popup.width() // 2,
-                   pos.y() + 4)
-        popup.show()
+        """「专注 ›」→ 任务选择弹窗（任务 / 常用专注 / 习惯 三签，参考图6）。
 
-    def _open_todo_picker(self):
-        """从待办任务直接选择当前专注任务。"""
-        popup = TaskPickerPopup(self, self)
+        以前这里直接弹「常用专注」选择框，点「从待办中选择」才进任务列表 ——
+        和滴答反了：主入口应是选任务，常用专注只是其中一个签。
+        """
+        popup = TaskPickerPopup(self, self, fav_tab=True)
         popup.picked.connect(self._on_task_picked)
-        # PopupCard 关闭时不自己销毁（老写法靠 hideEvent 里的 deleteLater），
-        # 不加这个的话每开一次就留一个挂在页面下。
+        popup.fav_picked.connect(self._start_favorite)
+        popup.manage_favs.connect(self._open_fav_manager)
+        # PopupCard 关闭时不自己销毁，不加这个每开一次就留一个挂在页面下。
         popup.setAttribute(Qt.WA_DeleteOnClose, True)
         popups.place_popup(popup, self.task_lbl)
         popup.show()
 
     def _on_fav_picked(self, fav: dict):
         self._active_fav = fav
+        self._fav_id = fav.get("id") or ""
         self._task = fav.get("task") or fav["name"]
         self.task_lbl.setText(f"{fav.get('emoji', DEFAULT_EMOJI)} {fav['name']} ›")
         # 常用专注自带计时模式（添加弹窗里就能选正计时），选中它必须切过去，
@@ -3610,20 +4166,63 @@ class PomodoroPage(Page):
         if not self.running and self.timer_mode == "pomodoro":
             self._set_mode("work")
 
-    def _open_add_favorite(self):
-        dlg = AddFocusDialog(self)
+    def _open_add_favorite(self, fav: dict | None = None):
+        """新增（fav=None）或编辑（传 fav）一个常用专注。"""
+        dlg = AddFocusDialog(self, fav)
         if dlg.exec() == QDialog.Accepted and dlg.result_fav:
-            favs = _load_favorites()
-            name = dlg.result_fav["name"]
-            # 重名不去重的话，列表里会出现两条一模一样的条目，
-            # 而它们点起来完全无法区分。
-            if any(f.get("name") == name for f in favs):
-                self._notify("已存在同名常用专注", f"「{name}」已经在列表里了")
+            self._upsert_favorite(dlg.result_fav, notify=True)
+
+    def _upsert_favorite(self, fav: dict, notify: bool = False) -> bool:
+        """按 id 新增或更新一个常用专注。
+
+        重名要去重（否则列表里两条一模一样、点起来无法区分），但编辑自己时
+        不算重名。返回是否写入。
+        """
+        favs = _load_favorites()
+        name = fav["name"]
+        if any(f.get("name") == name and f.get("id") != fav.get("id") for f in favs):
+            self._notify("已存在同名常用专注", f"「{name}」已经在列表里了")
+            return False
+        idx = next((i for i, f in enumerate(favs)
+                    if f.get("id") == fav.get("id")), -1)
+        if idx >= 0:
+            favs[idx] = fav
+        else:
+            favs.append(fav)
+        _save_favorites(favs)
+        act = self._active_fav or {}
+        if act.get("id") == fav.get("id"):
+            if self.running:
+                # 正在计时时只换显示的名字，别去动模式/时长，那会把这一轮打断
+                self._active_fav = fav
+                self.task_lbl.setText(
+                    f"{fav.get('emoji', DEFAULT_EMOJI)} {fav['name']} ›")
+            else:
+                self._on_fav_picked(fav)
+        self._refresh_fav_manager()
+        if notify:
+            self._notify("已保存常用专注", name)
+        return True
+
+    def _start_favorite(self, fav: dict) -> None:
+        """从常用专注页/选择器直接开始一个专注：配置 + 立即计时。"""
+        same = bool(fav.get("id")) and \
+            (self._active_fav or {}).get("id") == fav.get("id")
+        if self.running and not same:
+            # 计时中途换专注：光改名字的话环上剩的还是上一个专注的时长，
+            # 会出现「冥想计了 50 分钟」这种记录，而上一截半专注悄悄就没了。
+            cur = (f"已计 {self._fmt(self.countup_elapsed)}"
+                   if self.timer_mode == "countup"
+                   else f"还剩 {self._fmt(self.remaining)}")
+            if not popups.confirm(
+                    self, "换专注",
+                    f"「{self._task or '专注'}」还在计时（{cur}），"
+                    f"结束它并开始「{fav['name']}」？未完成的这段不会记入记录。"):
                 return
-            favs.append(dlg.result_fav)
-            _save_favorites(favs)
-            self._notify("已添加常用专注", name)
-            self._on_fav_picked(dlg.result_fav)
+            self._reset()
+        self._on_fav_picked(fav)
+        if not self.running:
+            self._toggle()
 
     def _open_more_menu(self):
         """「⋯」菜单：沉浸模式 / Mini 模式 / 统计 / 专注设置。"""
@@ -3658,10 +4257,13 @@ class PomodoroPage(Page):
         super().resizeEvent(event)
         if self._stats is not None and self._stats.isVisible():
             self._stats.setGeometry(self.rect())
+        if self._fav_manager is not None and self._fav_manager.isVisible():
+            self._fav_manager.setGeometry(self.rect())
         QTimer.singleShot(0, self._apply_side_width)
 
     def _on_task_picked(self, title: str):
         self._active_fav = None
+        self._fav_id = ""
         self._task = title
         self.task_lbl.setText(f"{title} ›")
         if not self.running:
@@ -3755,6 +4357,41 @@ class PomodoroPage(Page):
             self._refresh_stats()
             self._reload_records()
 
+    def _add_record_for_fav(self, fav: dict):
+        """从常用专注页给某个专注补录一条记录（带 fav_id，统计才归到它头上）。"""
+        minutes = int(fav.get("minutes") or self._work_min)
+        dlg = AddRecordDialog(minutes, minutes, self)
+        name = fav.get("name") or ""
+        if name:
+            dlg._on_task(name)
+        if dlg.exec() == QDialog.Accepted:
+            task, mins, started, note = dlg.values()
+            services.pomodoro_add(mins, task, 1, started_at=started, note=note,
+                                  fav_id=fav.get("id") or "")
+            self._refresh_stats()
+            self._reload_records()
+
+    # ------------------------------------------------------------------
+    # 常用专注整页
+    # ------------------------------------------------------------------
+    def _open_fav_manager(self):
+        """打开常用专注整页（覆盖在主页上，和统计页一个套路）。"""
+        if self._fav_manager is None:
+            self._fav_manager = FocusManagerView(self)
+        self._fav_manager.setGeometry(self.rect())
+        self._fav_manager.show()
+        self._fav_manager.raise_()
+        focus_ui.fade_in(self._fav_manager, 140)
+
+    def _refresh_fav_manager(self) -> None:
+        """整页开着时让它重读一次库；没开着就是空操作。
+
+        列表行右侧的累计、右侧的三张卡和柱状图都从库里算，页面自己不查就没时机更新。
+        """
+        mgr = getattr(self, "_fav_manager", None)
+        if mgr is not None and mgr.isVisible():
+            mgr._refresh_list()
+
     # ------------------------------------------------------------------
     # 概览 / 统计刷新
     # ------------------------------------------------------------------
@@ -3795,6 +4432,9 @@ class PomodoroPage(Page):
         records = services.pomodoro_records(RECORD_LIMIT)
         if self._stats is not None and self._stats.isVisible():
             self._stats.refresh()
+        # 记录一变，常用专注页的行尾累计和右侧三张卡就过期了；它没有别的刷新时机，
+        # 全部挂在这里（补录 / 完成番茄 / 退出结算 / 删记录都走这一条路）。
+        self._refresh_fav_manager()
         if not records:
             hint = QLabel("暂无专注记录")
             hint.setObjectName("FocusMuted")
@@ -4024,7 +4664,7 @@ class PomodoroPage(Page):
             # 正计时：已发生的专注时间不能丢，直接按当前累计结算
             if self.countup_elapsed > 0:
                 minutes = max(1, round(self.countup_elapsed / 60))
-                services.pomodoro_add(minutes, self._task, 1)
+                services.pomodoro_add(minutes, self._task, 1, fav_id=self._fav_id)
             self._clear_session()
         else:
             # 番茄倒计时：进行中则保存进度，未开始则清空

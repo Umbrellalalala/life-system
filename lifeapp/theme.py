@@ -224,6 +224,14 @@ QLabel[strongColor="amber"]  { color: @amber@;  font-weight: 700; }
 QLabel[strongColor="blue"]   { color: @blue@;   font-weight: 700; }
 QLabel[strongColor="green"]  { color: @green@;  font-weight: 700; }
 QLabel[strongColor="accent"] { color: @accent@; font-weight: 700; }
+/* 记账那两处带 objectName：#HeroMetricVal / #DaySum 自己的 color 特异性更高，
+   上面五条对它们无效（钱该红该绿一直全是一个色），这里按颜色点名一次。
+   只给 color：字重各自的 ID 规则里已经有了，别在这儿顺手加粗。 */
+QLabel#HeroMetricVal[strongColor="red"],    QLabel#DaySum[strongColor="red"]    { color: @red@; }
+QLabel#HeroMetricVal[strongColor="amber"],  QLabel#DaySum[strongColor="amber"]  { color: @amber@; }
+QLabel#HeroMetricVal[strongColor="blue"],   QLabel#DaySum[strongColor="blue"]   { color: @blue@; }
+QLabel#HeroMetricVal[strongColor="green"],  QLabel#DaySum[strongColor="green"]  { color: @green@; }
+QLabel#HeroMetricVal[strongColor="accent"], QLabel#DaySum[strongColor="accent"] { color: @accent@; }
 
 /* 大纲按钮（Obsidian 风格） */
 QPushButton#OutlineBtn {
@@ -259,6 +267,14 @@ QWidget#SideRow[checked="true"] { background: @accent_soft@; }
 QWidget#SideRow[dropHot="true"] {
     background: @accent_soft@; border: 1px dashed @accent@; border-radius: 8px;
 }
+/* 组内拖拽排序：落在哪一半就在哪一侧画一条插入线 */
+QWidget#SideRow[navEdge="above"] { border-top: 2px solid @accent@; }
+QWidget#SideRow[navEdge="below"] { border-bottom: 2px solid @accent@; }
+/* 完成后浮在中栏底部的撤销条：滴答那条是深色胶囊 + 白字 + ↺，两套主题同一色 */
+QFrame#UndoBar { background: #333a48; border: none; border-radius: 10px; }
+QLabel#UndoText { color: #ffffff; font-size: 13px; background: transparent; }
+QLabel#UndoVerb { color: #c3c9d6; font-size: 13px; background: transparent; }
+
 QLabel#SideRowText { font-size: 13px; color: @text@; background: transparent; }
 QLabel#SideRowText[tint="red"]    { color: @red@; }
 QLabel#SideRowText[tint="amber"]  { color: @amber@; }
@@ -384,11 +400,18 @@ QFrame#TickMenuCard {
     background: @surface@; border: 1px solid @border@; border-radius: 10px;
 }
 QFrame#TickMenuRow { background: transparent; border: none; border-radius: 7px; }
+/* 菜单里的图标条（日期五宫格 / 优先级四旗）本身不画底 */
+QFrame#MenuStrip { background: transparent; border: none; }
 QFrame#TickMenuRow[hover="true"] { background: @surface_hi@; }
 QLabel#TickMenuLabel { font-size: 13px; color: @text@; background: transparent; }
 QLabel#MenuSection { font-size: 11px; color: @muted@; font-weight: 600;
     padding: 2px 8px 4px; background: transparent; }
 QLabel#TickMenuLabel[danger="true"] { color: @red@; }
+/* 文本框右键菜单：快捷键那一列、分隔线，以及做不了的项（没选字时的剪切） */
+QLabel#TickMenuLabel[disabled="true"] { color: @muted@; }
+QLabel#MenuHint { font-size: 11.5px; color: @muted@; background: transparent; }
+QLabel#MenuHint[disabled="true"] { color: @border@; }
+QFrame#MenuSep { background: @border@; }
 /* ⋯ 菜单「视图」那一格的三档 */
 QPushButton#ViewBtn {
     background: transparent; border: 1px solid transparent; border-radius: 7px;
@@ -396,19 +419,36 @@ QPushButton#ViewBtn {
 QPushButton#ViewBtn:hover { background: @surface_hi@; }
 QPushButton#ViewBtn[active="true"] { background: @accent_soft@; }
 QPushButton#ViewBtn:disabled { background: transparent; border: none; }
+/* 优先级弹层里的四格旗子：选中那格描一圈框 + 浅底（滴答同款） */
+QPushButton#PrioBtn {
+    background: transparent; border: 1px solid transparent; border-radius: 8px;
+}
+QPushButton#PrioBtn:hover { background: @surface_hi@; }
+QPushButton#PrioBtn[on="true"] { background: @accent_soft@; border-color: @accent@; }
 QFrame#InsertLine { background: @accent@; border: none; border-radius: 1px; }
 
 QLabel#StatValue { font-size: 26px; font-weight: 800; color: @text_hi@; }
 QLabel#StatLabel { font-size: 12px; color: @muted@; }
+/* 挂在页面大标题那一行的小胶囊。MiniValue 不写 color，[statColor=...] 才轮得上 */
+QLabel#MiniValue { font-size: 16px; font-weight: 800; }
+QLabel#MiniLabel { font-size: 12px; color: @muted@; }
 QLabel#PageTitle { font-size: 24px; font-weight: 800; color: @text_hi@; }
 QLabel#PageSubtitle { font-size: 13px; color: @muted@; }
 
-/* 强调色文字（动态属性） */
-QLabel[statColor="accent"] { color: @accent@; }
-QLabel[statColor="green"]  { color: @green@; }
-QLabel[statColor="red"]    { color: @red@; }
-QLabel[statColor="amber"]  { color: @amber@; }
-QLabel[statColor="blue"]   { color: @blue@; }
+/* 强调色文字（动态属性）。
+   带 objectName 的那些必须在这里点名一次：`QLabel#StatValue{color}` 的特异性是
+   (1,0,1)，压过 `QLabel[statColor]` 的 (0,1,1)，于是统计卡上那些绿/红全被刷成
+   默认色 —— 特异性不打平，光把 ID 规则里的 color 删掉又会让没传色的卡变没色。 */
+QLabel[statColor="accent"], QLabel#StatValue[statColor="accent"],
+QLabel#MiniValue[statColor="accent"] { color: @accent@; }
+QLabel[statColor="green"],  QLabel#StatValue[statColor="green"],
+QLabel#MiniValue[statColor="green"]  { color: @green@; }
+QLabel[statColor="red"],    QLabel#StatValue[statColor="red"],
+QLabel#MiniValue[statColor="red"]    { color: @red@; }
+QLabel[statColor="amber"],  QLabel#StatValue[statColor="amber"],
+QLabel#MiniValue[statColor="amber"]  { color: @amber@; }
+QLabel[statColor="blue"],   QLabel#StatValue[statColor="blue"],
+QLabel#MiniValue[statColor="blue"]   { color: @blue@; }
 
 /* 金额符号 */
 QLabel[moneySign="income"]  { color: @green@; font-weight: 700; }
@@ -515,12 +555,21 @@ QLabel#TodoSub[subState="full"] { color: @green@; }
 QLabel#TodoNotePreview { font-size: 12px; color: @muted@; background: transparent; }
 QLabel#TodoListLine { font-size: 12px; color: @muted@; background: transparent; }
 QFrame#RowSub { background: transparent; border: none; }
-QLabel#RowSubText { font-size: 12.5px; color: @text@; background: transparent; }
+QLabel#RowSubText { font-size: 13px; color: @text@; background: transparent; }
 QLabel#RowSubText[done="true"] { color: @muted@; }
+/* 行内只列前三条时底下那行「还有 N 项」：点开详情看全部 */
+QLabel#RowSubMore { font-size: 12px; color: @muted@; background: transparent; }
+QLabel#RowSubMore:hover { color: @accent@; }
 /* 看板视图：列只是排布的槽位（不画底），卡片才有边框 */
 QScrollArea#BoardScroll { background: transparent; border: none; }
 QScrollArea#BoardScroll > QWidget > QWidget { background: transparent; }
 QFrame#BoardColumn { background: transparent; border: none; }
+/* 时间线（甘特）：底纹由每一行自己画，容器一律透明（暗色下不顶出白块） */
+QScrollArea#TimelineScroll { background: transparent; border: none; }
+QScrollArea#TimelineScroll > QWidget > QWidget { background: transparent; }
+QWidget#TimelineContainer, QWidget#TimelineHead, QWidget#TimelineWrap {
+    background: transparent;
+}
 QFrame#TodoRow[card="true"] {
     background: @surface@; border: 1px solid @border@; border-radius: 10px;
 }
@@ -601,6 +650,48 @@ QHeaderView::section {
     border-bottom: 1px solid @border@; padding: 8px; font-weight: 600;
 }
 
+/* ---------- 原生控件兜底：QMenu / QCalendarWidget ---------- */
+/* 本应用从不设 QPalette，配色全靠 QSS 逐条命中；这两类原生控件之前一条规则
+   都没有，夜间模式下托盘菜单、笔记/理财/番茄钟/日历的右键菜单、以及各处
+   日期选择器里的日历都是一整块系统浅色。
+   故意不给 QMenu 写 border-radius：QMenu 不是无边框半透明窗，圆角外会露出
+   脏角（见弹层黑边那类坑），方角反而干净。 */
+QMenu {
+    background: @surface@;
+    border: 1px solid @border@;
+    padding: 5px;
+}
+QMenu::item {
+    background: transparent; color: @text@;
+    padding: 7px 26px 7px 14px;
+    font-size: 13px;
+}
+QMenu::item:selected { background: @surface_hi@; color: @text_hi@; }
+QMenu::item:disabled { color: @muted@; }
+QMenu::separator { height: 1px; background: @border@; margin: 5px 8px; }
+
+QCalendarWidget { background: @surface@; color: @text@; }
+QCalendarWidget QWidget#qt_calendar_navigationbar {
+    background: @surface_hi@;
+}
+QCalendarWidget QToolButton {
+    background: transparent; color: @text_hi@;
+    border: none; padding: 4px 8px;
+}
+QCalendarWidget QToolButton:hover { background: @surface@; }
+QCalendarWidget QToolButton::menu-indicator { image: none; }
+QCalendarWidget QSpinBox {
+    background: @surface@; color: @text@;
+    border: 1px solid @border@;
+}
+QCalendarWidget QAbstractItemView {
+    background: @surface@; color: @text@;
+    selection-background-color: @accent_soft@;
+    selection-color: @accent@;
+    outline: none; border: none;
+}
+QCalendarWidget QAbstractItemView:disabled { color: @muted@; }
+
 /* ---------- 滚动区域：默认透明，融入所在卡片 ---------- */
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
@@ -610,9 +701,13 @@ QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: @border_strong@; border-radius: 5px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: @muted@; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+/* 滑块两侧那条轨道不写就是原生浅色凹槽 —— 暗色下每个滚动区一道白杠。
+   日历那边先踩过，只在 pages/calendar/style.py 里补了自己那份。 */
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
 QScrollBar::handle:horizontal { background: @border_strong@; border-radius: 5px; min-width: 30px; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
 /* ---------- 进度条 / 选项卡 / 复选 ---------- */
 QProgressBar {
@@ -743,6 +838,28 @@ QPushButton#QuickBtn {
 }
 QPushButton#QuickBtn:hover { background: @accent_soft@; }
 QLabel#CalHeader { font-size: 13.5px; font-weight: 700; color: @text_hi@; }
+/* 日期弹层顶部的「日期 / 时间段」分段 */
+QFrame#DateTabBar { background: @surface_hi@; border-radius: 9px; }
+QPushButton#DateTab {
+    background: transparent; border: none; border-radius: 7px;
+    color: @muted@; font-size: 12.5px;
+}
+QPushButton#DateTab[on="true"] {
+    background: @surface@; color: @text_hi@; font-weight: 700;
+}
+/* 时间段页的四个格子 */
+QLabel#RangeCap { color: @text@; font-size: 13px; }
+QPushButton#RangeField {
+    background: @surface@; border: 1px solid @border@; border-radius: 8px;
+    min-height: 30px; color: @text_hi@; font-size: 13px;
+}
+QPushButton#RangeField:hover { border-color: @accent@; }
+QPushButton#RangeField:disabled { color: @muted@; border-color: @border_strong@; }
+QCheckBox#DateAllDay { color: @text@; font-size: 13px; }
+QLabel#CalYear {
+    font-size: 13.5px; font-weight: 700; color: @text_hi@; margin-left: 4px;
+}
+QLabel#CalYear[otherYear="true"] { color: @accent@; }
 QPushButton#CalNav {
     background: transparent; border: none; border-radius: 7px;
     min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px;
@@ -1140,6 +1257,20 @@ QPlainTextEdit#PopupNote {
     padding: 7px 9px; font-size: 13px; color: @text@;
 }
 QPlainTextEdit#PopupNote:focus { border-color: @accent@; background: @surface@; }
+
+/* 解题代码块：等宽 + 浅底，语法颜色由 code_view.Highlighter 自己按主题取 */
+QPlainTextEdit#CodeBlock {
+    background: @surface_hi@; border: 1px solid @border@; border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; color: @text@;
+    font-family: "Consolas", "Cascadia Mono", "Microsoft YaHei Mono", monospace;
+}
+QPlainTextEdit#CodeBlock:focus { border-color: @accent@; background: @bg_alt@; }
+QPlainTextEdit#CodeBlock QScrollBar:vertical { width: 9px; }
+QPlainTextEdit#CodeBlock QScrollBar::handle:vertical {
+    background: @border@; border-radius: 4px; min-height: 26px;
+}
+QPlainTextEdit#CodeBlock QScrollBar::add-line:vertical,
+QPlainTextEdit#CodeBlock QScrollBar::sub-line:vertical { height: 0; }
 QScrollArea#AppPopup * { background: transparent; }
 
 /* ---------- 习惯打卡 ---------- */
@@ -1155,6 +1286,10 @@ QFrame#HabitRow[selected="true"] { background: @accent_soft@; }
 QLabel#HabitName { font-size: 13.5px; font-weight: 600; color: @text_hi@; background: transparent; }
 QLabel#HabitCount { font-size: 14px; font-weight: 700; color: @text_hi@; background: transparent; }
 QLabel#HabitCountSub { font-size: 10.5px; color: @muted@; background: transparent; }
+/* 拖习惯换顺序时的插入线 */
+QFrame#HabitDropLine {
+    background: @accent@; border: none; border-radius: 1px;
+}
 /* 分组标题：只在真有两个以上分组时才出现（见 HabitPane.reload） */
 QLabel#HabitGroupHead {
     font-size: 11.5px; font-weight: 600; color: @muted@;
@@ -1241,6 +1376,16 @@ QLabel#BadgeCell {
 }
 QLabel#BadgeCell:hover { background: @surface_hi@; }
 QLabel#BadgeCell[checked="true"] { background: @accent_soft@; }
+/* 清单图标选择器：emoji / 线性图标一格，选中那格描一圈框 */
+QPushButton#IconCell {
+    background: transparent; border: 1px solid transparent; border-radius: 8px;
+    font-size: 16px; padding: 0;
+}
+QPushButton#IconCell:hover { background: @surface_hi@; }
+QPushButton#IconCell[on="true"] {
+    background: @accent_soft@; border-color: @accent@;
+}
+QLabel#IconGroupCap { font-size: 11.5px; color: @muted@; padding-top: 2px; }
 QLabel#HabitLogTitle { font-size: 13.5px; font-weight: 700; color: @text_hi@; }
 QFrame#HabitLogRow { background: transparent; border: none; border-radius: 8px; }
 QFrame#HabitLogRow:hover { background: @surface_hi@; }

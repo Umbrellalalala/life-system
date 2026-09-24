@@ -13,15 +13,17 @@ from __future__ import annotations
 from datetime import date
 
 from PySide6.QtCore import Qt, QDate, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QKeySequence, QShortcut,
+)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QScrollArea, QFrame,
-    QSplitter,
+    QListWidgetItem, QPlainTextEdit, QScrollArea, QFrame,
+    QSplitter, QAbstractItemView,
 )
 
-from .. import popups, services, solution_card, sounds, theme, widgets
-from .base import Page, stats_row
+from .. import popups, services, solution_tabs, sounds, theme, widgets
+from .base import Page
 
 # 列表项上挂的题目 id
 _ROLE_PID = Qt.UserRole
@@ -37,7 +39,9 @@ class AlgoPage(Page):
         self._show_archived = False
         self._loading = False
         self._first_show = True
+        self._n_rows = 0
         self._editor_pid = 0
+        self._select_sol = 0        # 重画详情时要选中哪一版解法（0=保持）
         self._sol_map: dict[int, str] = {}
 
         self._build_stats()
@@ -52,6 +56,7 @@ class AlgoPage(Page):
         split.setCollapsible(0, False)
         split.setCollapsible(1, False)
         self.body().addWidget(split, 1)
+        self._bind_shortcuts()
 
         # 自动保存：备注 / 题解改动攒到停手后再一次性落库
         self._save_timer = QTimer(self)
@@ -65,12 +70,14 @@ class AlgoPage(Page):
 
     # ------------------------------------------------------------------ 统计
     def _build_stats(self) -> None:
-        self.card_active = widgets.StatCard("在刷", "0", "accent")
-        self.card_due = widgets.StatCard("到期待复习", "0", "amber")
-        self.card_grad = widgets.StatCard("已毕业", "0", "green")
-        self.card_writes = widgets.StatCard("累计写过", "0", "blue")
-        self.body().addLayout(stats_row(
-            [self.card_active, self.card_due, self.card_grad, self.card_writes]))
+        # 缩成小胶囊挂在大标题同一行的右边，不再单独占一整排
+        self.card_active = widgets.StatCard("在刷", "0", "accent", mini=True)
+        self.card_due = widgets.StatCard("到期待复习", "0", "amber", mini=True)
+        self.card_grad = widgets.StatCard("已毕业", "0", "green", mini=True)
+        self.card_writes = widgets.StatCard("累计写过", "0", "blue", mini=True)
+        for c in (self.card_active, self.card_due,
+                  self.card_grad, self.card_writes):
+            self.header().addWidget(c)
 
     # ---------------------------------------------------------------- 工具栏
     def _build_toolbar(self) -> None:
@@ -133,11 +140,46 @@ class AlgoPage(Page):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
 
-        self.list = QListWidget()
+        self.list = widgets.FittingList()
         self.list.setFrameShape(QFrame.NoFrame)
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 资源管理器那套选择语义：单击、Ctrl 加选、Shift 连选，右键对选中这批生效
+        self.list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.currentRowChanged.connect(self._on_row_changed)
+        self.list.customContextMenuRequested.connect(self._list_menu)
+        self.list.itemSelectionChanged.connect(self._update_hint)
+        self.list.itemSelectionChanged.connect(self._update_batch_bar)
         lay.addWidget(self.list, 1)
+
+        # 批量操作条：选中两道以上才出现。和八股页同一套形状 —— 同类实体在两个
+        # 姊妹页上的操作路径要一致，别让「归档」一边是按钮、一边只藏在右键里。
+        self.batch = QFrame()
+        self.batch.setObjectName("InnerCard")
+        bl = QHBoxLayout(self.batch)
+        bl.setContentsMargins(10, 6, 8, 6)
+        bl.setSpacing(6)
+        self.batch_lbl = QLabel("")
+        self.batch_lbl.setObjectName("Muted")
+        bl.addWidget(self.batch_lbl)
+        bl.addStretch(1)
+        for text, tip, slot in (
+                ("归档", "把选中的题归档（停止排复习、不再被抽到）",
+                 lambda: self._batch_archive(self._selected_ids(), True)),
+                ("删除", "删除选中的题及其题解、写作历史与复习待办",
+                 lambda: self._batch_delete(self._selected_ids())),
+                ("⋯", "更多批量操作（取消归档 / 标签 / 全选）",
+                 lambda: self._batch_more(self._selected_ids())),
+                ("✕", "取消选择（等同 Esc）", self._clear_selection)):
+            b = QPushButton(text)
+            b.setObjectName("Danger" if text == "删除" else "Ghost")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setStyleSheet("padding: 3px 9px;")
+            b.clicked.connect(slot)
+            bl.addWidget(b)
+        self.batch.hide()
+        lay.addWidget(self.batch)
 
         self.hint = QLabel("")
         self.hint.setObjectName("Muted")
@@ -194,13 +236,12 @@ class AlgoPage(Page):
             self.list.addItem(item)
             w = self._row_widget(p, counts.get(p["id"], 0))
             self.list.setItemWidget(item, w)
-            # setItemWidget 不会自己撑行高，不显式给 sizeHint 的话整行被压成
-            # 一条窄带，标题和副信息全被裁掉看不见。
-            item.setSizeHint(w.sizeHint())
             # 到期/逾期的标成琥珀色，一眼看出今天该动哪几道
             if p.get("next_review") and p["next_review"] <= today:
                 item.setForeground(QColor(theme.get("amber")))
         self.list.blockSignals(False)
+        # 行高要按视口真实宽度量，窄栏里才会折行而不是被裁掉
+        self.list.fit_rows()
         # 选中项没变也要重画详情：复习结论是在待办页写的，这边 _pid 不变，
         # 只靠 currentRowChanged 会让详情停在旧数据上。
         if not rows:
@@ -211,8 +252,53 @@ class AlgoPage(Page):
             self._pid = int(prev)
             self._select(self._pid)
         self._render_detail()
+        self._n_rows = len(rows)
+        self._update_hint()
+
+    def _update_hint(self) -> None:
         self.hint.setText("%d 道题%s" % (
-            len(rows), "（已归档）" if self._show_archived else ""))
+            self._n_rows,
+            "（已归档）" if self._show_archived else ""))
+
+    def _update_batch_bar(self) -> None:
+        n = len(self.list.selectedItems())
+        self.batch_lbl.setText("已选 %d 道" % n)
+        self.batch.setVisible(n >= 2)
+
+    def _clear_selection(self) -> None:
+        self.list.clearSelection()
+
+    def _bind_shortcuts(self) -> None:
+        """列表这套快捷键和八股页一一对齐：资源管理器的手感不该两个姊妹页各半套。
+
+        「让位在文本框里」是这条的前提：题解编辑器 / 备注框 / 搜索框正被编辑时，
+        Delete 和 Ctrl+A 归那个控件，不然改个字一按 Delete 整批题就被删了。
+        """
+        for seq, slot in (
+                (QKeySequence.SelectAll, self._on_select_all),
+                (QKeySequence(Qt.Key_Delete), self._on_delete_key),
+                (QKeySequence(Qt.Key_Escape), self._on_esc),
+        ):
+            sc = QShortcut(seq, self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+
+    def _editing_text(self) -> bool:
+        return isinstance(self.focusWidget(), (QLineEdit, QPlainTextEdit))
+
+    def _on_select_all(self) -> None:
+        if not self._editing_text():
+            self.list.selectAll()
+
+    def _on_delete_key(self) -> None:
+        if not self._editing_text() and self.list.selectedItems():
+            self._batch_delete(self._selected_ids())
+
+    def _on_esc(self) -> None:
+        if self._editing_text():
+            return
+        if self.list.hasFocus() and self.list.selectedItems():
+            self._clear_selection()     # 列表里按 Esc = 取消选择
 
     def focus_item(self, pid: int) -> None:
         """从待办页点复习条目跳进来：先清掉筛选，保证这道题一定在列表里。
@@ -281,7 +367,7 @@ class AlgoPage(Page):
         tag_row.setSpacing(8)
         tag_row.addWidget(self._label("标签"))
         self.tags = QLineEdit()
-        self.tags.setPlaceholderText("逗号分隔，如 二叉树,递归")
+        self.tags.setPlaceholderText("逗号分隔，中英文都行，如 二叉树，递归")
         self.tags.editingFinished.connect(self._save_fields)
         tag_row.addWidget(self.tags, 1)
         lay.addLayout(tag_row)
@@ -329,7 +415,9 @@ class AlgoPage(Page):
         self.log_btn.setObjectName("Primary")
         self.log_btn.setCursor(Qt.PointingHandCursor)
         self.log_btn.setToolTip("记进写作历史，并按「是否独立做出来」重排下一个记忆点")
-        self.log_btn.clicked.connect(self._log_write)
+        # 不能直接 connect：clicked 会把 checked 布尔当第一个位置参数塞进来，
+        # 正好落进 _log_write 的 pid 上
+        self.log_btn.clicked.connect(lambda: self._log_write())
         log_row.addWidget(self.log_btn)
         self.writes_lbl = QLabel("")
         self.writes_lbl.setObjectName("Muted")
@@ -351,25 +439,22 @@ class AlgoPage(Page):
         self.sol_sum = QLabel("")
         self.sol_sum.setObjectName("Muted")
         sol_head.addWidget(self.sol_sum)
-        self.add_sol_btn = QPushButton("＋ 加一版解法")
-        self.add_sol_btn.setObjectName("Ghost")
-        self.add_sol_btn.setCursor(Qt.PointingHandCursor)
-        self.add_sol_btn.setToolTip("默认 C++；同一语言可以再存几版（暴力 / 最优）")
-        self.add_sol_btn.clicked.connect(self._add_solution)
-        sol_head.addWidget(self.add_sol_btn)
         lay.addLayout(sol_head)
-        self.sol_box = QVBoxLayout()
-        self.sol_box.setSpacing(8)
-        lay.addLayout(self.sol_box)
-        self.no_sol = QLabel("还没写解法")
-        self.no_sol.setObjectName("Muted")
-        lay.addWidget(self.no_sol)
+        # 一版解法 = 一个语言标签，加一版只多一个标签，不再往下堆卡片
+        self.sol_tabs = solution_tabs.SolutionTabs(
+            caption="题解", show_source=True,
+            on_save=lambda sid, **f: services.algo_solution_update(sid, **f),
+            on_delete=services.algo_solution_delete,
+            on_add=self._add_solution,
+            on_touch=self.mark_dirty,
+            on_commit=self.reload)
+        lay.addWidget(self.sol_tabs)
 
         lay.addWidget(self.seps[2])
 
         lay.addWidget(self._label("备注"))
         self.note = QPlainTextEdit()
-        self.note.setPlaceholderText("卡在哪、下次注意什么…")
+        self.note.setPlaceholderText("思路：怎么想到的、复杂度、有什么坑；卡在哪、下次注意什么…")
         self.note.setMinimumHeight(72)
         self.note.textChanged.connect(self.mark_dirty)
         lay.addWidget(self.note)
@@ -395,7 +480,7 @@ class AlgoPage(Page):
         self._detail_widgets = [
             self.title, self.tags, self.lc_ref, self.url, self.open_btn,
             self.review_date, self.review_lbl, self.log_btn, self.writes_lbl,
-            self.add_sol_btn, self.sol_sum, self.no_sol, self.note,
+            self.sol_tabs, self.sol_sum, self.note,
             self.arch_btn, self.del_btn, *self.seps,
         ]
         scroll.hide()
@@ -464,21 +549,11 @@ class AlgoPage(Page):
             lbl.setObjectName("Muted")
             self.timeline.addWidget(lbl)
 
-        _clear_layout(self.sol_box)
         sols = services.algo_solution_list(p["id"])
-        for s in sols:
-            self.sol_box.addWidget(self._new_card(s))
-        self.no_sol.setVisible(not sols)
-        self.sol_sum.setText(solution_card.summary(sols))
+        self.sol_tabs.set_solutions(sols, select_id=self._select_sol)
+        self._select_sol = 0
+        self.sol_sum.setText(solution_tabs.summary(sols))
         self._loading = False
-
-    def _new_card(self, sol: dict) -> solution_card.SolutionCard:
-        return solution_card.SolutionCard(
-            sol, caption="题解", show_source=True,
-            on_save=lambda sid, **f: services.algo_solution_update(sid, **f),
-            on_delete=services.algo_solution_delete,
-            on_touch=self.mark_dirty,
-            on_commit=self.reload)
 
     def _review_text(self, p: dict) -> str:
         stage = int(p.get("stage") or 0)
@@ -530,14 +605,7 @@ class AlgoPage(Page):
         note = self.note.toPlainText()
         if (p.get("note") or "") != note:
             services.algo_problem_update(self._pid, note=note)
-        for card in self._solution_cards():
-            card.flush()
-
-    def _solution_cards(self) -> list[solution_card.SolutionCard]:
-        return [self.sol_box.itemAt(i).widget()
-                for i in range(self.sol_box.count())
-                if isinstance(self.sol_box.itemAt(i).widget(),
-                              solution_card.SolutionCard)]
+        self.sol_tabs.flush()
 
     def _save_fields(self) -> None:
         """单行字段失焦即落库；只填了题号就把链接拼出来。"""
@@ -590,27 +658,29 @@ class AlgoPage(Page):
             "题解、思路、代码直接在右侧面板里写，停手就自动存。"
             % services.algo_problem_get(pid)["next_review"])
 
-    def _log_write(self) -> None:
-        if not self._pid:
+    def _log_write(self, pid: int = 0) -> None:
+        pid = pid or self._pid
+        if not pid:
             return
         opts = ["独立做出来了", "没独立做出来"]
         pick, ok = popups.get_item(self, "复习结论",
                                    "这次是独立做出来的吗？", opts)
         if not ok:
             return
-        services.algo_log_write(self._pid, independent=(pick == opts[0]))
+        services.algo_log_write(pid, independent=(pick == opts[0]))
         sounds.play("answer_correct" if pick == opts[0] else "answer_wrong")
         self.reload()
 
     def _add_solution(self) -> None:
-        """先长一张空卡再往里写：默认 C++，停手自动存，比弹框舒服。"""
+        """多加一个语言标签，光标直接落在新标签的代码块里。"""
         if not self._pid:
             return
         self._flush()
-        sid = services.algo_solution_add(
-            self._pid, allow_empty=True)
+        sid = services.algo_solution_add(self._pid, allow_empty=True)
         if sid:
+            self._select_sol = sid
             self._render_detail()   # 只重画右侧，别把左侧列表也刷没了
+            self.sol_tabs.code.setFocus()
 
     def _toggle_archive(self) -> None:
         if not self._pid:
@@ -632,14 +702,17 @@ class AlgoPage(Page):
         p = services.algo_problem_get(self._pid)
         if not popups.confirm(self, "删除这道题",
                               "「%s」的题解、写作历史和复习待办会一起删掉。"
-                              % p["title"]):
+                              % services.algo_display(p)):
             return
         services.algo_problem_delete(self._pid)
         self._pid = 0
         self.reload()
 
     def _open_problem(self) -> None:
-        p = services.algo_problem_get(self._pid) if self._pid else None
+        self._open_one(self._pid)
+
+    def _open_one(self, pid: int) -> None:
+        p = services.algo_problem_get(pid) if pid else None
         url = (p or {}).get("url") or ""
         if not url:
             popups.notify(self, "还没有链接",
@@ -649,8 +722,125 @@ class AlgoPage(Page):
             popups.notify(self, "打不开链接",
                           "系统浏览器没能打开：\n%s" % url, danger=True)
 
+    # ------------------------------------------------------ 多选 / 右键菜单
+    def _selected_ids(self) -> list[int]:
+        return [int(it.data(_ROLE_PID)) for it in self.list.selectedItems()]
+
+    def _after_batch(self) -> None:
+        """批量操作后统一收尾：清掉选择再重刷，别让选中态指向已消失的行。"""
+        self.list.clearSelection()
+        self.reload()
+
+    def _list_menu(self, pos) -> None:
+        """右键：落在没选中的行上时先只选它（资源管理器行为），再对这批生效。"""
+        it = self.list.itemAt(pos)
+        if it is not None and not it.isSelected():
+            self.list.setCurrentItem(it)
+        ids = self._selected_ids()
+        if ids:
+            self._batch_more(ids)
+
+    def _batch_more(self, ids: list[int]) -> None:
+        one = len(ids) == 1
+        del_act = "删除这道题" if one else "删除这 %d 道题" % len(ids)
+        acts = (["打开题目", "记一次写过"] if one else []) + [
+            "归档", "取消归档", "加标签", "移除标签", del_act, "全选"]
+        head = (services.algo_display(services.algo_problem_get(ids[0]) or {})
+                if one else "对选中的 %d 道题做什么？" % len(ids))
+        pick, ok = popups.get_item(self, "这道题" if one else "批量操作",
+                                   head, acts)
+        if not ok:
+            return
+        if pick == "打开题目":
+            self._open_one(ids[0])
+        elif pick == "记一次写过":
+            self._log_write(ids[0])
+        elif pick == "归档":
+            self._batch_archive(ids, True)
+        elif pick == "取消归档":
+            self._batch_archive(ids, False)
+        elif pick == "加标签":
+            self._batch_add_tags(ids)
+        elif pick == "移除标签":
+            self._batch_remove_tags(ids)
+        elif pick == "全选":
+            self.list.selectAll()
+        elif pick == del_act:
+            self._batch_delete(ids)
+
+    def _batch_archive(self, ids: list[int], on: bool) -> None:
+        self._flush()
+        for pid in ids:
+            services.algo_problem_set_archived(pid, on)
+        # 跟到这批题新所在的视图，否则点完归档它们当场从列表里消失，
+        # 看着像没生效
+        self._show_archived = on
+        self.seg_active.setChecked(not on)
+        self.seg_arch.setChecked(on)
+        self._after_batch()
+        popups.notify(self, "已归档" if on else "已取消归档",
+                      "处理了 %d 道题。" % len(ids))
+
+    def _batch_delete(self, ids: list[int]) -> None:
+        self._flush()
+        names = "、".join(
+            services.algo_display(services.algo_problem_get(pid) or {})
+            for pid in ids[:3])
+        if not popups.confirm(
+                self, "删除 %d 道题" % len(ids),
+                "「%s%s」的题解、写作历史和复习待办会一起删掉，找不回来。"
+                % (names, "…" if len(ids) > 3 else "")):
+            return
+        for pid in ids:
+            services.algo_problem_delete(pid)
+        self._pid = 0
+        self._after_batch()
+        popups.notify(self, "已删除", "删掉了 %d 道题。" % len(ids))
+
+    def _batch_add_tags(self, ids: list[int]) -> None:
+        raw, ok = popups.ask_text(self, "加标签",
+                                  "要加的标签（多个用逗号分隔，中英文都行）")
+        if not ok or not raw.strip():
+            return
+        add = services.split_tags(raw)
+        for pid in ids:
+            cur = services.split_tags(
+                (services.algo_problem_get(pid) or {}).get("tags"))
+            merged = cur + [t for t in add if t not in cur]
+            services.algo_problem_update(pid, tags=",".join(merged))
+        self._after_batch()
+        popups.notify(self, "已加标签",
+                      "给 %d 道题加了「%s」。" % (len(ids), "、".join(add)))
+
+    def _batch_remove_tags(self, ids: list[int]) -> None:
+        # 只列选中题身上真实存在的标签，点了才发现「没这个标签」很烦
+        present: list[str] = []
+        for pid in ids:
+            for t in services.split_tags(
+                    (services.algo_problem_get(pid) or {}).get("tags")):
+                if t not in present:
+                    present.append(t)
+        if not present:
+            popups.notify(self, "没有可移除的标签", "选中的题都没打标签。")
+            return
+        tag, ok = popups.get_item(self, "移除标签", "移除哪个标签", present)
+        if not ok:
+            return
+        n = 0
+        for pid in ids:
+            cur = services.split_tags(
+                (services.algo_problem_get(pid) or {}).get("tags"))
+            left = [t for t in cur if t != tag]
+            if len(left) != len(cur):
+                services.algo_problem_update(pid, tags=",".join(left))
+                n += 1
+        self._after_batch()
+        popups.notify(self, "已移除标签", "从 %d 道题上移除了「%s」。" % (n, tag))
+
     def _on_theme_changed(self) -> None:
         self._flush()
+        # 高亮色是建规则时算死的，换肤后要按新主题重建一遍才会跟着变
+        self.sol_tabs.refresh_theme()
         self.reload()
 
 

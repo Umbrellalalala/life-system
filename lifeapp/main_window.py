@@ -8,6 +8,7 @@ from PySide6.QtGui import QKeySequence, QShortcut, QAction
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QStackedWidget, QButtonGroup, QPushButton, QSystemTrayIcon, QMenu,
+    QScrollArea,
 )
 
 from . import sounds, theme
@@ -98,8 +99,9 @@ class MainWindow(QWidget):
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
 
-        # 依次插入导航项（模块 + 工具分组），分组标题用 SideSection 标签
-        insert_at = 3  # 标题(0) / 副标题(1) / 间距(2) 之后
+        # 依次插入导航项（模块 + 工具分组），分组标题用 SideSection 标签。
+        # 导航列在滚动区里，从 0 开始插；末尾那根 stretch 保证项少时靠顶对齐。
+        insert_at = 0
         page_index = 0
         self._section_labels: list[QLabel] = []
         self._nav_buttons: list[tuple[QPushButton, str, str]] = []
@@ -148,9 +150,10 @@ class MainWindow(QWidget):
                 lambda: (self._nav_group.button(habit_idx).setChecked(True),
                          self.switch_page(habit_idx)))
 
-        # 待办页点「复习：xxx」这类合成待办 → 跳到刷题页对应那道题。
-        # 它们不是能编辑的任务：改标题、改备注都没意义，做完的动作在刷题页做，
-        # 那边完成后会把这条自动勾掉（见 services._review_close）。
+        # 待办页点复习大任务下的某道题目 → 跳到刷题页对应那一题。
+        # 大任务本身点开是详情（那天的题目清单），题目才是跳转入口。
+        # 在刷题页做完一道题，待办那边会把这条目摘掉、按下一档另挂一天
+        # （见 services._review_close）。
         self._review_pages = {
             "algo": next((i for i, p in enumerate(self._pages)
                           if isinstance(p, AlgoPage)), None),
@@ -172,7 +175,7 @@ class MainWindow(QWidget):
                 self._nav_group.button(pomo_idx).setChecked(True)
                 self.switch_page(pomo_idx)
                 pomodoro_page.start_focus_for(title, mode)
-            for src in (habit_page, cal_page):
+            for src in (habit_page, cal_page, todo_page):
                 if src is not None:
                     src.focusRequested.connect(start_focus)
 
@@ -195,12 +198,23 @@ class MainWindow(QWidget):
         self._update_theme_btn()
         theme.manager.changed.connect(self._on_theme_changed)
 
+    def _nav_seq(self, i: int) -> str:
+        """第 i 页的切页快捷键。
+
+        Qt 解析不出 "Ctrl+10" 这种双位数 —— 它给出的是一个 NoModifier 的垃圾
+        键值，永远按不出来，所以第 10 页往后（八股刷题 / 三个内嵌工具 / 设置）
+        原来根本没有键盘入口。前 9 页保持 Ctrl+1~9，其余走 Ctrl+Shift+1~5。
+        """
+        return f"Ctrl+{i + 1}" if i < 9 else f"Ctrl+Shift+{i - 8}"
+
     def _setup_shortcuts(self) -> None:
-        """Ctrl+1~N 快速切换模块 / 工具页；Ctrl+B 收起/展开侧边栏。"""
+        """Ctrl+1~9 / Ctrl+Shift+1~5 快速切换模块与工具页；Ctrl+B 收起侧边栏。"""
         for i in range(self._page_count):
-            sc = QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self)
+            seq = self._nav_seq(i)
+            sc = QShortcut(QKeySequence(seq), self)
             sc.activated.connect(lambda idx=i: (self._nav_group.button(idx).setChecked(True),
                                                 self.switch_page(idx)))
+            self._nav_buttons[i][0].setToolTip(seq)
         sc_sidebar = QShortcut(QKeySequence("Ctrl+B"), self)
         sc_sidebar.activated.connect(self.toggle_sidebar)
 
@@ -208,37 +222,52 @@ class MainWindow(QWidget):
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(214)
-        self._nav_layout = QVBoxLayout(sidebar)
-        self._nav_layout.setContentsMargins(14, 20, 14, 16)
-        self._nav_layout.setSpacing(5)
+        outer = QVBoxLayout(sidebar)
+        outer.setContentsMargins(14, 20, 14, 16)
+        outer.setSpacing(5)
+        self._sidebar_layout = outer
 
         title = QLabel("Life System")
         title.setObjectName("AppTitle")
         self._sidebar_title = title
-        self._nav_layout.addWidget(title)
+        outer.addWidget(title)
 
         sub = QLabel("个人管理系统")
         sub.setObjectName("AppSubtitle")
         self._sidebar_subtitle = sub
-        self._nav_layout.addWidget(sub)
-        self._nav_layout.addSpacing(16)
+        outer.addWidget(sub)
+        outer.addSpacing(16)
 
-        # 导航项由 __init__ 通过 insertWidget 插入在 index 3（标题/副标题/间距之后）
-
+        # 导航项放进滚动区：十四个按钮各 39px，整列 minimumSizeHint 832 高，
+        # 而窗口只允许压到 480 —— 不滚动的话 Qt 分不出那三百多像素，
+        # 会把中间的按钮静默挤没（标题裁一半、选中项只剩一条空高亮）。
+        self._nav_scroll = QScrollArea()
+        self._nav_scroll.setObjectName("SidebarNavScroll")
+        self._nav_scroll.setWidgetResizable(True)
+        self._nav_scroll.setFrameShape(QFrame.NoFrame)
+        self._nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = QWidget()
+        self._nav_layout = QVBoxLayout(holder)
+        self._nav_layout.setContentsMargins(0, 0, 0, 0)
+        self._nav_layout.setSpacing(5)
         self._nav_layout.addStretch(1)
+        self._nav_scroll.setWidget(holder)
+        outer.addWidget(self._nav_scroll, 1)
+
+        # 导航项由 __init__ 通过 insertWidget 插进 self._nav_layout
 
         # 主题切换按钮（快捷；完整配置在「设置」页）
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ThemeToggle")
         self.theme_btn.setCursor(Qt.PointingHandCursor)
         self.theme_btn.clicked.connect(self._toggle_theme)
-        self._nav_layout.addWidget(self.theme_btn)
+        outer.addWidget(self.theme_btn)
 
         version = QLabel("Life System v1.1.0")
         version.setObjectName("AppSubtitle")
         version.setAlignment(Qt.AlignCenter)
         self._sidebar_version = version
-        self._nav_layout.addWidget(version)
+        outer.addWidget(version)
         return sidebar
 
     def collapse_sidebar(self) -> None:
@@ -255,9 +284,9 @@ class MainWindow(QWidget):
         self.sidebar.setFixedWidth(
             SIDEBAR_COLLAPSED_WIDTH if collapsed else SIDEBAR_WIDTH)
         if collapsed:
-            self._nav_layout.setContentsMargins(8, 20, 8, 16)
+            self._sidebar_layout.setContentsMargins(8, 20, 8, 16)
         else:
-            self._nav_layout.setContentsMargins(14, 20, 14, 16)
+            self._sidebar_layout.setContentsMargins(14, 20, 14, 16)
 
         # 标题 / 副标题 / 版本号 / 分组标题：收起后隐藏
         for w in (self._sidebar_title, self._sidebar_subtitle,
@@ -267,14 +296,15 @@ class MainWindow(QWidget):
             sec.setVisible(not collapsed)
 
         # 导航按钮：收起后只显示图标（悬停提示显示完整名称）
-        for btn, icon, label in self._nav_buttons:
+        for i, (btn, icon, label) in enumerate(self._nav_buttons):
             btn.setProperty("collapsed", "true" if collapsed else "false")
+            seq = self._nav_seq(i)
             if collapsed:
                 btn.setText(icon)
-                btn.setToolTip(label)
+                btn.setToolTip(f"{label}  ({seq})")
             else:
                 btn.setText(f"  {icon}   {label}")
-                btn.setToolTip("")
+                btn.setToolTip(seq)
             self._repolish(btn)
 
         # 主题切换按钮：收起后只显示图标

@@ -110,6 +110,36 @@ REPEAT_CN = {"daily": "每天", "workday": "每个工作日", "weekly": "每周"
              "biweekly": "每两周", "monthly": "每月", "yearly": "每年"}
 _WD_CN = "日一二三四五六"
 
+# 「算法复习」「八股复习」这两个清单里的待办是刷题页按艾宾浩斯排出来的，
+# 日历只负责看，不负责挪：改了日期，题目那边的 next_review 不会跟着动，
+# 而启动对账只补「被删/被勾掉」的，不会把被改动的日期改回来 —— 两边就悄悄
+# 对不上了。判据用清单名（就是这两个页写入的地方），不用查库：
+# 每次 reload 每格每条都要问一次，那里省下来的是实打实的耗时。
+TRAINER_LISTS = {services.ALGO_LIST_NAME: "算法刷题",
+                 services.INTERVIEW_LIST_NAME: "八股刷题"}
+
+
+def trainer_of(row: dict) -> str:
+    """这条是哪个刷题页排的（返回页名），不是就返回空串。"""
+    return TRAINER_LISTS.get(row.get("list_name") or "", "")
+
+
+def trainer_drag_blocked(row: dict, global_pos) -> bool:
+    """想拖一条复习待办时调这个：True = 已经拦下来了。
+
+    拦了又不说原因，用户只会以为「这日历怎么拖不动」，所以在鼠标位置顶一句
+    提示 —— QToolTip 非阻塞、自动消失，不像弹层那样要点掉，也不会卡在
+    鼠标事件里。
+    """
+    who = trainer_of(row)
+    if not who:
+        return False
+    from PySide6.QtWidgets import QToolTip
+    QToolTip.showText(global_pos,
+                      f"这条的日期由「{who}」页排（艾宾浩斯），"
+                      "在日历里改会和那边对不上", None)
+    return True
+
 
 def row_tooltip(row: dict) -> str:
     """色条 / 色块上悬停看到的那几行字。
@@ -156,6 +186,9 @@ def row_tooltip(row: dict) -> str:
         lines.append(first if len(first) <= 60 else first[:60] + "…")
     if row.get("done"):
         lines.append("已完成")
+    who = trainer_of(row)
+    if who:
+        lines.append(f"日期由{who}页排，在日历里不能改")
     return "\n".join(lines)
 
 
