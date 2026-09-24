@@ -106,8 +106,8 @@ _FOLDER_TINTS = ["red", "amber", "green", "blue", "accent", "nlp_fg"]
 
 _RECENT_COL = 64           # 「最近」视图第二列要放得下「3 个月前」
 _COUNT_COL = 34
-_MAX_BACKLINKS = 12
-_POS_KEEP = 300        # 阅读位置最多记几篇，超了丢最旧的        # 反向链接面板条数上限，超出会在面板里说明
+_MAX_BACKLINKS = 12       # 反向链接面板条数上限，超出会在面板里说明
+_POS_KEEP = 300           # 阅读位置最多记几篇，超了丢最旧的
 _HEADING_TOP_PAD = 6       # 跳标题时留一点上边距，别贴着卡片边缘
 _IMAGE_OBJECT = int(QTextFormat.ImageObject)
 

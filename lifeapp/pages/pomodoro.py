@@ -4007,6 +4007,9 @@ class PomodoroPage(Page):
             self._persist_session()  # 暂停时也保存进度，防崩溃
             self.start_btn.setText("继续")
             self._set_state("已暂停")
+            # 暂停分支原来不刷环：全局快捷键 / Mini 上暂停时，常用专注页的坞和
+            # 行尾那枚 ⏸ 会一直停在「还在跑」的样子。
+            self._update_ring()
             sounds.play("pomodoro_pause")
         else:
             if self.timer_mode == "pomodoro":
@@ -4285,6 +4288,9 @@ class PomodoroPage(Page):
         mode: "pomodoro" 番茄倒计时 / "countup" 正计时。
         """
         self._active_fav = None
+        # _fav_id 也要一起清：它才是这轮计时落到哪条常用专注上的凭据，
+        # 只清 _active_fav 的话界面看着是「无」，记史时仍然记到上一条常用专注名下
+        self._fav_id = ""
         self._task = title
         self.task_lbl.setText(f"{title} ›")
         want_countup = mode == "countup"

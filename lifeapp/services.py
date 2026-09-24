@@ -1140,7 +1140,7 @@ def pomodoro_fav_summary(fav_id: str) -> dict:
 def pomodoro_fav_totals() -> dict[str, int]:
     """一次查询拿到 {fav_id: 累计分钟}，供常用专注列表每行右侧的时长。
 
-    列表有 N 行就查 N 次的话，每次 ``db.connect()`` 约 12ms，行多了切页会卡。
+    按行各查一次的话，列表有 N 条就是 N 次 GROUP BY 往返；一次 GROUP BY 全拿。
     """
     with db.connect() as conn:
         rows = conn.execute(

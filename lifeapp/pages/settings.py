@@ -368,10 +368,14 @@ class SettingsPage(Page):
             self._refresh_vault_lbl()
 
     def _export_data(self) -> None:
-        default_dir = os.path.join(config.data_dir(), "exports")
+        # 导出是「对着同一套备份目录反复按」的动作：不记上次去哪儿，
+        # 每次都从 ~/.life_system/exports 开始，就得重新点三遍目录树。
+        default_dir = (db_get("export_dir")
+                       or os.path.join(config.data_dir(), "exports"))
         chosen = QFileDialog.getExistingDirectory(self, "选择导出目录", default_dir)
         if not chosen:
             return
+        db_set("export_dir", chosen)
         files = export.export_all(chosen)
         sounds.play("export_ok")
         popups.notify(self, "导出完成", f"已导出 {len(files)} 个文件到：\n{chosen}")

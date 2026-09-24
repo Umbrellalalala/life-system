@@ -914,8 +914,10 @@ class InterviewPage(Page):
                 self._set_mode("bank")
                 return
             self._refresh_progress()
-        for b in (self.submit_btn, self.btn_right, self.btn_wrong,
-                  self.btn_skip, self.drill_open):
+        # reveal_btn 也得一起放开：上面两处空态会把它一起禁掉，漏了的话
+        # 换到有题的标签下「看答案」还是灰的
+        for b in (self.submit_btn, self.reveal_btn, self.btn_right,
+                  self.btn_wrong, self.btn_skip, self.drill_open):
             b.setEnabled(True)
         p = services.interview_pick(exclude_id=self._drill_id,
                                     tag=self.tag_filter.currentData() or "")

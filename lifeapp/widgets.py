@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, QSize, QObject, QEvent, QDate
 from PySide6.QtGui import (
     QColor, QPainter, QPainterPath, QPen, QFont, QLinearGradient, QPolygonF,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QSizePolicy,
@@ -288,6 +289,23 @@ def drop_widget(widget: QWidget) -> None:
     widget.hide()
     widget.setParent(None)
     widget.deleteLater()
+
+
+def drag_snapshot(widget: QWidget, bg_key: str = "bg_alt") -> QPixmap:
+    """拖拽预览图。不能直接 grab()：这些行自己是 transparent 的，grab 会把
+    「调色板的窗口色」烤进图里，而本应用换肤只改 QSS 不改调色板 ——
+    夜间模式下每块预览都成了一条亮灰色的杠子（亮色下又完全看不出来）。
+
+    先按当前主题铺一层背景再 render。保住 devicePixelRatio：直接铺到
+    `QPixmap(size())` 上会让 150% 屏的预览发虚。
+    """
+    dpr = widget.devicePixelRatioF() or 1.0
+    pix = QPixmap(max(1, int(widget.width() * dpr)),
+                  max(1, int(widget.height() * dpr)))
+    pix.setDevicePixelRatio(dpr)
+    pix.fill(QColor(theme.get(bg_key)))
+    widget.render(pix)
+    return pix
 
 
 def _height_at(row: QWidget, w: int) -> int:

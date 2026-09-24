@@ -19,6 +19,9 @@ from PySide6.QtWidgets import (
 class RepeatDialog(QDialog):
     def __init__(self, parent: QWidget, title: str, desc: str):
         super().__init__(parent)
+        # 没有这个名字就吃不到 QSS 里 QDialog#TickDialog 那套底色，
+        # 夜间模式下整框是白的
+        self.setObjectName("TickDialog")
         self.setWindowTitle(title)
         self.setModal(True)
         self.setFixedWidth(420)

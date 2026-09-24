@@ -2077,7 +2077,112 @@ class TaskListArea(QScrollArea):
             bar.setValue(bar.value() + max(4, (vp_pos.y() - (h - margin)) // 3))
 
 
-class BoardColumn(QFrame):
+class ColumnReorderMixin:
+    """给「一列卡片」这种容器加拖拽重排：算插槽、画预览线、发落点信号。
+
+    看板的一列和四象限的一格结构一样（body 里一个 QVBoxLayout，末尾一根 stretch），
+    所以两边共用这一份，不再各写一遍。列表页 TaskListArea 早就有同构的实现，
+    它按整张表的索引算落点；这里改成报「插到哪张卡之前/之后」，由页面换算全局顺序 ——
+    因为列只是全局序列里的一段，列内索引对不上 services.todo_reorder 要的全局 id 表。
+
+    刻意限制：只接受**属于本列**的任务落进本列。跨列拖不改清单也不改优先级，
+    那两个语义已经分别由「拖到左栏」和「拖进别的象限」负责，这里不抢。
+    """
+
+    cardDropped = Signal(int, object, bool)   # (todo_id, 参照卡 todo_id 或 None, 插到它之前?)
+
+    def _setup_reorder(self) -> None:
+        self._reorder_on = False
+        self.setAcceptDrops(True)
+        line = QFrame(self.body)
+        line.setObjectName("ColumnDropLine")
+        line.setFixedHeight(2)
+        line.hide()
+        self._drop_line = line
+
+    def _cards(self) -> list:
+        """本列里可重排的卡片（带 _todo_id 的那些）。"""
+        lay = self.body.layout()
+        out = []
+        for i in range(lay.count()):
+            it = lay.itemAt(i)
+            w = it.widget() if it is not None else None
+            if w is not None and getattr(w, "_todo_id", None) is not None:
+                out.append(w)
+        return out
+
+    def set_reorder_enabled(self, on: bool) -> None:
+        self._reorder_on = bool(on)
+        if not on:
+            self._drop_line.hide()
+
+    def _slot_for(self, tid: int, y: int):
+        """光标 y（body 坐标）→ (参照卡, 插到它之前?)；落点不合法返回 None。"""
+        cards = self._cards()
+        if not any(c._todo_id == tid for c in cards):
+            return None                     # 不是本列的卡：不给「这里能放」的假象
+        for c in cards:
+            if y < c.geometry().center().y():
+                return (c, True) if c._todo_id != tid else None
+        if not cards:
+            return (None, True)
+        last = cards[-1]
+        return (None, True) if last._todo_id == tid else (last, False)
+
+    def _show_line(self, slot) -> None:
+        if slot is None:
+            self._drop_line.hide()
+            return
+        anchor, before = slot
+        lay = self.body.layout()
+        if anchor is None:                  # 本列末尾
+            w = lay.itemAt(lay.count() - 2).widget() if lay.count() > 1 else None
+            y = (w.geometry().bottom() + 1) if w is not None else 2
+        else:
+            y = anchor.geometry().top() - 4 if before else anchor.geometry().bottom() + 4
+        self._drop_line.setStyleSheet(
+            f"background: {theme.get('accent')}; border-radius: 1px;")
+        self._drop_line.setGeometry(2, max(y, 0), max(self.body.width() - 12, 10), 2)
+        self._drop_line.show()
+        self._drop_line.raise_()
+
+    # ---- Qt 拖放三件套 ----
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._reorder_on and event.mimeData().hasFormat(MIME_TODO):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if not (self._reorder_on and event.mimeData().hasFormat(MIME_TODO)):
+            return
+        tid = int(bytes(event.mimeData().data(MIME_TODO)).decode())
+        slot = self._slot_for(tid, self.body.mapFrom(self,
+                                                     event.position().toPoint()).y())
+        if slot is None:
+            self._drop_line.hide()
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._show_line(slot)
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._drop_line.hide()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        self._drop_line.hide()
+        if not (self._reorder_on and event.mimeData().hasFormat(MIME_TODO)):
+            event.ignore()
+            return
+        tid = int(bytes(event.mimeData().data(MIME_TODO)).decode())
+        slot = self._slot_for(tid, self.body.mapFrom(self, event.position().toPoint()).y())
+        if slot is None:
+            event.ignore()
+            return
+        anchor, before = slot
+        self.cardDropped.emit(tid, None if anchor is None else anchor._todo_id, before)
+        event.acceptProposedAction()
+
+
+class BoardColumn(QFrame, ColumnReorderMixin):
     """看板里的一列：组标题在上，卡片往下堆。
 
     列本身不画底 —— 滴答的看板也是只有卡片有边框，列只是排布的槽位。
@@ -2101,6 +2206,7 @@ class BoardColumn(QFrame):
         bl.addStretch(1)
         lay.addWidget(self.head)
         lay.addWidget(self.body, 1)
+        self._setup_reorder()
 
     def set_header(self, w: QWidget) -> None:
         w.setParent(self.head)
@@ -2119,10 +2225,11 @@ class BoardArea(QScrollArea):
 
     和 TaskListArea 暴露同一套 add_widget / clear_items / finalize_layout 接口，
     reload 里那条「组标题 → 行」的调用序列不用写两份：遇到 GroupHeader 就开一列，
-    其它控件都进当前列。代价是看板上没有拖拽排序和键盘导航（那两个是列表的事）。
+    其它控件都进当前列。列内支持拖拽重排（ColumnReorderMixin），键盘导航仍是列表的事。
     """
 
     emptyClicked = Signal()
+    reorderDropped = Signal(int, object, bool)   # 透传 BoardColumn.cardDropped
     COL_W = 292
 
     def __init__(self, parent=None):
@@ -2145,6 +2252,20 @@ class BoardArea(QScrollArea):
         self._container.installEventFilter(self)
 
     # ---- 与 TaskListArea 同形的最小接口 ----
+    def set_reorder_enabled(self, on: bool) -> None:
+        """列是 reload 时新建的，所以这里既刷已有的、也记住开关给以后的。"""
+        self._reorder_on = bool(on)
+        for col in self._columns:
+            col.set_reorder_enabled(on)
+
+    def _new_column(self) -> BoardColumn:
+        col = BoardColumn(self.COL_W)
+        col.cardDropped.connect(self.reorderDropped.emit)
+        col.set_reorder_enabled(getattr(self, "_reorder_on", False))
+        self._lay.insertWidget(self._lay.count() - 1, col)
+        self._columns.append(col)
+        return col
+
     def clear_items(self) -> None:
         while self._lay.count() > 1:          # 末尾 stretch 必须留着
             it = self._lay.takeAt(0)
@@ -2157,26 +2278,18 @@ class BoardArea(QScrollArea):
 
     def add_widget(self, widget: QWidget) -> None:
         if isinstance(widget, GroupHeader):
-            col = BoardColumn(self.COL_W)
+            col = self._new_column()
             col.set_header(widget)
-            self._lay.insertWidget(self._lay.count() - 1, col)
-            self._columns.append(col)
             self._current = col
         else:
             if self._current is None:
                 # 「分组=无」时没有组标题，也要有一列来装卡片
-                col = BoardColumn(self.COL_W)
-                self._lay.insertWidget(self._lay.count() - 1, col)
-                self._columns.append(col)
-                self._current = col
+                self._current = self._new_column()
             self._current.add_card(widget)
         self._widgets.append(widget)
 
     def finalize_layout(self) -> None:
         self._lay.activate()
-
-    def set_reorder_enabled(self, on: bool) -> None:
-        pass          # 看板不支持拖拽重排，接口留着让 reload 少一个分支
 
     def scroll_value(self) -> int:
         return self.horizontalScrollBar().value()
@@ -2194,11 +2307,14 @@ class BoardArea(QScrollArea):
         return super().eventFilter(obj, event)
 
 
-class QuadCard(QFrame):
+class QuadCard(QFrame, ColumnReorderMixin):
     """四象限页里的一格：彩色罗马数字角标 + 标题，下面按日期分组列任务。
 
     和 BoardColumn 一样只暴露 `add_widget`，reload 里那条「组标题 → 行」的
     调用序列不用为这一页再写一遍。
+
+    落点分两种，互不抢：拖的是**本格里的卡** → 格内重排；拖的是别的格的卡 →
+    维持原语义「拖进来就是改优先级」。
     """
 
     dropped = Signal(int, int)         # (todo_id, 目标优先级)
@@ -2236,6 +2352,8 @@ class QuadCard(QFrame):
         bl.setSpacing(0)
         bl.addStretch(1)
         lay.addWidget(self.body, 1)
+        self._setup_reorder()
+        self._reordering = False
 
     def add_widget(self, w: QWidget) -> None:
         w.setParent(self.body)
@@ -2243,19 +2361,46 @@ class QuadCard(QFrame):
         bl.insertWidget(bl.count() - 1, w)
         w.show()
 
-    # ---- 拖进来就是改优先级 ----
+    # ---- 落点：本格内的卡 → 重排；别处的卡 → 改优先级 ----
+    @staticmethod
+    def _drag_tid(event) -> int | None:
+        try:
+            return int(bytes(event.mimeData().data(MIME_TODO)).decode())
+        except (ValueError, TypeError):
+            return None
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if event.mimeData().hasFormat(MIME_TODO):
-            widgets._apply_property(self, "drop", "true")
+        if not event.mimeData().hasFormat(MIME_TODO):
+            return
+        tid = self._drag_tid(event)
+        self._reordering = tid is not None and any(
+            c._todo_id == tid for c in self._cards())
+        if self._reordering:
+            ColumnReorderMixin.dragEnterEvent(self, event)
+            return
+        widgets._apply_property(self, "drop", "true")
+        event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self._reordering:
+            ColumnReorderMixin.dragMoveEvent(self, event)
+        elif event.mimeData().hasFormat(MIME_TODO):
             event.acceptProposedAction()
 
     def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._reordering = False
         widgets._apply_property(self, "drop", "false")
+        self._drop_line.hide()
 
     def dropEvent(self, event) -> None:  # noqa: N802
         widgets._apply_property(self, "drop", "false")
         if not event.mimeData().hasFormat(MIME_TODO):
             return
+        if self._reordering:
+            self._reordering = False
+            ColumnReorderMixin.dropEvent(self, event)
+            return
+        self._reordering = False
         raw = bytes(event.mimeData().data(MIME_TODO)).decode()
         self.dropped.emit(int(raw), self._prio)
         event.acceptProposedAction()
@@ -2269,6 +2414,7 @@ class QuadArea(QScrollArea):
     """
 
     emptyClicked = Signal()
+    reorderDropped = Signal(int, object, bool)   # 透传 QuadCard.cardDropped
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2302,6 +2448,8 @@ class QuadArea(QScrollArea):
 
     def add_card(self, idx: int, card: QuadCard) -> None:
         self._grid.addWidget(card, idx // 2, idx % 2)
+        card.cardDropped.connect(self.reorderDropped.emit)
+        card.set_reorder_enabled(getattr(self, "_reorder_on", False))
         self._cards.append(card)
 
     def add_widget(self, w: QWidget) -> None:
@@ -2311,7 +2459,10 @@ class QuadArea(QScrollArea):
         self._grid.activate()
 
     def set_reorder_enabled(self, on: bool) -> None:
-        pass          # 象限页不支持拖拽重排
+        """格子是 reload 时新建的，所以既刷已有的、也记住开关给以后的。"""
+        self._reorder_on = bool(on)
+        for card in self._cards:
+            card.set_reorder_enabled(on)
 
     def scroll_value(self) -> int:
         return self.verticalScrollBar().value()
@@ -2887,9 +3038,9 @@ class TodoRow(QFrame):
         self._cancel_rename()
         drag = QDrag(self)
         drag.setMimeData(self._make_drag_mime())
-        pix = self.grab()
+        pix = widgets.drag_snapshot(self, "bg_alt")
         drag.setPixmap(pix)
-        drag.setHotSpot(QPoint(24, pix.height() // 2))
+        drag.setHotSpot(QPoint(24, self.height() // 2))
         self.dragGroup.emit(str(getattr(self, "_group_key", "") or ""))
         drag.exec(Qt.MoveAction)
         self.dragGroup.emit("")
@@ -3266,9 +3417,9 @@ class SideRow(QWidget):
             mime.setData(MIME_NAV, self.key.encode())
             drag = QDrag(self)
             drag.setMimeData(mime)
-            pix = self.grab()
+            pix = widgets.drag_snapshot(self, "nav_bg")
             drag.setPixmap(pix)
-            drag.setHotSpot(QPoint(16, pix.height() // 2))
+            drag.setHotSpot(QPoint(16, self.height() // 2))
             drag.exec(Qt.MoveAction)
             return
         super().mouseMoveEvent(event)
@@ -4383,11 +4534,8 @@ class _SubRow(QFrame):
         mime.setData(_SUB_MIME, str(self.sub["id"]).encode())
         drag = QDrag(self)
         drag.setMimeData(mime)
-        # 直接 grab() 会把底色烤成黑色（这行自己是 transparent 的），先铺一层
-        pm = QPixmap(self.size())
-        pm.fill(QColor(theme.get("bg_alt")))
-        self.render(pm)
-        drag.setPixmap(pm)
+        # 直接 grab() 会把底色烤成调色板那一档，夜间模式下发白
+        drag.setPixmap(widgets.drag_snapshot(self, "bg_alt"))
         drag.setHotSpot(start)
         drag.exec(Qt.MoveAction)
 
@@ -5121,6 +5269,8 @@ class TodoPage(QWidget):
         if arch:
             row = SideRow("archived_lists", "已归档清单", icon_kind="archive",
                           icon_key="muted", count=len(arch))
+            # 这行没有右键菜单（_nav_more 不认这个 key），⋯ 挂着就是假按钮
+            row.set_has_menu(False)
             row.picked.connect(lambda _k: self._archived_lists_menu(row))
             self._nav_rows["archived_lists"] = row
             self._nav_insert(row)
@@ -5249,7 +5399,7 @@ class TodoPage(QWidget):
         self.search_input.setObjectName("TodoSearch")
         self.search_input.setPlaceholderText("搜索任务标题或描述")
         self.search_input.textChanged.connect(self._on_search)
-        self.search_input.returnPressed.connect(self._toggle_search)
+        self.search_input.returnPressed.connect(self._search_enter)
         self.search_input.installEventFilter(self)
         sr.addWidget(self.search_input, 1)
         self.search_row.hide()
@@ -5314,6 +5464,10 @@ class TodoPage(QWidget):
         self.quad.emptyClicked.connect(self._close_detail)
         self.quad.hide()
         lay.addWidget(self.quad, 1)
+
+        # 看板列内 / 象限格内的拖拽重排：落点由容器算，这里换算成全局顺序再落库
+        self.board.reorderDropped.connect(self._handle_column_drop)
+        self.quad.reorderDropped.connect(self._handle_quad_drop)
 
         # 完成后浮在中间的撤销条：挂在 canvas 上跟着中栏走，不进布局（浮层）
         self._undo_bar = UndoBar(canvas)
@@ -5382,6 +5536,17 @@ class TodoPage(QWidget):
             self.search_row.hide()
         else:
             self._focus_search()
+
+    def _search_enter(self) -> None:
+        """搜索框回车 = 走到第一条命中并打开详情。
+
+        以前回车挂的是 _toggle_search，也就是「收起并清空」—— 打了半天字按回车，
+        字没了、框也没了，等于搜索根本没有「执行」这个动作。收起留给 Esc。
+        """
+        self._selected_id = 0          # 让 _on_key_move 从「没选中」起步 -> 第一条
+        self._on_key_move(1)
+        self.list_widget.setFocus(Qt.OtherFocusReason)
+        self._on_key_activate("enter")
 
     def _focus_search(self) -> None:
         self.search_row.show()
@@ -5924,6 +6089,9 @@ class TodoPage(QWidget):
         搜索、隐藏清单、重复展开这些口径就和中栏列表完全一致，不用抄第二份。
         """
         keep_scroll = self.quad.scroll_value()
+        # 象限分支在主 reload 里提前 return，够不到那句统一的开关，自己补上；
+        # 放在 clear_items 之前，新建的格子才会从 QuadArea 身上继承到这个状态
+        self.quad.set_reorder_enabled(self._sort == "custom")
         self.quad.clear_items()
         self._items.clear()
         self._groups.clear()
@@ -6117,6 +6285,13 @@ class TodoPage(QWidget):
         if kind == "todo":
             _, tid, occ = payload
             services.occ_set_done(tid, occ, False)
+        elif kind == "del":
+            _, tid, occ = payload
+            t = services.todo_get(tid) or {}
+            if t.get("deleted_at"):
+                services.todo_restore(tid)              # 从垃圾桶捞回来
+            elif occ:
+                services.occ_set_done(tid, occ, False)  # 取消「跳过这一周期」
         else:
             _, hid, date_s = payload
             services.habit_set_count(hid, date_s, 0)
@@ -6473,6 +6648,12 @@ class TodoPage(QWidget):
         sounds.play("todo_deleted")
         if self.detail._task and self.detail._task["id"] == todo_id:
             self.detail.clear()
+        # 删除是这一页最容易手滑的动作，而且软删之后界面上什么都不剩 ——
+        # 没有撤销条的话用户只能自己想到「去垃圾桶捞」
+        t = services.todo_get(todo_id) or {}
+        if t.get("deleted_at") or occ:
+            self._undo_bar.show_for(("del", todo_id, occ),
+                                    t.get("title") or "", verb="已删除")
         self.reload()
 
     def _on_task_saved(self, todo_id: int) -> None:
@@ -6551,9 +6732,14 @@ class TodoPage(QWidget):
 
     def _on_more_action(self, value: str) -> None:
         if value == "clear_done":
-            for t in services.todo_list():
-                if t["done"]:
-                    services.todo_delete(t["id"])
+            done = [t for t in services.todo_list() if t["done"]]
+            # 以前点一下立刻把整批已完成塞进垃圾桶，一条不问、也不说动了几条
+            if not done or not popups.confirm(
+                    self, "清空已完成",
+                    "把这 %d 条已完成的待办移入垃圾桶？" % len(done)):
+                return
+            for t in done:
+                services.todo_delete(t["id"])
             self.reload()
         elif value == "archive":
             self._set_view("archived")
@@ -6655,7 +6841,9 @@ class TodoPage(QWidget):
             def pick_trash(v: object) -> None:
                 if v == "restore":
                     services.todo_restore(todo_id)
-                else:
+                elif popups.confirm(self, "彻底删除",
+                                    "彻底删除「%s」？不留备份，找不回来。"
+                                    % (t.get("title") or "")):
                     services.todo_delete(todo_id, hard=True)
                 self.reload()
             self._menu_at([("restore", "restore", "恢复"),
@@ -6959,6 +7147,53 @@ class TodoPage(QWidget):
             return
         ids.insert(max(0, min(new_idx, len(ids))), tid)
         services.todo_reorder(ids)
+        self.reload()
+
+    # ---- 看板 / 四象限的列内重排 ----
+    def _handle_column_drop(self, tid: int, anchor_tid, before: bool) -> None:
+        """看板：整块看板的卡片顺序就是全局顺序，列只是它切出来的一段。"""
+        if self._sort != "custom":
+            return
+        rows = [w for w in self.board._widgets
+                if getattr(w, "_todo_id", None) is not None]
+        self._splice_order(rows, tid, anchor_tid, before)
+
+    def _handle_quad_drop(self, tid: int, anchor_tid, before: bool) -> None:
+        """四象限：卡片是塞进各格自己的布局里的（QuadArea._widgets 是空的），
+        所以按格的顺序把每格里的卡串起来当全局顺序。"""
+        if self._sort != "custom":
+            return
+        rows = [c for card in self.quad._cards for c in card._cards()]
+        self._splice_order(rows, tid, anchor_tid, before)
+
+    def _splice_order(self, rows: list, tid: int, anchor_tid, before: bool) -> None:
+        """把 tid 挪到 anchor 前/后，写回 sort_order。
+
+        anchor_tid=None 表示落在本列末尾。落点等价于原顺序时直接返回 ——
+        不然「拖一下又松回原地」会白写一遍库、白重建一次整页。
+        """
+        ids = [w._todo_id for w in rows]
+        if tid not in ids:
+            return
+        src = rows[ids.index(tid)]
+        anchor = next((w for w in rows if w._todo_id == anchor_tid), None) \
+            if anchor_tid is not None else None
+        # 和列表页同一条规矩：只在同一分组内重排。跨组「拖一下」看着像能改清单/
+        # 改日期，实际那些语义各有出口（拖左栏、拖别的象限），这里不抢。
+        if anchor is not None and getattr(src, "_group_key", None) is not None:
+            if getattr(src, "_group_key", "") != getattr(anchor, "_group_key", ""):
+                return
+        rest = [i for i in ids if i != tid]
+        if anchor_tid is None:
+            pos = len(rest)
+        else:
+            if anchor_tid not in rest:
+                return
+            pos = rest.index(anchor_tid) + (0 if before else 1)
+        new_ids = rest[:pos] + [tid] + rest[pos:]
+        if new_ids == ids:
+            return
+        services.todo_reorder(new_ids)
         self.reload()
 
     def _on_nav_drop(self, key: str, tid: int) -> None:
@@ -7266,10 +7501,28 @@ class TodoPage(QWidget):
             elif v == "add":
                 self._add_list(folder_id=lst["id"] if kind == "folder" else 0)
             elif v == "archive":
+                if not popups.confirm(
+                        self, "归档清单",
+                        "归档「%s」？清单和里面的待办都从列表里消失，"
+                        "只能到左栏「已归档清单」里逐条取回。" % lst["name"]):
+                    return
                 services.list_update(lst["id"], archived=1)
                 self._rebuild_nav()
                 self._set_view("today")
             elif v == "delete":
+                kids = [l for l in services.list_all()
+                        if l.get("folder_id") == lst["id"]] if kind == "folder" else []
+                if kind == "folder":
+                    head = "删除文件夹「%s」？" % lst["name"]
+                    tail = ("里面的 %d 个子清单会一起删掉。" % len(kids)) if kids \
+                        else "这个文件夹是空的。"
+                else:
+                    n = sum(1 for t in services.todo_list()
+                            if t.get("list_name") == lst["name"])
+                    head = "删除清单「%s」？" % lst["name"]
+                    tail = ("%d 条待办会一起删掉。" % n) if n else "里面没有待办。"
+                if not popups.confirm(self, "删除", head + tail):
+                    return
                 services.list_delete(lst["id"], lst["name"])
                 self._rebuild_nav()
                 self._set_view("today")
@@ -7298,7 +7551,11 @@ class TodoPage(QWidget):
             if str(v) == "edit":
                 from ..todo_dialogs import TagDialog
                 TagDialog(self, tag_row=tag).exec()
-            else:
+            elif popups.confirm(
+                    self, "删除标签",
+                    "删除标签「%s」？%d 条待办会去掉这个标签，"
+                    "待办本身不删。" % (tag["name"],
+                                     len(services.tag_todo_ids(tag["id"])))):
                 services.tag_delete(tag["id"])
             self._rebuild_nav()
             self.reload()
@@ -7315,7 +7572,8 @@ class TodoPage(QWidget):
             if str(v) == "edit":
                 from ..todo_dialogs import FilterDialog
                 FilterDialog(self, filter_row=fl).exec()
-            else:
+            elif popups.confirm(self, "删除过滤器",
+                                "删除过滤器「%s」？" % fl["name"]):
                 services.filter_delete(fl["id"])
             self._rebuild_nav()
             self.reload()
@@ -7325,8 +7583,13 @@ class TodoPage(QWidget):
         items = [("clear", "trash", "清空垃圾桶")]
 
         def pick(v: object) -> None:
-            services.trash_clear()
-            self.reload()
+            n = len(services.trash_list())
+            # 全应用只有这一处是真的不可逆，以前点一下就全没了，连个问都不问
+            if n and popups.confirm(self, "清空垃圾桶",
+                                    "彻底删除垃圾桶里的 %d 条？不留备份，找不回来。"
+                                    % n):
+                services.trash_clear()
+                self.reload()
         self._menu_at(items, pos, pick, danger=("clear",))
 
     def _add_list(self, folder_id: int = 0) -> None:
