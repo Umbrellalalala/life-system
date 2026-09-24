@@ -70,7 +70,7 @@ EVENTS: list[tuple[str, str, str, str, bool]] = [
     ("pomodoro_abandon",     "放弃本轮",                "番茄钟", "lattice",   False),
     ("countup_recorded",     "正计时结束并记录",        "番茄钟", "beep",      False),
 
-    # 滴答自己的完成音，从 E:\滴答清单\completion_sound_*.wav 转来的：
+    # 滴答风格的完成音（从官方客户端的 completion_sound_*.wav 转来）：
     # 立体声 48k → 单声道 44.1k，并按这套素材的响度目标（RMS -20dBFS）归一化过，
     # 不然会和老素材差 8dB。
     ("todo_done",            "完成待办",                "待办",   "jingle",    True),

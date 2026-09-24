@@ -106,7 +106,8 @@ _FOLDER_TINTS = ["red", "amber", "green", "blue", "accent", "nlp_fg"]
 
 _RECENT_COL = 64           # 「最近」视图第二列要放得下「3 个月前」
 _COUNT_COL = 34
-_MAX_BACKLINKS = 12        # 反向链接面板条数上限，超出会在面板里说明
+_MAX_BACKLINKS = 12
+_POS_KEEP = 300        # 阅读位置最多记几篇，超了丢最旧的        # 反向链接面板条数上限，超出会在面板里说明
 _HEADING_TOP_PAD = 6       # 跳标题时留一点上边距，别贴着卡片边缘
 _IMAGE_OBJECT = int(QTextFormat.ImageObject)
 
@@ -456,6 +457,9 @@ class NotePage(Page):
         self._math_imgs: dict[str, QImage] = {}
         self._math_avail = 0.0
         self._math_cache: dict[tuple, object] = {}   # tex/字号/色 -> QImage
+        self._pos_map: dict[str, list] = {}         # rel -> [滚动位置, 当时文档高, 时间]
+        self._pos_pending = ""              # 还没放到位的那篇（图下来后还要再校正）
+        self._pos_applying = False
         self._raw_html = ""                 # vault 给的 HTML（还带着 data-tex）
         self._tint_cache: dict[str, str] = {}
         self._view = "tree"              # tree | recent
@@ -492,6 +496,10 @@ class NotePage(Page):
         self.outline.jumpRequested.connect(self._on_outline_jump)
         self.preview.verticalScrollBar().valueChanged.connect(
             self._sync_outline_current)
+        self.preview.verticalScrollBar().valueChanged.connect(self._note_scrolled)
+        self._pos_timer = QTimer(self)
+        self._pos_timer.setSingleShot(True)
+        self._pos_timer.timeout.connect(self._save_pos)
         if theme.manager is not None:
             theme.manager.changed.connect(self._on_theme_changed)
 
@@ -949,26 +957,25 @@ class NotePage(Page):
         db.set_setting("note_pos", json.dumps(
             {"vault": vault.vault_path(), "map": self._pos_map}))
 
-    def _restore_pos(self, force: bool = False) -> None:
+    def _restore_pos(self) -> None:
+        """把这篇放回上次读到的地方。可以反复调：图是异步下来的，
+        每落一张整篇就变高一点，位置得跟着按比例挪，否则会偏出半屏。"""
         want = self._pos_map.get(self._current_rel)
-        if not want or self._pos_ref is None:
+        if not want or self._pos_pending != self._current_rel:
             return
-        if not force and self._pos_ref[2] != want[2]:
-            return                               # 期间用户自己滚走了，别再抢
-        y, old_h, stamp = want
+        y, old_h, _stamp = want
         doc = self.preview.document()
         h = max(round(doc.size().height()), 1)
-        scaled = y * h / max(old_h, 1)
         sb = self.preview.verticalScrollBar()
+        target = int(max(0, min(y * h / max(old_h, 1), sb.maximum())))
         self._pos_applying = True
-        sb.setValue(int(max(0, min(scaled, sb.maximum()))))
+        sb.setValue(target)
         self._pos_applying = False
-        self._pos_ref = (self._current_rel, scaled, stamp)
 
     def _note_scrolled(self, _value: int) -> None:
-        """用户自己滚了：放弃这次「等图片下完再校正位置」，并防抖存一次位置。"""
+        """用户自己滚走了就别再抢他的位置；同时防抖存一次当前位置。"""
         if not self._pos_applying:
-            self._pos_ref = None
+            self._pos_pending = ""
         self._pos_timer.start(900)
 
     def _save_order(self) -> None:
@@ -1260,12 +1267,16 @@ class NotePage(Page):
         return None
 
     def _open(self, rel: str, line: int = 0) -> None:
+        if rel != self._current_rel:
+            self._save_pos()                 # 切走之前先把这篇读到哪儿记下来
         self._current_rel = rel
         self.doc_title.setText(os.path.splitext(os.path.basename(rel))[0])
         self.doc_path.setText(rel)
         self.doc_stat.setText(vault.stats(rel))
         self._render_preview()
         self._refresh_side()
+        self._pos_pending = "" if line else rel
+        self._restore_pos()
         if line:
             kw = self.search_input.text().strip()
             if kw:
@@ -1385,6 +1396,8 @@ class NotePage(Page):
         if img is not None:
             # 图可能属于上一篇笔记，addResource 只是塞进资源表，不引用就没影响
             self.preview.document().addResource(_IMAGE_OBJECT, src, img)
+            # 每落一张图整篇就变高一点，恢复中的阅读位置要跟着重算
+            self._restore_pos()
 
     def _reclamp_images(self) -> None:
         """窗口改宽后重夹一遍：照片留着老尺寸、公式图比视口宽，都会顶出横向滚动条。

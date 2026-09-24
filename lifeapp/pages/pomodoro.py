@@ -3062,6 +3062,9 @@ class _TimerDock(QFrame):
     def _toggle(self):
         self.page._toggle()
         self.refresh()
+        mgr = getattr(self.page, "_fav_manager", None)
+        if mgr is not None:
+            mgr._sync_running_marks()   # 暂停后行上的 ⏸ 要变回 ▶
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         # 点坞体（非 ▶ 按钮）→ 收起常用专注页，回到原来的全屏计时界面
@@ -3376,6 +3379,7 @@ class FocusManagerView(QWidget):
             row.menu_requested.connect(self._row_menu)
             row.set_selected(fav.get("id") == (self._selected or {}).get("id"))
             self.list_lay.insertWidget(self.list_lay.count() - 1, row)
+        self._sync_running_marks()
         self._refresh_detail()
 
     def _select(self, fav: dict) -> None:
@@ -3409,8 +3413,14 @@ class FocusManagerView(QWidget):
 
     def _start(self, fav: dict) -> None:
         self._select(fav)
-        self.page._start_favorite(fav)
+        p = self.page
+        same = bool(fav.get("id")) and (p._active_fav or {}).get("id") == fav.get("id")
+        if same and p.running:
+            p._toggle()          # 行上此刻画的是 ⏸，点它就是暂停
+        else:
+            p._start_favorite(fav)
         self.dock.refresh()
+        self._sync_running_marks()
 
     # ---- 右侧详情 ----
     def _refresh_detail(self) -> None:
