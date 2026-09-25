@@ -4,7 +4,7 @@
 - 周日为首；跨月的日子数字变灰、整格淡底；周末列淡底
 - 日期号：今天 = 白字蓝圆；休/班角标贴在数字右上；节日名绿色右对齐
 - 色条底色 = 优先级浅色（无=灰 低=蓝 中=黄 高=红），已完成划掉
-- 格子放不下时收成「+N」，点它切到当天
+- 格子放不下时收成「+N」（挤在最后一根条右边），点它弹出当天的完整列表
 - 色条可拖到别的格子改期；重复任务拖之前先问「仅此周期 / 所有未完成周期」
 """
 from __future__ import annotations
@@ -29,16 +29,32 @@ HEAD_H = 28         # 日期号那一行的高度
 WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
 
 
+def _drain(lay) -> None:
+    """清空一个布局。子布局要递归拆：只 deleteLater 控件的话，
+    装着条和角标的那个空 HBox 会留在原位，白占一行高。
+    takeAt 交回来的 QLayoutItem 归调用方所有，不 del 就是每重建一次漏一批。"""
+    while lay.count():
+        it = lay.takeAt(0)
+        if it.layout():
+            _drain(it.layout())
+        elif it.widget():
+            it.widget().deleteLater()
+        del it
+
+
 class TaskBar(QFrame):
     """一条任务色条。"""
 
     clicked_ = Signal(dict, QPoint)
     dragged = Signal(dict)
 
-    def __init__(self, row: dict, parent: QWidget | None = None):
+    def __init__(self, row: dict, parent: QWidget | None = None,
+                 draggable: bool = True):
         super().__init__(parent)
         self.row = row
+        self._drag = draggable
         self._press: QPoint | None = None
+        self._blocked = False
         self.setObjectName("CalBar")
         self.setToolTip(model.row_tooltip(row))
         self.setFixedHeight(BAR_H - 1)
@@ -50,11 +66,14 @@ class TaskBar(QFrame):
         text = row["title"]
         if row.get("time"):
             text = f"{dateparse.human_time(row['time'])} {text}"
-        self.lbl = widgets.ElidedLabel(text)
+        self.lbl = widgets.ElidedLabel(text, keep_tip=True)
         self.lbl.setObjectName("CalBarText")
         f = QFont()
         f.setStrikeOut(bool(row["done"]))
         self.lbl.setFont(f)
+        # 标签盖住条面九成，悬停命中的是它 —— 整段说明也得挂一份上去，
+        # 否则「这条里面有 14 道题」这种话就只有点开卡片才看得见
+        self.lbl.setToolTip(model.row_tooltip(row))
         lay.addWidget(self.lbl)
         self._apply_colors(False)
 
@@ -78,6 +97,7 @@ class TaskBar(QFrame):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton and not self.row.get("feed"):
             self._press = event.position().toPoint()
+            self._blocked = False
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
@@ -88,11 +108,15 @@ class TaskBar(QFrame):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._press is not None and \
+        if self._drag and self._press is not None and \
                 (event.position().toPoint() - self._press).manhattanLength() > 8:
+            if self._blocked:
+                return          # 这次按下已经解释过为什么拖不动了，别每像素刷一遍
             if model.trainer_drag_blocked(self.row,
                                           event.globalPosition().toPoint()):
-                self._press = None
+                # 故意不清 _press：拖不动不等于不想点开。清了就变成「这根条点了
+                # 没反应」，用户只会以为它坏了。松手仍然按一次普通点击处理。
+                self._blocked = True
                 return
             self._start_drag()
             self._press = None
@@ -143,7 +167,7 @@ class DayCell(QFrame):
     bar_clicked = Signal(dict, QPoint)
     dropped = Signal(int, str, QDate)       # (todo_id, occ, 目标日期)
     add_clicked = Signal(QDate, QPoint)
-    more_clicked = Signal(QDate)
+    more_clicked = Signal(QDate, QPoint)   # (哪天, 角标左下角的全局坐标)
 
     def __init__(self, date: QDate, home_month: int, parent=None):
         super().__init__(parent)
@@ -151,6 +175,7 @@ class DayCell(QFrame):
         self._home_month = home_month
         self._bars: list[TaskBar] = []
         self._rows: list[dict] = []
+        self._sig: tuple | None = None   # 上次画出去的内容指纹，见 set_rows
         self._max_bars = 4
         self.setObjectName("CalCell")
         self.setAcceptDrops(True)
@@ -203,12 +228,7 @@ class DayCell(QFrame):
         self.bar_lay.setSpacing(1)     # 条 17 + 缝 1 = 行距 BAR_H
         lay.addWidget(self.bar_box)
 
-        self.more = QPushButton()
-        self.more.setObjectName("CalMore")
-        self.more.setCursor(Qt.PointingHandCursor)
-        self.more.clicked.connect(lambda: self.more_clicked.emit(self._date))
-        self.more.hide()
-        lay.addWidget(self.more)
+        self.more = None        # 溢出角标，跟着最后一根条排，见 _rebuild
         lay.addStretch(1)
         self._sync_state()
 
@@ -230,7 +250,24 @@ class DayCell(QFrame):
         return self._date
 
     def set_rows(self, rows: list[dict]) -> None:
-        self._rows = rows
+        sig = self._signature(rows)
+        same = sig == self._sig
+        self._rows, self._sig = rows, sig
+        if not same:
+            self._rebuild()
+
+    @staticmethod
+    def _signature(rows: list[dict]) -> tuple:
+        """这一格当前内容的指纹。刷新时 126 格里通常只有一格真的变了，
+        没变的就别去拆布局重建条 —— 实测整月 reload 从 174ms 掉到个位数。"""
+        return tuple((r["id"], r.get("date"), r.get("occ"), bool(r.get("done")),
+                      r.get("title"), r.get("priority"), r.get("time"),
+                      r.get("repeat"), r.get("sub_done"), r.get("sub_total"),
+                      bool(r.get("feed")), r.get("note")) for r in rows)
+
+    def force_rebuild(self) -> None:
+        """颜色是建条时烤进内联样式的：换肤后哪怕内容没变也得重画。"""
+        self._sig = None
         self._rebuild()
 
     def set_max_bars(self, n: int) -> None:
@@ -239,21 +276,40 @@ class DayCell(QFrame):
             self._rebuild()
 
     def _rebuild(self) -> None:
-        while self.bar_lay.count():
-            it = self.bar_lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-        self._bars.clear()
+        _drain(self.bar_lay)
+        self.more = None        # 上一轮的角标已经跟着布局拆掉了，别留着当悬空引用
+        self._bars = []
         shown = self._rows if self._max_bars >= 99 else self._rows[:self._max_bars]
+        left = len(self._rows) - len(shown)
+        bars = []
         for row in shown:
             bar = TaskBar(row)
             bar.clicked_.connect(self.bar_clicked.emit)
-            self.bar_lay.addWidget(bar)
-            self._bars.append(bar)
-        left = len(self._rows) - len(shown)
-        self.more.setVisible(left > 0)
-        if left > 0:
-            self.more.setText(f"+{left} 更多")
+            bars.append(bar)
+        for i, bar in enumerate(bars):
+            if left and i == len(bars) - 1:
+                # 滴答的做法：+N 挤在最后一根条的右边。另起一行会把格子顶满，
+                # 于是越空的格子越先撑不住。
+                box = QHBoxLayout()
+                box.setContentsMargins(0, 0, 0, 0)
+                box.setSpacing(3)
+                box.addWidget(bar, 1)
+                box.addWidget(self._more_chip(left), 0)
+                self.bar_lay.addLayout(box)
+            else:
+                self.bar_lay.addWidget(bar)
+        self._bars = bars
+
+    def _more_chip(self, left: int) -> QPushButton:
+        chip = QPushButton(f"+{left}", self.bar_box)
+        chip.setObjectName("CalMoreChip")
+        chip.setFixedSize(30, BAR_H - 1)
+        chip.setCursor(Qt.PointingHandCursor)
+        chip.setToolTip(f"这天还有 {left} 条没放下，点开看全部")
+        chip.clicked.connect(lambda _checked: self.more_clicked.emit(
+            self._date, chip.mapToGlobal(QPoint(0, chip.height()))))
+        self.more = chip
+        return chip
 
     # ------------------------------------------------------------ 交互
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -314,7 +370,7 @@ class MonthView(QWidget):
     bar_right = Signal(dict, QPoint)      # 右键色条 → 快捷菜单
     dropped = Signal(int, str, QDate)
     day_add = Signal(QDate, QPoint)
-    day_more = Signal(QDate)
+    day_more = Signal(QDate, QPoint)
     anchor_changed = Signal(QDate)      # 滚动跨月后告诉外面「现在顶到几月了」
 
     ROW_MIN = 150        # 行高下限
@@ -327,6 +383,7 @@ class MonthView(QWidget):
         self._weeks: list[list[QDate]] = []
         self._mid = 0                    # 本月第一周在 _weeks 里的下标
         self._cells: list[DayCell] = []
+        self._laid = None                # 上一次 _layout 建出来的 (锚点月, 带子)
         self._provider = None
         self._rows: dict[str, list[dict]] = {}
         self._row_h = 194
@@ -401,6 +458,15 @@ class MonthView(QWidget):
     def set_provider(self, fn) -> None:
         """fn(start_iso, end_iso) -> {日期: [条目]}；挪带子时由视图自己取数。"""
         self._provider = fn
+
+    def day_rows(self, date: QDate) -> list[dict]:
+        """那天当前显示的条目：和格子里同一份，筛选掉的不会漏进「+N」浮层。"""
+        return list(self._rows.get(model.iso(date), []))
+
+    def invalidate_bars(self) -> None:
+        """换肤用：条的颜色是建的时候烤进内联样式的，签名没变也要重画一遍。"""
+        for cell in self._cells:
+            cell.force_rebuild()
 
     def show_month(self, anchor: QDate, keep_top: QDate | None = None) -> None:
         self._anim.stop()
@@ -487,28 +553,21 @@ class MonthView(QWidget):
         之前是拿 viewport().width() 手算绝对坐标，但首次布局时视口还没定型
         （宽 640、稳定后 1324），坐标和宽度来自两次不同的测量，格子会叠成
         一片空白。让 QGridLayout 自己分配就没这个时序问题。
+
+        格子只在「带子的日期变了 / 换了锚点月」时才重建。改一条数据、拖一下
+        窗口都不该把 126 个控件删了重做 —— 实测整月重建一次 420ms，而拖动
+        窗口会连着触发几十次，那就是明晃晃的卡顿。
         """
-        for c in self._cells:
-            c.deleteLater()
-        self._cells.clear()
-        while self.grid.count():
-            it = self.grid.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+        key = (self._anchor.month(), [list(w) for w in self._weeks])
+        if self._cells and self._laid == key:
+            self._apply_row_height()
+            self._refresh_rows()
+            return
+        self._teardown_cells()
+        self._laid = key
         if not self._weeks:
             return
-        self._row_h = self._row_height()
         rows = len(self._weeks)
-        # 先把旧的行高设置清空：从月视图（18 行）切到多周（2 行）时，
-        # 残留的 16 行最小高度还挂在那儿，网格会把 941px 平摊给 18 行，
-        # 每格只剩 53px，多周视图被压成顶部两条细条。
-        for r in range(max(self.grid.rowCount(), rows)):
-            self.grid.setRowMinimumHeight(r, 0)
-            self.grid.setRowStretch(r, 0)
-        for r in range(rows):
-            self.grid.setRowMinimumHeight(r, self._row_h)
-        for c, d in enumerate(self._weeks[0]):
-            self.grid.setColumnStretch(c, 1)
         for r, week in enumerate(self._weeks):
             last = (r == rows - 1) and self._mode == "weeks2"
             for c, d in enumerate(week):
@@ -523,6 +582,39 @@ class MonthView(QWidget):
                 self.grid.addWidget(cell, r, c)
                 cell.show()
                 self._cells.append(cell)
+        self._apply_row_height()
+
+    def _teardown_cells(self) -> None:
+        # deleteLater 之前先藏起来：旧格子会带着旧几何再画一帧，换月时肉眼就是一闪
+        for cell in self._cells:
+            cell.hide()
+            cell.deleteLater()
+        self._cells.clear()
+        while self.grid.count():
+            it = self.grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+            del it
+
+    def _refresh_rows(self) -> None:
+        """格子不动，只换每格里的条（_rebuild 会重建条，颜色随当前主题）。"""
+        for i, week in enumerate(self._weeks):
+            for c, d in enumerate(week):
+                self._cells[i * 7 + c].set_rows(self._rows.get(model.iso(d), []))
+
+    def _apply_row_height(self) -> None:
+        self._row_h = self._row_height()
+        rows = len(self._weeks)
+        # 先把旧的行高设置清空：从月视图（18 行）切到多周（2 行）时，
+        # 残留的 16 行最小高度还挂在那儿，网格会把 941px 平摊给 18 行，
+        # 每格只剩 53px，多周视图被压成顶部两条细条。
+        for r in range(max(self.grid.rowCount(), rows)):
+            self.grid.setRowMinimumHeight(r, 0)
+            self.grid.setRowStretch(r, 0)
+        for r in range(rows):
+            self.grid.setRowMinimumHeight(r, self._row_h)
+        for c in range(7):
+            self.grid.setColumnStretch(c, 1)
         self.content.setFixedHeight(max(rows * self._row_h,
                                       self.scroll.viewport().height()))
 

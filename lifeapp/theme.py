@@ -1516,7 +1516,6 @@ class ThemeManager(QObject):
         self._app = app
         self._dark = False
         self._colors = dict(LIGHT)
-        self._anim: QVariantAnimation | None = None
 
     @property
     def is_dark(self) -> bool:

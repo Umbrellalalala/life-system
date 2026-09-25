@@ -114,9 +114,9 @@ def restore_all() -> None:
         note._apply_saved_geom()
 
 
-def _rows(sql: str) -> list:
+def _rows(sql: str, args: tuple = ()) -> list:
     with db.connect() as conn:
-        return conn.execute(sql).fetchall()
+        return conn.execute(sql, args).fetchall()
 
 
 def _geom_map() -> dict:
@@ -264,13 +264,20 @@ class StickyNote(QFrame):
         return date.today().isoformat()
 
     def _is_done(self, t: dict) -> bool:
-        """重复任务的勾记在「哪一周期」上，`todos.done` 那一位从来不动。
-        所以直接读 t["done"] 会画成永远没勾上 —— 用户看着就是「勾了弹回来」。"""
+        """重复系列的勾记在 todo_occ 的「哪一周期」上，`todos.done` 那一位从来不动 ——
+        照着 t["done"] 画就永远显示没勾，用户看着是「勾了又弹回来」。便签没有
+        「是哪一天」的概念，按今天这一周期问一次。
+
+        不借日历的条目表算：那张表按 due_date 筛，一条被单周期挪出今天的周期
+        （把周四的健身拖到周五）在里面根本不存在，勾会假弹回；而 todo_list()
+        默认就排除垃圾桶和归档，所以也不用担心已删任务留下的旧例外行。
+        """
         if not (t.get("repeat") or "").strip():
             return bool(t["done"])
-        return any(r["done"] for r in services.cal_occurrences(self._today(),
-                                                              self._today())
-                   if r["id"] == self._id)
+        rows = _rows("SELECT status FROM todo_occ "
+                     "WHERE todo_id = ? AND occ_date = ?",
+                     (self._id, self._today()))
+        return bool(rows) and (rows[0]["status"] or "") == "done"
 
     def _on_check(self, checked: bool) -> None:
         # 周期日不能传空串：occ_set_done 会写出一条 occ_date='' 的例外，

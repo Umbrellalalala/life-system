@@ -202,6 +202,28 @@ QPushButton#CalMore {{
     background: transparent; border: none; color: {g('muted')};
     font-size: 12px; text-align: left; padding: 1px 6px; }}
 QPushButton#CalMore:hover {{ color: {g('accent')}; }}
+/* 月视图格子里的溢出角标：滴答把它挤在最后一根条的右边，不另占一行。
+   底色不能用 bg_alt —— 浅色主题下它和格子一样是纯白，角标会整个看不见 */
+QPushButton#CalMoreChip {{
+    background: {g('surface_hi')}; border: none; border-radius: 4px;
+    color: {g('muted')}; font-size: 11.5px; padding: 0; }}
+QPushButton#CalMoreChip:hover {{ background: {g('border_strong')}; color: {g('text')}; }}
+
+/* ---------- 格子「+N」点开当天的浮层 ---------- */
+QFrame#CalDayCard {{
+    background: {g('surface')}; border: 1px solid {g('border')};
+    border-radius: 12px; }}
+QLabel#CalDayPopDate {{
+    color: {g('text')}; font-size: 14px; font-weight: 600;
+    background: transparent; }}
+QScrollArea#CalDayPopScroll {{ background: transparent; border: none; }}
+QScrollArea#CalDayPopScroll > QWidget > QWidget {{ background: transparent; }}
+QScrollBar#CalDayPopBar:vertical {{
+    width: 6px; background: transparent; margin: 2px 1px 2px 2px; }}
+QScrollBar#CalDayPopBar:vertical::handle {{
+    background: {g('border_strong')}; border-radius: 3px; min-height: 28px; }}
+QScrollBar#CalDayPopBar:vertical::add-page,
+QScrollBar#CalDayPopBar:vertical::sub-page {{ background: transparent; }}
 
 /* ---------- 时间轴 ---------- */
 QFrame#CalTimeHead {{ background: {g('bg_alt')}; border-bottom: 1px solid {g('border')}; }}

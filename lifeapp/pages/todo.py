@@ -270,6 +270,23 @@ def _settled(t: dict) -> bool:
     return bool(t["done"]) or bool(t.get("abandoned"))
 
 
+def _review_date_guard(owner, todo_id: int) -> bool:
+    """复习大任务那天的日期是刷题页排出来的，待办这边改不得。
+
+    挪一下 `todos.due_date`，`*_reviews.due_date` 和 `problems.next_review`
+    就和待办对不上了；而 `_review_day_task` 是信映射行的 —— 别的日子排出来的题目
+    会跟着挂到这条上，「一天一门课一条」的不变量当场破掉。
+    日历同一件事是直接灰掉（`task_card._apply_lock`），这里给一句去哪儿改。
+    """
+    who = services.review_page_of_todo(todo_id)
+    if not who:
+        return True
+    popups.notify(owner, "这条日期改不了",
+                  f"这天的复习是「{who}」页排出来的。\n"
+                  f"要挪日期，请到「{who}」页改那道题的下次复习。")
+    return False
+
+
 def _group_label(key: str, items: list) -> str:
     """分组标题。滴答会把日期分组写成「今天, 周六」这种带星期的形式。"""
     today = QDate.currentDate()
@@ -1851,6 +1868,7 @@ class TaskListArea(QScrollArea):
     keyActivate = Signal(str)             # "space" 勾选 / "enter" 开详情
     keyDelete = Signal()
     keyEscape = Signal()
+    keyRename = Signal()                  # F2，资源管理器那个改名键
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1912,6 +1930,8 @@ class TaskListArea(QScrollArea):
             self.keyDelete.emit()
         elif k == Qt.Key_Escape:
             self.keyEscape.emit()
+        elif k == Qt.Key_F2:
+            self.keyRename.emit()
         else:
             super().keyPressEvent(event)
             return
@@ -3901,6 +3921,14 @@ class DetailPane(QFrame):
             self._task.get("title") or "")
         dirty_note = same and self._current_note() != (
             self._task.get("note") or "")
+        # 上面两条比的是「库里旧值 vs 框里的字」。防抖落库时会先把新值同步进
+        # self._task，于是两条都判成「不脏」，这里就把一模一样的内容重灌一遍 ——
+        # 光标弹回开头，打字每停 500ms 跳一次。再比一次「和要装的新值一样吗」，
+        # 一样就根本不碰这两个框（光标、滚动位置都留在原处）。
+        keep_title = same and self.title_input.toPlainText() == (
+            task.get("title") or "")
+        keep_note = same and self._current_note() == (
+            (task.get("note") or "").strip())
         self._task = task
         self._occ = occ
         self._disp_date = disp_date
@@ -3912,16 +3940,18 @@ class DetailPane(QFrame):
         self._foot.show()
         self._foot_line.show()
         self.scroll.show()
-        if not dirty_title:
+        if not dirty_title and not keep_title:
             self.title_input.setPlainText(task["title"])
-        if not dirty_note:
+        if not dirty_note and not keep_note:
             self._load_md(self.note_input, task.get("note") or "")
         self._link_url = _first_url(task)
         self.link_btn.setVisible(bool(self._link_url))
         if self._link_url:
             self.link_btn.setToolTip("在浏览器打开\n%s" % self._link_url)
         self.flag.set_priority(task.get("priority", 0))
-        self.done_check.set_checked(bool(task.get("done")))
+        # 放弃的在行上是「勾着 + ✕」，详情这枚框也必须显示成勾着，
+        # 否则同一条任务在两个地方说法不一样
+        self.done_check.set_checked(_settled(task))
         self.done_check.set_priority(task.get("priority", 0))
         self._sync_date_row()
         self._sync_list_rows()
@@ -4007,6 +4037,12 @@ class DetailPane(QFrame):
     def _on_check(self, checked: bool) -> None:
         if self._loading or not self._task:
             return
+        if (not checked and int(self._task.get("abandoned") or 0)
+                and not int(self._task.get("done") or 0)):
+            # 框上那个「勾」其实是放弃的 ✕：取消它 = 回到待做。
+            # 只写 done=0 的话框还是勾着的，看着像点了没反应
+            services.todo_update(self._task["id"], abandoned=0)
+            self._task["abandoned"] = 0
         self._task["done"] = int(checked)
         services.occ_set_done(self._task["id"], self._occ, checked)
         if checked and not _review_ask_group(self, self._task["id"]):
@@ -4240,6 +4276,8 @@ class DetailPane(QFrame):
     def _on_date_picked(self, date: str, time_v: str, end_date: str = "",
                         end_time: str = "") -> None:
         if not self._task:
+            return
+        if not _review_date_guard(self, self._task["id"]):
             return
         if self._occ:
             # 从周期打开的就只挪这个周期，其它周期留在系列原位
@@ -5442,6 +5480,7 @@ class TodoPage(QWidget):
         self.list_widget.keyMove.connect(self._on_key_move)
         self.list_widget.keyActivate.connect(self._on_key_activate)
         self.list_widget.keyDelete.connect(self._on_key_delete)
+        self.list_widget.keyRename.connect(self._on_key_rename)
         self.list_widget.keyEscape.connect(
             lambda: self._close_detail(keep_cursor=True))
         lay.addWidget(self.list_widget, 1)
@@ -6547,6 +6586,16 @@ class TodoPage(QWidget):
             return
         self._delete_task(self._selected_id, self._selected_occ())
 
+    def _on_key_rename(self) -> None:
+        """F2 就地改名 —— 改名这件事以前只有鼠标能做（右键菜单或双击标题）。
+
+        `at=None` 走的是键盘那支：标题整条预选好，直接敲新的就覆盖，
+        和鼠标按出来时光标落在点击位置是两套，别混。
+        """
+        row = self._items.get(self._selected_id) if self._selected_id else None
+        if row is not None:
+            row._start_rename()
+
     def _show_detail(self, todo_id: int, occ: str = "", disp_date: str = "",
                      disp_time: str = "") -> None:
         # 复习大任务点开就是详情：这天要复习的题目都挂在下面的检查事项里，
@@ -6700,6 +6749,9 @@ class TodoPage(QWidget):
                  "detail": self._row_detail, "countdown": self._show_countdown,
                  "checks": self._show_checks}
         menu = MoreMenuPopup(state, self.more_btn)
+        # 切完视图面板不关（滴答也是不关），不连着 set_view 的话
+        # 列表→看板之后，那一排还亮着「列表」
+        menu.viewPicked.connect(menu.set_view)
         menu.viewPicked.connect(self._on_view_mode)
         menu.toggled.connect(self._on_display_toggle)
         menu.picked.connect(self._on_more_action)
@@ -6732,7 +6784,7 @@ class TodoPage(QWidget):
 
     def _on_more_action(self, value: str) -> None:
         if value == "clear_done":
-            done = [t for t in services.todo_list() if t["done"]]
+            done = [t for t in services.todo_list() if _settled(t)]
             # 以前点一下立刻把整批已完成塞进垃圾桶，一条不问、也不说动了几条
             if not done or not popups.confirm(
                     self, "清空已完成",
@@ -6958,6 +7010,8 @@ class TodoPage(QWidget):
         重复任务没有「这一周期不排日期」这种状态 —— 日期是规则算出来的，
         唯一等价的表达就是这一次不做。
         """
+        if not _review_date_guard(self, todo_id):
+            return
         if recurring and occ:
             services.occ_delete(todo_id, occ)
         else:
@@ -6971,6 +7025,8 @@ class TodoPage(QWidget):
         重复任务只能改这一个周期（日历里那些日期是排期算出来的，没有存字段），
         所以跨天范围那一档对它没意义，只走 occ_move。
         """
+        if not _review_date_guard(self, todo_id):
+            return
         init = t.get("due_date") or QDate.currentDate().toString("yyyy-MM-dd")
         pop = DatePickerPopup(init, t.get("due_time") or "",
                               repeat=t.get("repeat") or "",
@@ -7493,7 +7549,14 @@ class TodoPage(QWidget):
                 from ..todo_dialogs import ListDialog
                 ListDialog(self, list_row=lst).exec()
                 self._rebuild_nav()
-                self.reload()
+                # 改的正是当前这张清单：导航 key 是 list:{名字}，不跟着换
+                # 的话 _collect 按旧名字匹配不到任何一条，视图原地空掉，
+                # 快速添加还会把新任务写进已经不存在的清单名里
+                new_name = (services.list_get(lst["id"]) or {}).get("name") or ""
+                if self._view == "list:%s" % lst["name"] and new_name:
+                    self._set_view("list:%s" % new_name)
+                else:
+                    self.reload()
             elif v == "pin":
                 services.list_update(lst["id"], pinned=0 if lst.get("pinned") else 1)
                 self._rebuild_nav()

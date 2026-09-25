@@ -795,6 +795,26 @@ class MenuIcon(QWidget):
             p.setBrush(_c(self._color_key))
             p.setPen(Qt.NoPen)
             p.drawEllipse(c, s * 0.10, s * 0.10)
+        elif k == "edit":
+            # 铅笔：斜杆 + 笔尖小三角（常用专注菜单「编辑」）
+            p.drawLine(QPointF(s * 0.24, s * 0.76), QPointF(s * 0.70, s * 0.30))
+            p.drawLine(QPointF(s * 0.70, s * 0.30), QPointF(s * 0.82, s * 0.42))
+            p.drawLine(QPointF(s * 0.82, s * 0.42), QPointF(s * 0.36, s * 0.88))
+            p.drawLine(QPointF(s * 0.36, s * 0.88), QPointF(s * 0.24, s * 0.76))
+            p.drawLine(QPointF(s * 0.62, s * 0.22), QPointF(s * 0.70, s * 0.30))
+            p.drawLine(QPointF(s * 0.70, s * 0.30), QPointF(s * 0.78, s * 0.22))
+            p.drawLine(QPointF(s * 0.78, s * 0.22), QPointF(s * 0.62, s * 0.22))
+        elif k == "add_record":
+            # 加号：常用专注菜单「添加记录」，和主页那枚 ＋ 同一种笔划
+            p.drawLine(QPointF(s * 0.50, s * 0.18), QPointF(s * 0.50, s * 0.82))
+            p.drawLine(QPointF(s * 0.18, s * 0.50), QPointF(s * 0.82, s * 0.50))
+        elif k == "archive":
+            # 归档箱：上盖 + 箱体 + 中间一道提手缝
+            p.drawRoundedRect(QRectF(s * 0.12, s * 0.20, s * 0.76, s * 0.20),
+                              2, 2)
+            p.drawRoundedRect(QRectF(s * 0.20, s * 0.40, s * 0.60, s * 0.42),
+                              2, 2)
+            p.drawLine(QPointF(s * 0.40, s * 0.58), QPointF(s * 0.60, s * 0.58))
         elif k == "tomato":
             # 详情卡标题那枚图标是**蓝盘 + 白色番茄**（凹口露出蓝盘本色），
             # 和记录轨道上的「淡蓝盘 + 蓝色番茄」正好反色，两处不要合并。

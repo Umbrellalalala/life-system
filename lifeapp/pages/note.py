@@ -108,6 +108,7 @@ _RECENT_COL = 64           # 「最近」视图第二列要放得下「3 个月�
 _COUNT_COL = 34
 _MAX_BACKLINKS = 12       # 反向链接面板条数上限，超出会在面板里说明
 _POS_KEEP = 300           # 阅读位置最多记几篇，超了丢最旧的
+_MATH_CACHE_MAX = 3000    # 公式图缓存上限，超了整表清掉（重画一张不到 1ms）
 _HEADING_TOP_PAD = 6       # 跳标题时留一点上边距，别贴着卡片边缘
 _IMAGE_OBJECT = int(QTextFormat.ImageObject)
 
@@ -456,6 +457,7 @@ class NotePage(Page):
         self._html = ""                   # 当前这篇渲染出的 HTML，改宽时重夹图片要用
         self._math_imgs: dict[str, QImage] = {}
         self._math_avail = 0.0
+        self._math_fp: dict = {}
         self._math_cache: dict[tuple, object] = {}   # tex/字号/色 -> QImage
         self._pos_map: dict[str, list] = {}         # rel -> [滚动位置, 当时文档高, 时间]
         self._pos_pending = ""              # 还没放到位的那篇（图下来后还要再校正）
@@ -495,8 +497,14 @@ class NotePage(Page):
         # 大纲：点一下在本应用内滚过去，Ctrl+点交给 Obsidian 定位
         self.outline.jumpRequested.connect(self._on_outline_jump)
         self.preview.verticalScrollBar().valueChanged.connect(
-            self._sync_outline_current)
+            self._on_preview_scroll)
         self.preview.verticalScrollBar().valueChanged.connect(self._note_scrolled)
+        # 大纲高亮每帧刷一次的话，实测滚动从 7.6ms/格 涨到 18.9ms/格 ——
+        # 它每次换了条目都要去滚右侧那棵树。防抖 80ms，肉眼看不出差别。
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.setInterval(80)
+        self._sync_timer.timeout.connect(self._sync_outline_current)
         self._pos_timer = QTimer(self)
         self._pos_timer.setSingleShot(True)
         self._pos_timer.timeout.connect(self._save_pos)
@@ -784,8 +792,9 @@ class NotePage(Page):
             f"background: {surface}; border: 1px solid {border};"
             f" border-radius: 10px;")
         # QTextBrowser 默认 9pt、正文贴边，读起来像日志不像笔记。
-        # 注意：Qt 的样式表**不认 line-height**（写了也不生效），行距和代码块
-        # 换行要在 setHtml 之后用 QTextBlockFormat 设，见 _apply_doc_format()。
+        # 样式表里 line-height 不生效（写了没反应），但 white-space 是生效的 ——
+        # 代码块换行就靠下面那条 pre 规则；行距还得在 setHtml 之后用
+        # QTextBlockFormat 设，见 _apply_doc_format()。
         # 内边距交给 documentMargin，别在这里再叠一层 padding，两层会累加。
         self.preview.document().setDefaultStyleSheet(f"""
             body {{ color: {text}; font-size: 10.5pt; }}
@@ -799,7 +808,13 @@ class NotePage(Page):
             code {{ font-family: Consolas, 'Courier New', monospace;
                     background: {surface_hi}; border-radius: 3px;
                     padding: 1px 4px; font-size: 10pt; }}
+            /* white-space 是关键：Qt 把 <pre> 导成「不可断行」块，长代码行会把
+               文档撑宽；而横向滚动条是关掉的，撑宽就等于看不见。这条顶原来
+               整篇 mergeBlockFormat(setNonBreakableLines(False)) 那一刀 ——
+               实测同样折得下来，但省掉打开一篇的 ~900ms。
+               （对比：Qt 的样式表**不认** line-height，写了没反应。） */
             pre {{ font-family: Consolas, 'Courier New', monospace;
+                   white-space: pre-wrap;
                    background: {surface_hi}; padding: 10px; border-radius: 8px;
                    font-size: 10pt; }}
             table {{ border-collapse: collapse; }}
@@ -816,16 +831,17 @@ class NotePage(Page):
         self.preview.document().setDocumentMargin(18)
 
     def _apply_doc_format(self) -> None:
-        """整篇设行距 + 允许代码块换行。setHtml 之后必须重做一次：它会重建文档块。
+        """整篇设行距。setHtml 之后必须重做一次：它会重建文档块。
 
-        Qt 把 <pre> 导成「不可断行」的块，长代码行会把文档撑宽、底部冒横向滚动条；
-        这两件事在同一次 mergeBlockFormat 里做掉，比分开走两遍便宜。
+        代码块换行不再靠这里 —— 交给样式表里的 `pre { white-space: pre-wrap }`，
+        那一刀整篇 merge 只买得到每行 +1.4px。
+        另外它顺带把全文逼排了一遍，删掉之后远处标题的 layout().position()
+        会不准（点大纲落错地方），所以这行 merge 目前是有承重作用的。
         """
         cur = QTextCursor(self.preview.document())
         cur.select(QTextCursor.SelectionType.Document)
         fmt = QTextBlockFormat()
         fmt.setLineHeight(1.45, QTextBlockFormat.LineDistanceHeight.value)
-        fmt.setNonBreakableLines(False)
         cur.mergeBlockFormat(fmt)
 
     # ---------------------------------------------------------------- 右：面板
@@ -971,6 +987,9 @@ class NotePage(Page):
         self._pos_applying = True
         sb.setValue(target)
         self._pos_applying = False
+
+    def _on_preview_scroll(self, value: int) -> None:
+        self._sync_timer.start()
 
     def _note_scrolled(self, _value: int) -> None:
         """用户自己滚走了就别再抢他的位置；同时防抖存一次当前位置。"""
@@ -1333,18 +1352,27 @@ class NotePage(Page):
 
         def repl(m: re.Match, display: bool) -> str:
             tex = unquote(m.group(1))
+            size = px * (1.12 if display else 1.0)
             try:
-                ck = (tex, round(px, 1), round(avail), color, display)
-                got = self._math_cache.get(ck)
-                if got is None:
-                    # max_w：太长就在 = + , 处折行。Qt 排行内图片按图片自身宽度算
-                    # 文档宽度，写 width= 和调 devicePixelRatio 都压不住，只能在源头断。
-                    got = mathtex.render(
-                        tex, px=px * (1.12 if display else 1.0),
-                        color=color, display=display, dpr=dpr,
-                        max_w=avail)[0]
-                    self._math_cache[ck] = got
-                img = got
+                rpx = round(size, 1)
+                ck0 = (tex, rpx, color, display)
+                img = self._math_cache.get(ck0)
+                if img is None:
+                    img = mathtex.render(tex, px=size, color=color,
+                                         display=display, dpr=dpr)[0]
+                    self._math_cache[ck0] = img
+                if img.width() / dpr > avail:
+                    # 自然宽度放得下的，改窗口不必重画 —— 之前把 avail 塞进缓存键，
+                    # 拖一次窗口就把整篇 436 条重排一遍（实测 1.9 秒）。
+                    # 真放不下的才按宽度重排，宽度按 160px 分档，避免逐像素失效。
+                    ck1 = (tex, rpx, color, display, int(avail) // 160)
+                    got = self._math_cache.get(ck1)
+                    if got is None:
+                        got = mathtex.render(tex, px=size, color=color,
+                                             display=display, dpr=dpr,
+                                             max_w=avail)[0]
+                        self._math_cache[ck1] = got
+                    img = got
             except Exception:
                 return m.group(0)
             # 折行管不了「单个原子就超宽」（一长串 \text{}、一个大括号），只能整体缩。
@@ -1373,7 +1401,11 @@ class NotePage(Page):
             pos = head.end()
         out.append(sub(html[pos:]))
         self._math_imgs = pending
+        self._math_fp = {
+            k: (v.width(), v.height()) for k, v in pending.items()}
         self._math_avail = avail
+        if len(self._math_cache) > _MATH_CACHE_MAX:
+            self._math_cache.clear()      # 别攒着几百篇之前看过的
         return "".join(out)
 
     def _img_limit(self) -> int:
@@ -1415,10 +1447,18 @@ class NotePage(Page):
             doc.markContentsDirty(0, doc.characterCount())
         if self._raw_html and abs(avail - self._math_avail) > 2:
             top = self.preview.verticalScrollBar().value()
+            was_html, was_fp = self._html, self._math_fp
             try:
-                self._html = self._mathify(self._raw_html)
+                new_html = self._mathify(self._raw_html)
             except Exception:
                 return
+            # 标签没变 **且每张公式图的尺寸也没变** 才跳过。光比 HTML 会漏：
+            # src 里不含宽度，按新宽度重排后是「同样的标签、换了像素」，
+            # 跳过的话超宽的图就留在窄视口里。注意要先存旧值 —— _mathify
+            # 自己会把 self._math_fp 刷新成新的。
+            if new_html == was_html and self._math_fp == was_fp:
+                return
+            self._html = new_html
             self.preview.setHtml(self._html)
             self._apply_doc_format()
             self._load_images(self._html)

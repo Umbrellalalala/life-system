@@ -134,13 +134,31 @@ class StatsView(QWidget):
         root.addWidget(self._column(head_w))
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_overview_tab())
-        self.stack.addWidget(self._build_task_tab())
-        self.stack.addWidget(self._build_focus_tab())
+        # 三个签全建一遍实测 157ms，而打开统计页只会看到其中一个 —— 另外两个
+        # 是白等的头两帧。先各挂一个空壳，第一次真去看它时才建它。
+        self._tab_builders = [self._build_overview_tab,
+                              self._build_task_tab,
+                              self._build_focus_tab]
+        self._tab_built = [False] * len(self._tab_builders)
+        for _ in self._tab_builders:
+            self.stack.addWidget(QWidget())
         root.addWidget(self.stack, 1)
         self.stack.setCurrentIndex(self._start_tab)
+        self._ensure_tab(self._start_tab)
         self.tabs.changed.connect(self._on_tab)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
+
+    def _ensure_tab(self, idx: int) -> None:
+        """把第 idx 个页签真正建出来（建过的直接返回）。"""
+        if self._tab_built[idx]:
+            return
+        self._tab_built[idx] = True          # 先置位，别让它回头再触发自己
+        host = self._tab_builders[idx]()
+        old = self.stack.widget(idx)
+        self.stack.removeWidget(old)
+        old.deleteLater()
+        self.stack.insertWidget(idx, host)
+        self.stack.setCurrentIndex(idx)      # 摘占位时当前索引会漂
 
     @staticmethod
     def _saved_tab() -> int:
@@ -829,6 +847,7 @@ class StatsView(QWidget):
             self._style_band()
 
     def _on_tab(self, idx: int) -> None:
+        self._ensure_tab(idx)
         self.stack.setCurrentIndex(idx)
         db.set_setting("focus_stats_tab", str(idx))
         self._refresh_tab(idx)
@@ -949,7 +968,11 @@ class StatsView(QWidget):
 
         daily = services.pomodoro_range_daily(start.isoformat(), end.isoformat())
         total_min = sum(d["minutes"] for d in daily)
-        avg = total_min / max(len(daily), 1)
+        # 平均只除以「已经过去的天数」。daily 是逐日补 0 的，当月 25 号去算
+        # len(daily) 会把还没来的 5 天当成 0 分钟一起摊平（年视图更夸张：365 天
+        # 里只有 268 天发生过）。热力图那边同样按今天截断，这里得一致。
+        elapsed = max((min(end, date.today()) - start).days + 1, 1)
+        avg = total_min / elapsed
 
         # 专注趋势
         if hasattr(self, "fc_trend"):

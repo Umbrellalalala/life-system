@@ -114,6 +114,24 @@ def _is_hidden(name: str) -> bool:
     return name.startswith(".") or name in _SKIP_DIRS
 
 
+def count_notes(root: str | None = None) -> int:
+    """只数「有多少篇 md」，不建附件索引、也不给每个文件取 mtime/ctime。
+
+    设置页那行标签以前写的是 `len(iter_notes(root))` —— 为了显示一个数字，
+    启动时整库走一遍外加每文件两次 stat（实测 152ms，是 MainWindow 构造里
+    最大的一块）。数字要的是同一个口径，所以过滤规则和 iter_notes 保持一致。
+    """
+    root = root or vault_path()
+    if not root:
+        return 0
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not _is_hidden(d)]
+        n += sum(1 for fn in filenames
+                 if not _is_hidden(fn) and fn.lower().endswith(_MD_EXT))
+    return n
+
+
 def iter_notes(root: str | None = None) -> list[dict]:
     """遍历 vault 里的笔记，按「文件夹 / 标题」排序。
 

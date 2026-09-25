@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
 
 from ... import popups, services, sounds, theme, widgets
 from ..base import Page
-from ..todo import DatePickerPopup, _review_ask_sub
-from . import model, style
+from ..todo import DatePickerPopup, _review_ask_group
+from . import day_popup, model, style
 from .feed_popup import FeedPopup
 from .month_view import MonthView
 from .new_card import NewTaskCard
@@ -48,6 +48,24 @@ def _panel_icon(size: int = 18) -> QIcon:
     p.drawLine(QPointF(ax - 1.4, cy), QPointF(ax + 2.2, cy + 2.6))
     p.end()
     return QIcon(pm)
+
+
+def _place_at(pop: QWidget, pos: QPoint) -> None:
+    """摆在给定全局坐标的下方，四个方向都夹回屏幕内。
+
+    原先只夹了下和右：贴屏幕左缘时 x 会是负数；底部那一行还会把 y 夹成
+    「上限 < 下限」，整块弹层跑到屏幕外，看着就是点了没反应。
+    """
+    pop.adjustSize()
+    scr = (pop.screen() or QApplication.primaryScreen()).availableGeometry()
+    x = min(max(pos.x(), scr.left() + 4),
+            max(scr.left() + 4, scr.right() - pop.width() - 4))
+    y = pos.y() + 4
+    if y + pop.height() > scr.bottom():
+        y = pos.y() - pop.height() - 8        # 下面放不下就翻到上面
+    y = min(max(y, scr.top() + 4),
+            max(scr.top() + 4, scr.bottom() - pop.height() - 4))
+    pop.move(x, y)
 
 
 class TitleButton(QFrame):
@@ -108,6 +126,7 @@ class CalendarPage(Page):
         self._card: TaskCard | None = None
         self._quick: NewTaskCard | None = None
         self._feeds: FeedPopup | None = None
+        self._day_pop: day_popup.DayPopup | None = None
         self._shown: tuple = ()        # 已渲染的 (视图, 年月)，用来区分「换月」和「原地刷新」
 
         style.apply_to(self)
@@ -124,6 +143,9 @@ class CalendarPage(Page):
         for m in (self, self.panel, self.drawer):
             m.style().unpolish(m)
             m.style().polish(m)
+        # 色条的颜色不走 QSS —— 是建条时按当时主题算好塞进内联样式的。光换 QSS
+        # 会留下一屏上一套主题的条，要等到下次数据变化才被被动纠正
+        self.month.invalidate_bars()
 
     # ------------------------------------------------------------ 头部
     def _build_header(self) -> None:
@@ -194,7 +216,10 @@ class CalendarPage(Page):
             view.bar_clicked.connect(self._open_card)
             view.bar_right.connect(self._row_menu)
             view.dropped.connect(self._on_dropped)
-            view.day_more.connect(self._focus_day)
+        # 时间轴的「+N」切到当天视图；月视图那一格改成弹当天的清单（滴答的做法），
+        # 只是为了看全那天的事，不该把用户整页带走
+        self.grid.day_more.connect(self._focus_day)
+        self.month.day_more.connect(self._open_day_popup)
         self.month.set_provider(
             lambda s, e: model.group_by_date(model.parse(s), model.parse(e), self._f))
         self.month.anchor_changed.connect(self._on_anchor_changed)
@@ -296,6 +321,22 @@ class CalendarPage(Page):
         self._view = "day"
         self._shown = ()
         self.refresh()
+
+    def _open_day_popup(self, d: QDate, pos: QPoint) -> None:
+        """格子里的「+N」→ 弹出当天的完整清单。"""
+        self._close_day_popup()
+        pop = day_popup.DayPopup(d, self.month.day_rows(d), parent=self)
+        self._day_pop = pop       # 局部变量的话会被 Python 提前回收
+        pop.bar_clicked.connect(self._open_card)
+        pop.show()
+        _place_at(pop, pos)
+
+    def _close_day_popup(self) -> None:
+        """刷新 / 换视图 / 拖窗口都要收掉：浮层里是打开那一刻的快照，
+        留着就会指着错的格子显示一份过期的当天清单。"""
+        if self._day_pop is not None:
+            self._day_pop.close()
+            self._day_pop = None
 
     def _build_view_menu(self) -> QMenu:
         """建菜单和弹菜单分开：exec 是模态的，拆开才测得到内容。"""
@@ -466,9 +507,9 @@ class CalendarPage(Page):
         """重画当前视图。keep_card=True 用于卡片内部编辑后刷新，
         否则改个优先级就会把正在编辑的卡片自己关掉。"""
         start, end = self._window()
-        rows = model.group_by_date(start, end, self._f)
         if not keep_card:
             self._close_card()
+        self._close_day_popup()   # 浮层是打开那一刻的快照，数据一动就该收掉
 
         key = (self._view, self._anchor.year(), self._anchor.month())
         if self._view == "month":
@@ -486,7 +527,9 @@ class CalendarPage(Page):
                  else model.sunday_week_start(self._anchor))
             days = [s.addDays(i) for i in range(n)]
             self.stack.setCurrentWidget(self.grid)
-            self.grid.show_days(days, rows)
+            # 只有时间轴要这份按天分组的行；月视图那两分支由 provider 自己取
+            # 更宽的带子，在这儿算一份是白查一遍全库
+            self.grid.show_days(days, model.group_by_date(start, end, self._f))
 
         self._shown = key
         self._sync_title(start, end)
@@ -602,8 +645,8 @@ class CalendarPage(Page):
         tid = int(row["id"])
         todo = services.todo_get(tid)
         if not todo or int(todo.get("duration_min") or 0) == mins:
-            self.refresh()          # 没变也要把拖动中的临时高度复位
-            return
+            self.refresh(keep_card=True)   # 没变也要把拖动中的临时高度复位；
+            return                          # 但别把用户正开着的卡片顺手关掉
         services.todo_update(tid, duration_min=mins)
         self._card_changed()
 
@@ -635,12 +678,8 @@ class CalendarPage(Page):
         self._menu_picker = pop       # 局部变量的话会被 Python 提前回收
         pop.accepted.connect(
             lambda d_s, t_s, *_rest: self._menu_date_picked(row, d_s, t_s))
-        scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         pos = getattr(self, "_menu_pos", QPoint())
-        pop.adjustSize()
-        pop.move(min(max(pos.x(), scr.left() + 4), scr.right() - pop.width() - 4),
-                 min(max(pos.y() + 4, scr.top() + 4),
-                     scr.bottom() - pop.height() - 4))
+        _place_at(pop, pos)
         pop.show()
 
     def _menu_date_picked(self, row: dict, date_s: str, time_s: str,
@@ -667,19 +706,11 @@ class CalendarPage(Page):
         elif verb == "tag_new":
             self._menu_tag_new(tid)
         elif verb == "done":
-            sid = int(row.get("sub_id") or 0)
-            if sid:
-                # 摊出来的一道题：勾它等于在待办页勾那个子任务，所以问结论这一步
-                # 不能省 —— 不问就是不答，答不答决定这题往下走一档还是退一档。
-                # 没答的话 _review_ask_sub 自己会把 done 退回 0。
-                services.subtask_update(sid, done=1 if payload else 0)
-                if payload:
-                    _review_ask_sub(self, {"id": sid})
-                # 待办页靠这个版本号决定切回去要不要重刷：不问结论的那两种改勾
-                # （取消勾、勾一条用户自己加的检查事项）services 那边不会 bump。
-                services.bump_review_rev()
-            else:
-                services.occ_set_done(tid, occ, bool(payload))
+            services.occ_set_done(tid, occ, bool(payload))
+            if payload and not _review_ask_group(self, tid):
+                # 复习大任务：这天名下的题目按同一个结论逐个结掉。没答就退回
+                # 未完成 —— 不问就把整天的题默认成「做出来了」，会越排越远。
+                services.occ_set_done(tid, occ, False)
         elif verb == "copy":
             self._menu_copy(row)
         elif verb == "convert":
@@ -749,7 +780,11 @@ class CalendarPage(Page):
         if scope is None:
             return
         if scope == "all":
-            services.todo_update(tid, repeat="", due_date="", due_time="")
+            # 必须走 todo_set_repeat —— 只有它会把这任务攒下的单周期例外
+            # （skipped / 改过期）一起删掉。留着的话哪天再把这条设成重复，
+            # 那些陈年例外会原封不动盖回来
+            services.todo_set_repeat(tid, "")
+            services.todo_update(tid, due_date="", due_time="")
         else:
             services.occ_delete(tid, occ)
 
@@ -796,13 +831,13 @@ class CalendarPage(Page):
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
-        # 复习排期是在刷题页改的：那边改了下次复习日，切回日历得看到它挪了日子
-        seen = getattr(self, "_seen_review_rev", None)
-        rev = services.review_rev()
-        self._seen_review_rev = rev
-        if seen is not None and seen != rev:
-            self.refresh()
+        # 切回这一页就重查一遍：待办页新加的、刷题页改的下次复习日，日历都不该
+        # 还停在上次的样子。原先只盯 review_rev，普通待办改了不刷新 —— 通用
+        # todo_rev 没有，与其到处补 bump（漏一处比现在更糟），不如每次显示重查。
+        # 格子已经不重建了，这一趟就是取个数、换每格的条。
+        self.refresh()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._close_card()
+        self._close_day_popup()   # 「+N」浮层钉在原来那个格子上，窗口一动就飘错位

@@ -102,6 +102,11 @@ def _aggregate(data: list[dict], gran: str) -> tuple[list[str], list[float], lis
         items = groups[k]
         vals = [v for v, _ in items]
         weights.append(round(sum(vals) / len(vals), 2))
+        # 聚合点回填的是**这一组里最近一次称重的那一天**。以前填的是代表日
+        # （周的周一、月的 1 号），点周视图上一个「只有周三称过」的点，
+        # 按周一去匹配就匹配不到任何记录，只能退回「按比例猜一个索引」，
+        # 于是弹出来的是另一周那条记录。
+        latest = max(ds for _v, ds in items)
         if gran == "day":
             labels.append(_short_label(k))
             subs.append(k[:4])
@@ -111,16 +116,16 @@ def _aggregate(data: list[dict], gran: str) -> tuple[list[str], list[float], lis
             sunday = monday + timedelta(days=6)
             labels.append(monday.strftime("%m/%d"))
             subs.append(f"~{sunday.strftime('%m/%d')}")
-            full_dates.append(monday.strftime("%Y-%m-%d"))
+            full_dates.append(latest)
         elif gran == "month":
             labels.append(f"{int(k[5:7])}月")
             subs.append(k[:4])
-            full_dates.append(k + "-01")
+            full_dates.append(latest)
         else:  # 季度
             y, q = k.split("-Q")
             labels.append(f"第{q}季")
             subs.append(y)
-            full_dates.append(f"{y}-{(int(q) - 1) * 3 + 1:02d}-01")
+            full_dates.append(latest)
     return labels, weights, subs, full_dates
 
 
@@ -533,9 +538,31 @@ class WeightPage(QWidget):
 
         self._build_hero()
         self._build_charts()
+        # 涨跌那些颜色是建控件时用 theme.get() 现算的十六进制，换肤只重贴 QSS、
+        # 不会重跑这里 —— 不接 changed 就得重启才跟上新主题（同 algo.py 的约定）。
+        self._theme_dirty = False
+        theme.manager.changed.connect(self._on_theme_changed)
         self._build_list()
 
         self.reload()
+
+    # ---------- 换肤 ----------
+    def _on_theme_changed(self) -> None:
+        """站着不动换肤就当场重算；人在别的页时别把整页重建一遍（标脏等回来）。
+
+        以前是无条件 `connect(self.reload)`：日/夜按钮在侧栏上，谁都可能在别的
+        页按下去，于是一次换肤白重建一次历史记录列表 + 两张图。
+        """
+        if self.isVisible():
+            self.reload()
+        else:
+            self._theme_dirty = True
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._theme_dirty:
+            self._theme_dirty = False
+            self.reload()
 
     # ---------- Hero 卡 ----------
     def _build_hero(self) -> None:
@@ -711,19 +738,10 @@ class WeightPage(QWidget):
         if idx >= len(full_dates):
             return
         target_date = full_dates[idx]
-        # 找到该日期对应的最近一条记录
-        rec = None
-        for r in reversed(data):
-            if r["date"] == target_date or (
-                    self._range != "day" and r["date"][:len(target_date)] == target_date):
-                rec = r
-                break
-        if rec is None:
-            # fallback: 用全局索引映射
-            n = len(data)
-            chunk = max(1, n // max(1, len(labels)))
-            est = min(n - 1, idx * chunk)
-            rec = data[est] if est < n else None
+        # `full_dates` 里存的就是这一组最近一次称重的那一天（_aggregate 保证），
+        # 所以按日期精确找。以前先按「周一 / 1 号」匹配、匹配不到再按比例猜索引 ——
+        # 记录数少于点数时那个猜法还会把两个不同的点映射到同一条记录。
+        rec = next((r for r in reversed(data) if r["date"] == target_date), None)
         if rec:
             self._edit(rec["id"])
 

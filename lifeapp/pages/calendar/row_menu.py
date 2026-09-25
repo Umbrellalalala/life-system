@@ -90,12 +90,10 @@ class RowMenu(QMenu):
         self._done_action()
         self._focus_menu()
         self.addSeparator()
-        # 摊出来的一道题只是父条名下的一条子任务：「创建副本」「转换为笔记」
-        # 动的是父条本体（那整天的复习），点在一道题上做出那种事太意外。
-        if not self.row.get("sub_id"):
+        if not self._who:
             self._flat("copy", "创建副本", "copy")
             self._convert_action()
-            self.addSeparator()
+        self.addSeparator()
         if self._who:
             # 删除一起收掉：这条待办是排期给那天合成的，删了只会剩下一堆
             # 指向已删待办的映射行。直接不摆会比摆个灰的清楚，但用户找不到

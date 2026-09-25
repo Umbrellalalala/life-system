@@ -172,7 +172,14 @@ class InterviewPage(Page):
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(120)
         self.search.setMaximumWidth(220)
-        self.search.textChanged.connect(self._reload_list)
+        # 和算法页同一件事：300 题时逐字符重建列表，敲一个词要等六七秒。
+        # 停 200ms 再筛，回车立刻筛。
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._reload_list)
+        self.search.textChanged.connect(self._search_timer.start)
+        self.search.returnPressed.connect(self._reload_list)
         bar.addWidget(self.search)
 
         self.tag_filter = widgets.ComboBox()
@@ -351,6 +358,8 @@ class InterviewPage(Page):
     def _reload_list(self) -> None:
         self._flush()
         prev = self._iid
+        # 和算法页同一件事：筛一次字不该把视口弹回顶部，先记位置、重建完再滚回来
+        saved = self.list.verticalScrollBar().value()
         self.list.blockSignals(True)
         self.list.clear()
         rows = services.interview_problem_list(
@@ -372,6 +381,7 @@ class InterviewPage(Page):
         self.list.blockSignals(False)
         # 行高要按视口真实宽度量，窄栏里才会折行而不是被裁掉
         self.list.fit_rows()
+        keep = prev != 0 and any(r["id"] == prev for r in rows)
         if not rows:
             self._iid = 0
         elif not any(r["id"] == prev for r in rows):
@@ -388,6 +398,9 @@ class InterviewPage(Page):
             len(rows),
             "（已归档）" if self._show_archived else "",
             "（只看到期）" if self._due_only else ""))
+        if keep:
+            sb = self.list.verticalScrollBar()
+            QTimer.singleShot(0, lambda: sb.setValue(saved))
 
     def focus_item(self, iid: int) -> None:
         """从待办页点复习条目跳进来：先把筛选全清掉，保证这道题一定在列表里。"""

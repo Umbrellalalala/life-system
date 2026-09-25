@@ -10,6 +10,7 @@ import sqlite3
 from collections import deque
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
+from contextlib import contextmanager
 from typing import Any, Optional
 
 from . import db
@@ -681,54 +682,8 @@ def _cal_row(t: dict, occ_s: str, ov: dict | None, tags: list[dict],
         "tags": tags,
         "sub_done": subs[0],
         "sub_total": subs[1],
-        "sub_id": 0,
         "sort": int(t.get("sort_order") or 0),
     }
-
-
-def _sub_cal_row(parent: dict, sub: dict) -> dict:
-    """复习日里的一道题，在日历上自成一个条目。
-
-    id 仍然指向父条：点开的卡片、所属清单（那是刷题页认领这批待办的凭据）、
-    日期全都跟着父条走。唯一的区别是 ``sub_id``，勾它的时候按子任务落库。
-    """
-    r = dict(parent)
-    r["title"] = sub.get("title") or "（无标题）"
-    r["done"] = bool(int(sub.get("done") or 0))
-    r["note"] = ""            # 备注是父条的，摊成一排后每条都挂同一句没意义
-    r["sub_id"] = int(sub["id"])
-    r["sub_done"] = 0         # 题目自己不再有子任务，否则条目上会挂个 0/3
-    r["sub_total"] = 0
-    r["sort"] = int(sub.get("sort_order") or 0)
-    return r
-
-
-def _review_sub_map() -> dict[int, list[dict]]:
-    """复习大任务名下的子任务：{大任务 id: [子任务行, ...]}，只收排过期的那些大任务。
-
-    「算不算复习大任务」看的是它名下有没有排期挂着的条目，不是清单名 —— 而一旦
-    算，就把它名下**所有**子任务都摊出来：用户自己往大任务下加的检查事项在待办页
-    看得到，只摊题目会让它在日历上凭空少掉。
-    """
-    out: dict[int, list[dict]] = {}
-    with db.connect() as conn:
-        parents: set[int] = set()
-        for spec in _REVIEW_KINDS.values():
-            for r in conn.execute(
-                    f"SELECT DISTINCT todo_id FROM {spec['reviews']} "
-                    "WHERE COALESCE(subtask_id, 0) > 0 "
-                    "AND COALESCE(todo_id, 0) > 0").fetchall():
-                parents.add(int(r["todo_id"]))
-        if not parents:
-            return out
-        marks = ", ".join("?" for _ in parents)
-        rows = conn.execute(
-            f"SELECT * FROM subtasks WHERE todo_id IN ({marks}) "
-            "ORDER BY todo_id, sort_order, id", tuple(parents)).fetchall()
-    for raw in rows:
-        sub = _row_to_dict(raw)
-        out.setdefault(int(sub["todo_id"]), []).append(sub)
-    return out
 
 
 def cal_occurrences(start: str, end: str,
@@ -738,7 +693,8 @@ def cal_occurrences(start: str, end: str,
     日历本质是「任务的时间轴视图」，所以条目按**显示日期**过滤：
     被单周期改期挪出区间的不再出现，从区间外挪进来的会出现。
 
-    复习那天的题目摊成一道一条（父条不画），见 ``_sub_cal_row``。
+    一个任务在一格里只有一根条：复习大任务名下的题目不摊出来，它们在卡片里
+    逐条列着 —— 摊开会让一门课占满整格，把那天别的事挤进「+N 更多」。
     """
     s, e = _parse_d(start), _parse_d(end)
     if not s or not e or e < s:
@@ -762,22 +718,12 @@ def cal_occurrences(start: str, end: str,
                 "SELECT todo_id, COUNT(*) AS n, COALESCE(SUM(done), 0) AS dn "
                 "FROM subtasks GROUP BY todo_id").fetchall():
             sub_map[r["todo_id"]] = (int(r["dn"]), int(r["n"]))
-    review_subs = _review_sub_map()
 
     def emit(t: dict, occ_s: str, ov: dict | None) -> None:
         if ov and ov["status"] == "skipped":
             return
-        row = _cal_row(t, occ_s, ov, tag_map.get(t["id"], []),
-                       sub_map.get(t["id"], (0, 0)))
-        kids = review_subs.get(row["id"])
-        if kids:
-            # 复习那天真正要做的是题目，那条「八股复习」只是它们的容器。摊成
-            # 一道一条才看得出那天有什么；父条不再单独画，否则同一批事出现两遍。
-            # 点任意一道题开的仍是父条的卡片 —— 条目里的 id 没换。
-            for sub in kids:
-                out.append(_sub_cal_row(row, sub))
-        else:
-            out.append(row)
+        out.append(_cal_row(t, occ_s, ov, tag_map.get(t["id"], []),
+                            sub_map.get(t["id"], (0, 0))))
 
     out: list[dict] = []
     emitted: set[tuple[int, str]] = set()
@@ -897,7 +843,26 @@ def series_shift(todo_id: int, from_occ: str, new_date: str) -> int:
     dst = _parse_d(new_date)
     if not base or not src or not dst or dst == src:
         return 0
+    # 被拖的那个周期可能早已被「仅此周期改期」挪走过，那它现在显示在哪一天才是
+    # 平移的起点。拿原始周期日算会把挪过的那段距离重复加一遍：
+    # 用户把它从 9/24 拖到 9/26，再想拖回 9/26 就会跳到 9/28。
+    with db.connect() as conn:
+        moved = conn.execute(
+            "SELECT new_date FROM todo_occ WHERE todo_id = ? AND occ_date = ?",
+            (todo_id, from_occ)).fetchone()
+    anchor = _parse_d((moved["new_date"] if moved else "") or "")
+    if anchor and anchor != src:
+        if anchor == dst:
+            # 已经就在这一天：不平移，但那条「挪过」的例外要收掉，
+            # 否则它永远被当成手动改过，角标和序列都对不上
+            conn.execute("UPDATE todo_occ SET new_date = '', new_time = '' "
+                         "WHERE todo_id = ? AND occ_date = ?",
+                         (todo_id, from_occ))
+            return 0
+        src = anchor
     delta = (dst - src).days
+    if delta == 0:
+        return 0
     with db.connect() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM todo_occ WHERE todo_id = ?", (todo_id,)).fetchall()]
@@ -1851,47 +1816,71 @@ def arxiver_available() -> bool:
     return os.path.exists(arxiver_db_path())
 
 
+_arxiver_conn: list = []      # [(路径, 连接)]，只存一个；空表示没连上
+
+
+def _arxiver_reset() -> None:
+    """查询报错后丢掉缓存连接，下次重连（Arxiver 换了库文件也能自愈）。"""
+    if _arxiver_conn:
+        try:
+            _arxiver_conn[0][1].close()
+        except sqlite3.Error:
+            pass
+        _arxiver_conn.clear()
+
+
+@contextmanager
 def _arxiver_connect():
+    """复用一个只读连接。
+
+    每次新建要 25ms 上下（Arxiver 库里上千篇论文），而科研管理刷新时会连着开好几次；
+    对方是另一个进程在写的库，只读连接可以长期持有，不需要一次一开。
+    调用方不要 close —— 退出 with 只是交还引用。
+    """
     path = arxiver_db_path()
     if not os.path.exists(path):
-        return None
-    try:
-        uri = "file:" + path.replace("\\", "/") + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 3000")
-        return conn
-    except sqlite3.Error:
-        return None
+        yield None
+        return
+    if not _arxiver_conn or _arxiver_conn[0][0] != path:
+        _arxiver_reset()
+        try:
+            uri = "file:" + path.replace("\\", "/") + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 3000")
+        except sqlite3.Error:
+            yield None
+            return
+        _arxiver_conn.append((path, conn))
+    yield _arxiver_conn[0][1]
 
 
 def arxiver_search(q: str = "", limit: int = 60, only_local: bool = False) -> list[dict]:
     """按标题 / 中文标题 / 作者 / 标签 / arXiv ID 搜 Arxiver 论文库。"""
-    conn = _arxiver_connect()
-    if conn is None:
-        return []
-    try:
-        sql = f"SELECT {ARXIVER_FIELDS} FROM papers"
-        cond: list[str] = []
-        args: list[Any] = []
-        # 按空格切词再 AND：整句 LIKE 的话「agent planning」只能匹配到这个原短语，
-        # 标题里分别含这两个词的全部漏掉。
-        for tok in q.split():
-            like = f"%{tok}%"
-            cond.append("(title LIKE ? OR title_zh LIKE ? OR authors LIKE ? "
-                        "OR tags LIKE ? OR arxiv_id LIKE ?)")
-            args += [like] * 5
-        if only_local:
-            cond.append("local_path IS NOT NULL AND local_path <> ''")
-        if cond:
-            sql += " WHERE " + " AND ".join(cond)
-        sql += " ORDER BY fetched_at DESC LIMIT ?"
-        args.append(int(limit))
-        return [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
-    except sqlite3.Error:
-        return []
-    finally:
-        conn.close()
+    with _arxiver_connect() as conn:
+        if conn is None:
+            return []
+        try:
+            sql = f"SELECT {ARXIVER_FIELDS} FROM papers"
+            cond: list[str] = []
+            args: list[Any] = []
+            # 按空格切词再 AND：整句 LIKE 的话「agent planning」只能匹配到这个原短语，
+            # 标题里分别含这两个词的全部漏掉。
+            for tok in q.split():
+                like = f"%{tok}%"
+                cond.append("(title LIKE ? OR title_zh LIKE ? OR authors LIKE ? "
+                            "OR tags LIKE ? OR arxiv_id LIKE ?)")
+                args += [like] * 5
+            if only_local:
+                cond.append("local_path IS NOT NULL AND local_path <> ''")
+            if cond:
+                sql += " WHERE " + " AND ".join(cond)
+            sql += " ORDER BY fetched_at DESC LIMIT ?"
+            args.append(int(limit))
+            return [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+        except sqlite3.Error:
+            _arxiver_reset()
+            return []
 
 
 def arxiver_get(arxiv_ids: list[str]) -> dict[str, dict]:
@@ -1899,19 +1888,18 @@ def arxiver_get(arxiv_ids: list[str]) -> dict[str, dict]:
     ids = [i for i in arxiv_ids if i]
     if not ids:
         return {}
-    conn = _arxiver_connect()
-    if conn is None:
-        return {}
-    try:
-        marks = ", ".join("?" * len(ids))
-        rows = conn.execute(
-            f"SELECT {ARXIVER_FIELDS} FROM papers WHERE arxiv_id IN ({marks})",
-            ids).fetchall()
-        return {r["arxiv_id"]: _row_to_dict(r) for r in rows}
-    except sqlite3.Error:
-        return {}
-    finally:
-        conn.close()
+    with _arxiver_connect() as conn:
+        if conn is None:
+            return {}
+        try:
+            marks = ", ".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT {ARXIVER_FIELDS} FROM papers WHERE arxiv_id IN ({marks})",
+                ids).fetchall()
+            return {r["arxiv_id"]: _row_to_dict(r) for r in rows}
+        except sqlite3.Error:
+            _arxiver_reset()
+            return {}
 
 
 # ---------- 课题 ↔ Arxiver 论文关联 ----------
@@ -1960,191 +1948,191 @@ def research_paper_counts() -> dict[int, int]:
 
 
 def research_status_counts() -> dict[str, int]:
-    """各路线步骤的课题数量：{'s1': 2, 's5': 1, 'done': 3, ...}。"""
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT status, COUNT(*) AS c FROM research GROUP BY status"
-        ).fetchall()
-    return {r["status"]: r["c"] for r in rows}
+        """各路线步骤的课题数量：{'s1': 2, 's5': 1, 'done': 3, ...}。"""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS c FROM research GROUP BY status"
+            ).fetchall()
+        return {r["status"]: r["c"] for r in rows}
 
 
 # ---------- 科研专注投入（与番茄钟联动） ----------
 def research_keywords() -> list[str]:
-    """全局「算科研」的任务关键词（逗号分隔，存 settings）。"""
-    raw = db.get_setting("research_focus_keywords", RESEARCH_KEYWORDS_DEFAULT)
-    return [k.strip() for k in raw.split(",") if k.strip()]
+        """全局「算科研」的任务关键词（逗号分隔，存 settings）。"""
+        raw = db.get_setting("research_focus_keywords", RESEARCH_KEYWORDS_DEFAULT)
+        return [k.strip() for k in raw.split(",") if k.strip()]
 
 
 def set_research_keywords(keywords: list[str]) -> None:
-    db.set_setting("research_focus_keywords", ",".join(keywords))
+        db.set_setting("research_focus_keywords", ",".join(keywords))
 
 
 def _focus_where(keywords: list[str]) -> tuple[str, list[Any]]:
-    """把关键词拼成 ``AND (task LIKE ? OR ...)``；空表表示不过滤。"""
-    if not keywords:
-        return "", []
-    conds = " OR ".join(["task LIKE ?"] * len(keywords))
-    return f" AND ({conds})", [f"%{k}%" for k in keywords]
+        """把关键词拼成 ``AND (task LIKE ? OR ...)``；空表表示不过滤。"""
+        if not keywords:
+            return "", []
+        conds = " OR ".join(["task LIKE ?"] * len(keywords))
+        return f" AND ({conds})", [f"%{k}%" for k in keywords]
 
 
 def research_focus_daily(days: int = 42,
-                         keywords: Optional[list[str]] = None) -> list[dict]:
-    """近 days 天每天投入在科研上的专注分钟数（含 0 填充，日期升序）。"""
-    kw = research_keywords() if keywords is None else keywords
-    where, args = _focus_where(kw)
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT date(started_at) AS d, COALESCE(SUM(duration_min), 0) AS m, "
-            "COUNT(*) AS c FROM pomodoro WHERE completed = 1 "
-            "AND date(started_at) >= date('now', 'localtime', ?)"
-            + where + " GROUP BY d",
-            (f"-{days - 1} days", *args),
-        ).fetchall()
-    agg = {r["d"]: (r["m"], r["c"]) for r in rows}
-    today = date.today()
-    out = []
-    for i in range(days - 1, -1, -1):
-        ds = (today - timedelta(days=i)).isoformat()
-        m, c = agg.get(ds, (0, 0))
-        out.append({"date": ds, "minutes": m, "count": c})
-    return out
+                             keywords: Optional[list[str]] = None) -> list[dict]:
+        """近 days 天每天投入在科研上的专注分钟数（含 0 填充，日期升序）。"""
+        kw = research_keywords() if keywords is None else keywords
+        where, args = _focus_where(kw)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT date(started_at) AS d, COALESCE(SUM(duration_min), 0) AS m, "
+                "COUNT(*) AS c FROM pomodoro WHERE completed = 1 "
+                "AND date(started_at) >= date('now', 'localtime', ?)"
+                + where + " GROUP BY d",
+                (f"-{days - 1} days", *args),
+            ).fetchall()
+        agg = {r["d"]: (r["m"], r["c"]) for r in rows}
+        today = date.today()
+        out = []
+        for i in range(days - 1, -1, -1):
+            ds = (today - timedelta(days=i)).isoformat()
+            m, c = agg.get(ds, (0, 0))
+            out.append({"date": ds, "minutes": m, "count": c})
+        return out
 
 
 def research_focus_weekly(weeks: int = 6,
-                          keywords: Optional[list[str]] = None) -> list[dict]:
-    """近 weeks 周每周科研投入（周一为一周起点，含本周）。"""
-    daily = research_focus_daily(weeks * 7, keywords)
-    out = []
-    for i in range(weeks):
-        chunk = daily[i * 7:(i + 1) * 7]
-        if not chunk:
-            continue
-        out.append({
-            "label": f"{chunk[0]['date'][5:7]}/{chunk[0]['date'][8:10]}",
-            "start": chunk[0]["date"], "end": chunk[-1]["date"],
-            "minutes": sum(d["minutes"] for d in chunk),
-            "count": sum(d["count"] for d in chunk),
-        })
-    return out
+                              keywords: Optional[list[str]] = None) -> list[dict]:
+        """近 weeks 周每周科研投入（周一为一周起点，含本周）。"""
+        daily = research_focus_daily(weeks * 7, keywords)
+        out = []
+        for i in range(weeks):
+            chunk = daily[i * 7:(i + 1) * 7]
+            if not chunk:
+                continue
+            out.append({
+                "label": f"{chunk[0]['date'][5:7]}/{chunk[0]['date'][8:10]}",
+                "start": chunk[0]["date"], "end": chunk[-1]["date"],
+                "minutes": sum(d["minutes"] for d in chunk),
+                "count": sum(d["count"] for d in chunk),
+            })
+        return out
 
 
 def research_focus_summary(keywords: Optional[list[str]] = None) -> dict:
-    """本周 / 上周 / 近 30 天科研投入分钟数（看板 KPI 与环比用）。"""
-    kw = research_keywords() if keywords is None else keywords
-    daily = research_focus_daily(21, kw)
-    today = date.today()
-    week_start = today - timedelta(days=today.weekday())
+        """本周 / 上周 / 近 30 天科研投入分钟数（看板 KPI 与环比用）。"""
+        kw = research_keywords() if keywords is None else keywords
+        daily = research_focus_daily(21, kw)
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
 
-    def total(start: date, days: int) -> int:
-        want = {(start + timedelta(days=i)).isoformat() for i in range(days)}
-        return sum(d["minutes"] for d in daily if d["date"] in want)
+        def total(start: date, days: int) -> int:
+            want = {(start + timedelta(days=i)).isoformat() for i in range(days)}
+            return sum(d["minutes"] for d in daily if d["date"] in want)
 
-    return {
-        "week": total(week_start, (today - week_start).days + 1),
-        "prev_week": total(week_start - timedelta(days=7), 7),
-        "month": sum(d["minutes"] for d in daily[-30:]) if daily else 0,
-        "count_week": sum(d["count"] for d in daily
-                          if d["date"] >= week_start.isoformat()),
-    }
+        return {
+            "week": total(week_start, (today - week_start).days + 1),
+            "prev_week": total(week_start - timedelta(days=7), 7),
+            "month": sum(d["minutes"] for d in daily[-30:]) if daily else 0,
+            "count_week": sum(d["count"] for d in daily
+                              if d["date"] >= week_start.isoformat()),
+        }
 
 
 def research_focus_top_tasks(days: int = 30, limit: int = 6) -> list[dict]:
-    """近 days 天科研类专注的任务分布 Top N（看板的「时间花在哪」卡）。"""
-    where, args = _focus_where(research_keywords())
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT COALESCE(NULLIF(task, ''), '未命名专注') AS t, "
-            "COALESCE(SUM(duration_min), 0) AS m, COUNT(*) AS c "
-            "FROM pomodoro WHERE completed = 1 "
-            "AND date(started_at) >= date('now', 'localtime', ?)"
-            + where + " GROUP BY t ORDER BY m DESC LIMIT ?",
-            (f"-{days - 1} days", *args, limit),
-        ).fetchall()
-    return [{"task": r["t"], "minutes": r["m"], "count": r["c"]} for r in rows]
+        """近 days 天科研类专注的任务分布 Top N（看板的「时间花在哪」卡）。"""
+        where, args = _focus_where(research_keywords())
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(NULLIF(task, ''), '未命名专注') AS t, "
+                "COALESCE(SUM(duration_min), 0) AS m, COUNT(*) AS c "
+                "FROM pomodoro WHERE completed = 1 "
+                "AND date(started_at) >= date('now', 'localtime', ?)"
+                + where + " GROUP BY t ORDER BY m DESC LIMIT ?",
+                (f"-{days - 1} days", *args, limit),
+            ).fetchall()
+        return [{"task": r["t"], "minutes": r["m"], "count": r["c"]} for r in rows]
 
 
 def project_focus_minutes(project: dict, days: int = 30) -> int:
-    """单课题的科研投入：命中「自定义关键词 + 研究方向」的专注分钟数。
+        """单课题的科研投入：命中「自定义关键词 + 研究方向」的专注分钟数。
 
-    没配关键词时不按课题标题模糊匹配 —— 番茄任务名很少和课题全名一致，
-    猜着匹配会把别的课题的时长算进来，宁可显示 0 并提示去补关键词。
-    """
-    kw = [k.strip() for k in (project.get("focus_keywords") or "").split(",")
-          if k.strip()]
-    if project.get("field"):
-        kw.append(project["field"].strip())
-    if not kw:
-        return 0
-    where, args = _focus_where(kw)
-    with db.connect() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(duration_min), 0) AS m FROM pomodoro "
-            "WHERE completed = 1 AND date(started_at) >= date('now', 'localtime', ?)"
-            + where,
-            (f"-{days - 1} days", *args),
-        ).fetchone()
-    return row["m"] or 0
+        没配关键词时不按课题标题模糊匹配 —— 番茄任务名很少和课题全名一致，
+        猜着匹配会把别的课题的时长算进来，宁可显示 0 并提示去补关键词。
+        """
+        kw = [k.strip() for k in (project.get("focus_keywords") or "").split(",")
+              if k.strip()]
+        if project.get("field"):
+            kw.append(project["field"].strip())
+        if not kw:
+            return 0
+        where, args = _focus_where(kw)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(duration_min), 0) AS m FROM pomodoro "
+                "WHERE completed = 1 AND date(started_at) >= date('now', 'localtime', ?)"
+                + where,
+                (f"-{days - 1} days", *args),
+            ).fetchone()
+        return row["m"] or 0
 
 # ---------- 记账自定义分类 / 周期账单 ----------
 def get_custom_categories(kind: str) -> list[str]:
-    raw = db.get_setting(f"custom_cats_{kind}", "[]")
-    try:
-        return [c for c in json.loads(raw) if c.strip()]
-    except Exception:
-        return []
+        raw = db.get_setting(f"custom_cats_{kind}", "[]")
+        try:
+            return [c for c in json.loads(raw) if c.strip()]
+        except Exception:
+            return []
 
 
 def set_custom_categories(kind: str, cats: list[str]) -> None:
-    db.set_setting(f"custom_cats_{kind}", json.dumps(cats, ensure_ascii=False))
+        db.set_setting(f"custom_cats_{kind}", json.dumps(cats, ensure_ascii=False))
 
 
 def custom_category_styles() -> dict:
-    """自定义分类的图标/配色：{分类名: {"icon": str, "color": str}}。"""
-    raw = db.get_setting("custom_category_styles", "{}")
-    try:
-        data = json.loads(raw)
-        return {k: v for k, v in data.items() if isinstance(v, dict)}
-    except Exception:
-        return {}
+        """自定义分类的图标/配色：{分类名: {"icon": str, "color": str}}。"""
+        raw = db.get_setting("custom_category_styles", "{}")
+        try:
+            data = json.loads(raw)
+            return {k: v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            return {}
 
 
 def set_custom_category_style(name: str, icon: str, color: str) -> None:
-    styles = custom_category_styles()
-    if icon or color:
-        styles[name] = {"icon": icon or "", "color": color or ""}
-    else:
-        styles.pop(name, None)
-    db.set_setting("custom_category_styles",
-                   json.dumps(styles, ensure_ascii=False))
+        styles = custom_category_styles()
+        if icon or color:
+            styles[name] = {"icon": icon or "", "color": color or ""}
+        else:
+            styles.pop(name, None)
+        db.set_setting("custom_category_styles",
+                       json.dumps(styles, ensure_ascii=False))
 
 
 def get_recurring_bills() -> list[dict]:
-    raw = db.get_setting("recurring_bills", "[]")
-    try:
-        return json.loads(raw)
-    except Exception:
-        return []
+        raw = db.get_setting("recurring_bills", "[]")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return []
 
 
 def set_recurring_bills(bills: list[dict]) -> None:
-    db.set_setting("recurring_bills", json.dumps(bills, ensure_ascii=False))
+        db.set_setting("recurring_bills", json.dumps(bills, ensure_ascii=False))
 
 
 # ---------- 习惯打卡 ----------
 def habit_list(archived: Optional[int] = None) -> list[dict]:
-    q = "SELECT * FROM habits"
-    if archived is not None:
-        q += f" WHERE archived = {int(archived)}"
-    q += " ORDER BY sort_order ASC, id ASC"
-    with db.connect() as conn:
-        rows = conn.execute(q).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        q = "SELECT * FROM habits"
+        if archived is not None:
+            q += f" WHERE archived = {int(archived)}"
+        q += " ORDER BY sort_order ASC, id ASC"
+        with db.connect() as conn:
+            rows = conn.execute(q).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def habit_get(habit_id: int) -> dict:
-    with db.connect() as conn:
-        row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
-    return _row_to_dict(row)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
+        return _row_to_dict(row)
 
 
 # 习惯数据的版本号。习惯页和待办页底部的「今日打卡」各自缓存了一份界面，
@@ -2153,51 +2141,51 @@ _habit_rev = 0
 
 
 def habit_rev() -> int:
-    return _habit_rev
+        return _habit_rev
 
 
 def bump_habit_rev() -> None:
-    global _habit_rev
-    _habit_rev += 1
+        global _habit_rev
+        _habit_rev += 1
 
 
 def habit_add(name: str, icon: str = "😊", color: str = "green",
-              freq_type: str = "daily", freq_days: str = "",
-              goal_type: str = "check", goal_per_day: int = 1,
-              goal_auto: int = 1, goal_each: int = 1,
-              start_date: str = "", target_days: int = 0,
-              group_name: str = "其他", reminder: str = "",
-              auto_log: int = 0) -> int:
-    with db.connect() as conn:
-        max_order = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM habits").fetchone()["m"]
-        cur = conn.execute(
-            "INSERT INTO habits(name, icon, color, freq_type, freq_days, goal_type, "
-            "goal_per_day, goal_auto, goal_each, start_date, target_days, group_name, "
-            "reminder, auto_log, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, icon, color, freq_type, freq_days, goal_type, goal_per_day,
-             goal_auto, goal_each, start_date, target_days, group_name,
-             reminder, auto_log, max_order + 1))
-        hid = cur.lastrowid
-    bump_habit_rev()
-    return hid
+                  freq_type: str = "daily", freq_days: str = "",
+                  goal_type: str = "check", goal_per_day: int = 1,
+                  goal_auto: int = 1, goal_each: int = 1,
+                  start_date: str = "", target_days: int = 0,
+                  group_name: str = "其他", reminder: str = "",
+                  auto_log: int = 0) -> int:
+        with db.connect() as conn:
+            max_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM habits").fetchone()["m"]
+            cur = conn.execute(
+                "INSERT INTO habits(name, icon, color, freq_type, freq_days, goal_type, "
+                "goal_per_day, goal_auto, goal_each, start_date, target_days, group_name, "
+                "reminder, auto_log, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (name, icon, color, freq_type, freq_days, goal_type, goal_per_day,
+                 goal_auto, goal_each, start_date, target_days, group_name,
+                 reminder, auto_log, max_order + 1))
+            hid = cur.lastrowid
+        bump_habit_rev()
+        return hid
 
 
 _HABIT_FIELDS = {"name", "icon", "color", "freq_type", "freq_days", "goal_type",
-                 "goal_per_day", "goal_auto", "goal_each", "start_date",
-                 "target_days", "group_name", "reminder", "auto_log", "archived",
-                 "sort_order"}
+                     "goal_per_day", "goal_auto", "goal_each", "start_date",
+                     "target_days", "group_name", "reminder", "auto_log", "archived",
+                     "sort_order"}
 
 
 def habit_update(habit_id: int, **fields: Any) -> None:
-    updates = {k: v for k, v in fields.items() if k in _HABIT_FIELDS}
-    if not updates:
-        return
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE habits SET {cols} WHERE id = ?",
-                     (*updates.values(), habit_id))
-    bump_habit_rev()
+        updates = {k: v for k, v in fields.items() if k in _HABIT_FIELDS}
+        if not updates:
+            return
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE habits SET {cols} WHERE id = ?",
+                         (*updates.values(), habit_id))
+        bump_habit_rev()
 
 
 # 内置的四个分组是「一天里的时段」，顺序是语义的一部分，必须按时间排；
@@ -2206,278 +2194,278 @@ _GROUP_RANK = {"上午": 0, "中午": 1, "下午": 2, "晚上": 3}
 
 
 def habit_list_grouped(archived: Optional[int] = None
-                       ) -> list[tuple[str, list[dict]]]:
-    """按所属分组分好返回 ``[(组名, [习惯…])]``。
+                           ) -> list[tuple[str, list[dict]]]:
+        """按所属分组分好返回 ``[(组名, [习惯…])]``。
 
-    组间顺序：上午 → 中午 → 下午 → 晚上，然后才是自建分组和「其他」，
-    它们按组内最小的 sort_order 排。以前所有组都只按 sort_order 排，于是
-    截图里出现过 上午 / 晚上 / 下午 这种顺序。
-    组内按 sort_order 排。
-    """
-    buckets: dict[str, list[dict]] = {}
-    for h in habit_list(archived=archived):
-        buckets.setdefault(str(h.get("group_name") or "其他"), []).append(h)
+        组间顺序：上午 → 中午 → 下午 → 晚上，然后才是自建分组和「其他」，
+        它们按组内最小的 sort_order 排。以前所有组都只按 sort_order 排，于是
+        截图里出现过 上午 / 晚上 / 下午 这种顺序。
+        组内按 sort_order 排。
+        """
+        buckets: dict[str, list[dict]] = {}
+        for h in habit_list(archived=archived):
+            buckets.setdefault(str(h.get("group_name") or "其他"), []).append(h)
 
-    def key(kv: tuple[str, list[dict]]):
-        name, hs = kv
-        rank = _GROUP_RANK.get(name)
-        first = min(x["sort_order"] for x in hs)
-        return (0, rank, 0) if rank is not None else (1, 0, first)
+        def key(kv: tuple[str, list[dict]]):
+            name, hs = kv
+            rank = _GROUP_RANK.get(name)
+            first = min(x["sort_order"] for x in hs)
+            return (0, rank, 0) if rank is not None else (1, 0, first)
 
-    return sorted(buckets.items(), key=key)
+        return sorted(buckets.items(), key=key)
 
 
 def habit_move(habit_id: int, delta: int) -> bool:
-    """在同一分组内上移 / 下移一位（交换 sort_order）。
+        """在同一分组内上移 / 下移一位（交换 sort_order）。
 
-    列表一直是按 sort_order 排的，但除了新建时没人写过这个字段，
-    所以顺序一旦定了就再也改不了。到组边界时返回 False，调用方据此决定刷不刷新。
-    """
-    op, order = ("<", "DESC") if delta < 0 else (">", "ASC")
-    with db.connect() as conn:
-        me = conn.execute(
-            "SELECT id, archived, sort_order, "
-            "IFNULL(group_name, '其他') AS g FROM habits WHERE id = ?",
-            (habit_id,)).fetchone()
-        if not me:
-            return False
-        nb = conn.execute(
-            f"SELECT id, sort_order FROM habits "
-            f"WHERE archived = ? AND IFNULL(group_name, '其他') = ? "
-            f"AND sort_order {op} ? "
-            f"ORDER BY sort_order {order} LIMIT 1",
-            (me["archived"], me["g"], me["sort_order"])).fetchone()
-        if not nb:
-            return False
-        conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
-                     (nb["sort_order"], me["id"]))
-        conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
-                     (me["sort_order"], nb["id"]))
-    bump_habit_rev()
-    return True
+        列表一直是按 sort_order 排的，但除了新建时没人写过这个字段，
+        所以顺序一旦定了就再也改不了。到组边界时返回 False，调用方据此决定刷不刷新。
+        """
+        op, order = ("<", "DESC") if delta < 0 else (">", "ASC")
+        with db.connect() as conn:
+            me = conn.execute(
+                "SELECT id, archived, sort_order, "
+                "IFNULL(group_name, '其他') AS g FROM habits WHERE id = ?",
+                (habit_id,)).fetchone()
+            if not me:
+                return False
+            nb = conn.execute(
+                f"SELECT id, sort_order FROM habits "
+                f"WHERE archived = ? AND IFNULL(group_name, '其他') = ? "
+                f"AND sort_order {op} ? "
+                f"ORDER BY sort_order {order} LIMIT 1",
+                (me["archived"], me["g"], me["sort_order"])).fetchone()
+            if not nb:
+                return False
+            conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
+                         (nb["sort_order"], me["id"]))
+            conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
+                         (me["sort_order"], nb["id"]))
+        bump_habit_rev()
+        return True
 
 
 def habit_move_to(habit_id: int, group: str,
-                  before_id: Optional[int] = None) -> bool:
-    """拖拽落点：把习惯挪进 ``group``，排在 ``before_id`` 之前（None = 该组末尾）。
+                      before_id: Optional[int] = None) -> bool:
+        """拖拽落点：把习惯挪进 ``group``，排在 ``before_id`` 之前（None = 该组末尾）。
 
-    做法是把同一归档桶里的习惯摊平成一条有序列表，摘出被拖的那个再插回目标位置、
-    整条重新编号。组的先后顺序是从「组内最小 sort_order」推出来的，所以整体重编号
-    不会把别的组顺序打乱。
-    """
-    with db.connect() as conn:
-        me = conn.execute(
-            "SELECT id, archived, IFNULL(group_name, '其他') AS g "
-            "FROM habits WHERE id = ?", (habit_id,)).fetchone()
-        if not me:
-            return False
-        rows = conn.execute(
-            "SELECT id, IFNULL(group_name, '其他') AS g FROM habits "
-            "WHERE archived = ? ORDER BY sort_order ASC, id ASC",
-            (me["archived"],)).fetchall()
-        flat = [(r["id"], r["g"]) for r in rows if r["id"] != habit_id]
-        if before_id is None or before_id == habit_id:
-            last = [k for k, (_, g) in enumerate(flat) if g == group]
-            pos = (last[-1] + 1) if last else len(flat)
-        else:
-            pos = next((k for k, (i, _) in enumerate(flat) if i == before_id),
-                       None)
-            if pos is None:
+        做法是把同一归档桶里的习惯摊平成一条有序列表，摘出被拖的那个再插回目标位置、
+        整条重新编号。组的先后顺序是从「组内最小 sort_order」推出来的，所以整体重编号
+        不会把别的组顺序打乱。
+        """
+        with db.connect() as conn:
+            me = conn.execute(
+                "SELECT id, archived, IFNULL(group_name, '其他') AS g "
+                "FROM habits WHERE id = ?", (habit_id,)).fetchone()
+            if not me:
                 return False
-        conn.execute("UPDATE habits SET group_name = ? WHERE id = ?",
-                     (group, habit_id))
-        flat.insert(pos, (habit_id, group))
-        for k, (hid, _) in enumerate(flat):
-            conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
-                         (k, hid))
-    bump_habit_rev()
-    return True
+            rows = conn.execute(
+                "SELECT id, IFNULL(group_name, '其他') AS g FROM habits "
+                "WHERE archived = ? ORDER BY sort_order ASC, id ASC",
+                (me["archived"],)).fetchall()
+            flat = [(r["id"], r["g"]) for r in rows if r["id"] != habit_id]
+            if before_id is None or before_id == habit_id:
+                last = [k for k, (_, g) in enumerate(flat) if g == group]
+                pos = (last[-1] + 1) if last else len(flat)
+            else:
+                pos = next((k for k, (i, _) in enumerate(flat) if i == before_id),
+                           None)
+                if pos is None:
+                    return False
+            conn.execute("UPDATE habits SET group_name = ? WHERE id = ?",
+                         (group, habit_id))
+            flat.insert(pos, (habit_id, group))
+            for k, (hid, _) in enumerate(flat):
+                conn.execute("UPDATE habits SET sort_order = ? WHERE id = ?",
+                             (k, hid))
+        bump_habit_rev()
+        return True
 
 
 def habit_delete(habit_id: int) -> None:
-    with db.connect() as conn:
-        conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
-        conn.execute("DELETE FROM habit_checks WHERE habit_id = ?", (habit_id,))
-    bump_habit_rev()
-
-
-def habit_checks_map(habit_id: int) -> dict:
-    """{date: {'count': n, 'note': str}}，某习惯全部打卡记录。"""
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT date, count, note FROM habit_checks WHERE habit_id = ?",
-            (habit_id,)).fetchall()
-    return {r["date"]: {"count": r["count"], "note": r["note"]} for r in rows}
-
-
-def habit_checks_maps(habit_ids: list[int]) -> dict[int, dict]:
-    """一次查回多个习惯的打卡记录，``{habit_id: {date: {'count','note'}}}``。
-
-    列表页原先每个习惯各开一次连接，60 个习惯就是 60 次 connect/close + 120 次
-    PRAGMA（实测占整次 reload 的一半以上）；换成一条 IN 查询后连接数与习惯数无关。
-    """
-    out: dict[int, dict] = {hid: {} for hid in habit_ids}
-    if not habit_ids:
-        return out
-    marks = ",".join("?" * len(habit_ids))
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT habit_id, date, count, note FROM habit_checks "
-            f"WHERE habit_id IN ({marks})",
-            tuple(habit_ids)).fetchall()
-    for r in rows:
-        out.setdefault(r["habit_id"], {})[r["date"]] = {
-            "count": r["count"], "note": r["note"]}
-    return out
-
-
-def habit_set_count(habit_id: int, date: str, count: int) -> None:
-    """写入某日打卡次数；次数 <=0 时删除该日记录。"""
-    with db.connect() as conn:
-        if count <= 0:
-            conn.execute("DELETE FROM habit_checks WHERE habit_id = ? AND date = ?",
-                         (habit_id, date))
-        else:
-            conn.execute(
-                "INSERT INTO habit_checks(habit_id, date, count) VALUES(?,?,?) "
-                "ON CONFLICT(habit_id, date) DO UPDATE SET count = excluded.count",
-                (habit_id, date, count))
-    bump_habit_rev()
-
-
-def habit_set_note(habit_id: int, date: str, note: str) -> None:
-    with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO habit_checks(habit_id, date, count, note) VALUES(?,?,1,?) "
-            "ON CONFLICT(habit_id, date) DO UPDATE SET note = excluded.note",
-            (habit_id, date, note))
-    bump_habit_rev()
-
-
-def habit_groups() -> list[str]:
-    """习惯分组：内置四项 + 用户自定义（settings.habit_groups）。"""
-    builtin = ["上午", "下午", "晚上", "其他"]
-    raw = db.get_setting("habit_groups", "[]")
-    try:
-        extra = [g for g in json.loads(raw) if isinstance(g, str) and g.strip()]
-    except Exception:
-        extra = []
-    out = list(builtin)
-    for g in extra:
-        if g not in out:
-            out.append(g)
-    return out
-
-
-def habit_add_group(name: str) -> None:
-    raw = db.get_setting("habit_groups", "[]")
-    try:
-        extra = json.loads(raw)
-    except Exception:
-        extra = []
-    if name and name not in extra:
-        extra.append(name)
-        db.set_setting("habit_groups", json.dumps(extra, ensure_ascii=False))
+        with db.connect() as conn:
+            conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
+            conn.execute("DELETE FROM habit_checks WHERE habit_id = ?", (habit_id,))
         bump_habit_rev()
 
 
+def habit_checks_map(habit_id: int) -> dict:
+        """{date: {'count': n, 'note': str}}，某习惯全部打卡记录。"""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT date, count, note FROM habit_checks WHERE habit_id = ?",
+                (habit_id,)).fetchall()
+        return {r["date"]: {"count": r["count"], "note": r["note"]} for r in rows}
+
+
+def habit_checks_maps(habit_ids: list[int]) -> dict[int, dict]:
+        """一次查回多个习惯的打卡记录，``{habit_id: {date: {'count','note'}}}``。
+
+        列表页原先每个习惯各开一次连接，60 个习惯就是 60 次 connect/close + 120 次
+        PRAGMA（实测占整次 reload 的一半以上）；换成一条 IN 查询后连接数与习惯数无关。
+        """
+        out: dict[int, dict] = {hid: {} for hid in habit_ids}
+        if not habit_ids:
+            return out
+        marks = ",".join("?" * len(habit_ids))
+        with db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT habit_id, date, count, note FROM habit_checks "
+                f"WHERE habit_id IN ({marks})",
+                tuple(habit_ids)).fetchall()
+        for r in rows:
+            out.setdefault(r["habit_id"], {})[r["date"]] = {
+                "count": r["count"], "note": r["note"]}
+        return out
+
+
+def habit_set_count(habit_id: int, date: str, count: int) -> None:
+        """写入某日打卡次数；次数 <=0 时删除该日记录。"""
+        with db.connect() as conn:
+            if count <= 0:
+                conn.execute("DELETE FROM habit_checks WHERE habit_id = ? AND date = ?",
+                             (habit_id, date))
+            else:
+                conn.execute(
+                    "INSERT INTO habit_checks(habit_id, date, count) VALUES(?,?,?) "
+                    "ON CONFLICT(habit_id, date) DO UPDATE SET count = excluded.count",
+                    (habit_id, date, count))
+        bump_habit_rev()
+
+
+def habit_set_note(habit_id: int, date: str, note: str) -> None:
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO habit_checks(habit_id, date, count, note) VALUES(?,?,1,?) "
+                "ON CONFLICT(habit_id, date) DO UPDATE SET note = excluded.note",
+                (habit_id, date, note))
+        bump_habit_rev()
+
+
+def habit_groups() -> list[str]:
+        """习惯分组：内置四项 + 用户自定义（settings.habit_groups）。"""
+        builtin = ["上午", "下午", "晚上", "其他"]
+        raw = db.get_setting("habit_groups", "[]")
+        try:
+            extra = [g for g in json.loads(raw) if isinstance(g, str) and g.strip()]
+        except Exception:
+            extra = []
+        out = list(builtin)
+        for g in extra:
+            if g not in out:
+                out.append(g)
+        return out
+
+
+def habit_add_group(name: str) -> None:
+        raw = db.get_setting("habit_groups", "[]")
+        try:
+            extra = json.loads(raw)
+        except Exception:
+            extra = []
+        if name and name not in extra:
+            extra.append(name)
+            db.set_setting("habit_groups", json.dumps(extra, ensure_ascii=False))
+            bump_habit_rev()
+
+
 def habit_due_on(habit: dict, qdate) -> bool:
-    """qdate(QDate) 是否为该习惯的计划打卡日（考虑开始日期与频率）。"""
-    from PySide6.QtCore import QDate
-    start = QDate.fromString(habit.get("start_date") or "", "yyyy-MM-dd")
-    if start.isValid() and qdate < start:
-        return False
-    if habit.get("freq_type", "daily") == "weekly":
-        days = {int(x) for x in (habit.get("freq_days") or "").split(",") if x.strip()}
-        return qdate.dayOfWeek() in days
-    return True
+        """qdate(QDate) 是否为该习惯的计划打卡日（考虑开始日期与频率）。"""
+        from PySide6.QtCore import QDate
+        start = QDate.fromString(habit.get("start_date") or "", "yyyy-MM-dd")
+        if start.isValid() and qdate < start:
+            return False
+        if habit.get("freq_type", "daily") == "weekly":
+            days = {int(x) for x in (habit.get("freq_days") or "").split(",") if x.strip()}
+            return qdate.dayOfWeek() in days
+        return True
 
 
 def habit_goal_count(habit: dict) -> int:
-    """当日打卡完成所需次数。"""
-    if habit.get("goal_type", "check") == "amount":
-        return max(int(habit.get("goal_per_day") or 1), 1) * \
-            max(int(habit.get("goal_each") or 1), 1)
-    return 1
+        """当日打卡完成所需次数。"""
+        if habit.get("goal_type", "check") == "amount":
+            return max(int(habit.get("goal_per_day") or 1), 1) * \
+                max(int(habit.get("goal_each") or 1), 1)
+        return 1
 
 
 def habit_is_done(habit: dict, checks: dict, date_str: str) -> bool:
-    rec = checks.get(date_str)
-    return bool(rec) and rec["count"] >= habit_goal_count(habit)
+        rec = checks.get(date_str)
+        return bool(rec) and rec["count"] >= habit_goal_count(habit)
 
 
 def habit_stats(habit: dict, checks: dict) -> dict:
-    """统计：月打卡天数 / 总打卡天数 / 月完成率 / 当前连续（QDate 计算）。"""
-    from PySide6.QtCore import QDate
-    from datetime import date as _date
-    today = QDate.currentDate()
-    month_start = QDate(today.year(), today.month(), 1)
+        """统计：月打卡天数 / 总打卡天数 / 月完成率 / 当前连续（QDate 计算）。"""
+        from PySide6.QtCore import QDate
+        from datetime import date as _date
+        today = QDate.currentDate()
+        month_start = QDate(today.year(), today.month(), 1)
 
-    def done_on(qd) -> bool:
-        return habit_is_done(habit, checks, qd.toString("yyyy-MM-dd"))
+        def done_on(qd) -> bool:
+            return habit_is_done(habit, checks, qd.toString("yyyy-MM-dd"))
 
-    # 月打卡 / 总打卡
-    month_days = 0
-    d = month_start
-    while d <= today:
-        if done_on(d):
-            month_days += 1
-        d = d.addDays(1)
-    total_days = 0
-    for ds, rec in checks.items():
-        qd = QDate.fromString(ds, "yyyy-MM-dd")
-        if qd.isValid() and rec["count"] >= habit_goal_count(habit):
-            total_days += 1
-
-    # 月完成率：本月计划日中已完成比例（分母 = max(开始日,月初) → min(今天,月末)）
-    planned = done = 0
-    start = QDate.fromString(habit.get("start_date") or "", "yyyy-MM-dd")
-    first = month_start
-    if start.isValid() and start > first:
-        first = start
-    last = today
-    d = first
-    while d.isValid() and d <= last:
-        if habit_due_on(habit, d):
-            planned += 1
-            if done_on(d):
-                done += 1
-        d = d.addDays(1)
-    rate = round(done / planned * 100) if planned else 0
-
-    # 当前连续：从今天往回，符合频率且完成 +1；今天未完成不算断签；漏打即停
-    streak = 0
-    d = today
-    while d.isValid():
-        if start.isValid() and d < start:
-            break
-        if habit_due_on(habit, d):
-            if done_on(d):
-                streak += 1
-            elif d != today:
-                break
-        d = d.addDays(-1)
-
-    # 最高连续：从开始日扫到今天，频率排到的日子里连续完成的最长一段。
-    # 和当前连续一样按「漏打才算断」，频率没排到的那天直接跳过。
-    longest = run = 0
-    if start.isValid():
-        d = start
+        # 月打卡 / 总打卡
+        month_days = 0
+        d = month_start
         while d <= today:
+            if done_on(d):
+                month_days += 1
+            d = d.addDays(1)
+        total_days = 0
+        for ds, rec in checks.items():
+            qd = QDate.fromString(ds, "yyyy-MM-dd")
+            if qd.isValid() and rec["count"] >= habit_goal_count(habit):
+                total_days += 1
+
+        # 月完成率：本月计划日中已完成比例（分母 = max(开始日,月初) → min(今天,月末)）
+        planned = done = 0
+        start = QDate.fromString(habit.get("start_date") or "", "yyyy-MM-dd")
+        first = month_start
+        if start.isValid() and start > first:
+            first = start
+        last = today
+        d = first
+        while d.isValid() and d <= last:
+            if habit_due_on(habit, d):
+                planned += 1
+                if done_on(d):
+                    done += 1
+            d = d.addDays(1)
+        rate = round(done / planned * 100) if planned else 0
+
+        # 当前连续：从今天往回，符合频率且完成 +1；今天未完成不算断签；漏打即停
+        streak = 0
+        d = today
+        while d.isValid():
+            if start.isValid() and d < start:
+                break
             if habit_due_on(habit, d):
                 if done_on(d):
-                    run += 1
-                    longest = max(longest, run)
+                    streak += 1
                 elif d != today:
-                    run = 0
-            d = d.addDays(1)
+                    break
+            d = d.addDays(-1)
 
-    # 目标进度（target_days）
-    target = int(habit.get("target_days") or 0)
-    return {"month_days": month_days, "total_days": total_days,
-            "month_rate": rate, "streak": streak,
-            "longest_streak": longest,
-            "target_reached": bool(target and total_days >= target)}
+        # 最高连续：从开始日扫到今天，频率排到的日子里连续完成的最长一段。
+        # 和当前连续一样按「漏打才算断」，频率没排到的那天直接跳过。
+        longest = run = 0
+        if start.isValid():
+            d = start
+            while d <= today:
+                if habit_due_on(habit, d):
+                    if done_on(d):
+                        run += 1
+                        longest = max(longest, run)
+                    elif d != today:
+                        run = 0
+                d = d.addDays(1)
+
+        # 目标进度（target_days）
+        target = int(habit.get("target_days") or 0)
+        return {"month_days": month_days, "total_days": total_days,
+                "month_rate": rate, "streak": streak,
+                "longest_streak": longest,
+                "target_reached": bool(target and total_days >= target)}
 
 
 # ---------------------------------------------------------------------------
@@ -2487,106 +2475,106 @@ _CHECKIN_SMART_KEY = "habit_checkin_in_smart"
 
 
 def habit_checkin_in_smart() -> bool:
-    """「今日打卡」是否出现在「今天」「最近7天」两个智能清单里（滴答同名开关）。"""
-    return db.get_setting(_CHECKIN_SMART_KEY, "1") != "0"
+        """「今日打卡」是否出现在「今天」「最近7天」两个智能清单里（滴答同名开关）。"""
+        return db.get_setting(_CHECKIN_SMART_KEY, "1") != "0"
 
 
 def habit_set_checkin_in_smart(on: bool) -> None:
-    db.set_setting(_CHECKIN_SMART_KEY, "1" if on else "0")
-    bump_habit_rev()
+        db.set_setting(_CHECKIN_SMART_KEY, "1" if on else "0")
+        bump_habit_rev()
 
 
 _FREQ_NAMES = {"1": "一", "2": "二", "3": "三", "4": "四",
-               "5": "五", "6": "六", "7": "日"}
+                   "5": "五", "6": "六", "7": "日"}
 
 
 def habit_freq_text(habit: dict) -> str:
-    if habit.get("freq_type", "daily") == "weekly":
-        days = [(_FREQ_NAMES.get(x, x))
-                for x in (habit.get("freq_days") or "").split(",") if x]
-        return "每周 " + "、".join(days) if days else "每周"
-    return "每天"
+        if habit.get("freq_type", "daily") == "weekly":
+            days = [(_FREQ_NAMES.get(x, x))
+                    for x in (habit.get("freq_days") or "").split(",") if x]
+            return "每周 " + "、".join(days) if days else "每周"
+        return "每天"
 
 
 def habit_goal_text(habit: dict) -> str:
-    return f"{habit_goal_count(habit)} 次/天"
+        return f"{habit_goal_count(habit)} 次/天"
 
 
 def habit_check_rows(habit_id: int) -> list[dict]:
-    """打卡明细（含首次打卡时刻），导出用。按日期倒序。"""
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT date, count, note, created_at FROM habit_checks "
-            "WHERE habit_id = ? ORDER BY date DESC", (habit_id,)).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        """打卡明细（含首次打卡时刻），导出用。按日期倒序。"""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT date, count, note, created_at FROM habit_checks "
+                "WHERE habit_id = ? ORDER BY date DESC", (habit_id,)).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def habit_export_sheets(include_archived: bool = True
-                        ) -> tuple[list[tuple[str, list[list]]], int, int]:
-    """按滴答「习惯导出」的格式组装工作表：每个习惯一个 sheet。
+                            ) -> tuple[list[tuple[str, list[list]]], int, int]:
+        """按滴答「习惯导出」的格式组装工作表：每个习惯一个 sheet。
 
-    返回 (sheets, 习惯数, 打卡条数)。
-    """
-    from datetime import datetime
+        返回 (sheets, 习惯数, 打卡条数)。
+        """
+        from datetime import datetime
 
-    from .xlsx import safe_sheet_name
+        from .xlsx import safe_sheet_name
 
-    used: set[str] = set()
-    sheets: list[tuple[str, list[list]]] = []
-    n_checks = 0
-    for h in habit_list():
-        if not include_archived and h.get("archived"):
-            continue
-        rows = habit_check_rows(h["id"])
-        n_checks += len(rows)
-        goal = habit_goal_count(h)
-        dates = [r["date"] for r in rows]
-        lo = min(dates) if dates else (h.get("start_date") or "")
-        hi = max(dates) if dates else ""
-        info = "\n".join([
-            "基本信息",
-            f"习惯名称：{h['name']}",
-            "鼓励语：",
-            f"习惯状态：{'已归档' if h.get('archived') else '进行中'}",
-            f"目标：{habit_goal_text(h)}",
-            f"所属分组：{h.get('group_name') or '其他'}",
-            f"提醒时间：{h.get('reminder') or ''} ",
-            f"频率：{habit_freq_text(h)}",
-        ])
-        table: list[list] = [[info], [f"日期:{lo}~{hi}"],
-                             ["日期", "时间", "完成情况", "完成量", "心情", "日志"]]
-        for r in rows:
-            try:
-                d = datetime.strptime(r["date"], "%Y-%m-%d")
-                shown = f"{d.year}年{d.month:02d}月{d.day:02d}日"
-            except ValueError:
-                shown = r["date"]
-            ts = (r.get("created_at") or "")[11:16]
-            table.append([shown, ts, "完成" if r["count"] >= goal else "未完成",
-                          r["count"], "", r.get("note") or ""])
-        name = safe_sheet_name(h["name"], used)
-        sheets.append((name, table))
-    return sheets, len(sheets), n_checks
+        used: set[str] = set()
+        sheets: list[tuple[str, list[list]]] = []
+        n_checks = 0
+        for h in habit_list():
+            if not include_archived and h.get("archived"):
+                continue
+            rows = habit_check_rows(h["id"])
+            n_checks += len(rows)
+            goal = habit_goal_count(h)
+            dates = [r["date"] for r in rows]
+            lo = min(dates) if dates else (h.get("start_date") or "")
+            hi = max(dates) if dates else ""
+            info = "\n".join([
+                "基本信息",
+                f"习惯名称：{h['name']}",
+                "鼓励语：",
+                f"习惯状态：{'已归档' if h.get('archived') else '进行中'}",
+                f"目标：{habit_goal_text(h)}",
+                f"所属分组：{h.get('group_name') or '其他'}",
+                f"提醒时间：{h.get('reminder') or ''} ",
+                f"频率：{habit_freq_text(h)}",
+            ])
+            table: list[list] = [[info], [f"日期:{lo}~{hi}"],
+                                 ["日期", "时间", "完成情况", "完成量", "心情", "日志"]]
+            for r in rows:
+                try:
+                    d = datetime.strptime(r["date"], "%Y-%m-%d")
+                    shown = f"{d.year}年{d.month:02d}月{d.day:02d}日"
+                except ValueError:
+                    shown = r["date"]
+                ts = (r.get("created_at") or "")[11:16]
+                table.append([shown, ts, "完成" if r["count"] >= goal else "未完成",
+                              r["count"], "", r.get("note") or ""])
+            name = safe_sheet_name(h["name"], used)
+            sheets.append((name, table))
+        return sheets, len(sheets), n_checks
 
 # ---------------------------------------------------------------------------
 # 提醒去重（待办 / 习惯共用一张 notified 表）
 # ---------------------------------------------------------------------------
 
 def mark_notified(kind: str, ref_id: int, slot: str) -> bool:
-    """记下「这条提醒已经响过」。返回 True 表示是第一次，调用方据此决定弹不弹。"""
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO notified(kind, ref_id, slot) VALUES (?,?,?)",
-            (kind, int(ref_id), slot))
-        return cur.rowcount > 0
+        """记下「这条提醒已经响过」。返回 True 表示是第一次，调用方据此决定弹不弹。"""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO notified(kind, ref_id, slot) VALUES (?,?,?)",
+                (kind, int(ref_id), slot))
+            return cur.rowcount > 0
 
 
 def prune_notified(keep_days: int = 14) -> None:
-    """清掉久远的去重记录，否则用得越久表越大。"""
-    with db.connect() as conn:
-        conn.execute(
-            "DELETE FROM notified WHERE created_at < "
-            "datetime('now', 'localtime', ?)", ("-%d days" % int(keep_days),))
+        """清掉久远的去重记录，否则用得越久表越大。"""
+        with db.connect() as conn:
+            conn.execute(
+                "DELETE FROM notified WHERE created_at < "
+                "datetime('now', 'localtime', ?)", ("-%d days" % int(keep_days),))
 
 
 # ---------------------------------------------------------------------------
@@ -2603,10 +2591,10 @@ ALGO_GRADUATED = len(ALGO_INTERVALS)      # 越过最后一档 = 记牢了，不
 
 
 def solution_language_label(key: str) -> str:
-    for k, label in SOLUTION_LANGUAGES:
-        if k == key:
-            return label
-    return (key or "").strip() or "其他"
+        for k, label in SOLUTION_LANGUAGES:
+            if k == key:
+                return label
+        return (key or "").strip() or "其他"
 
 
 # 标签分隔符：中文逗号、顿号、分号、换行都当分隔用，落库统一成英文逗号。
@@ -2614,332 +2602,332 @@ _TAG_SEP_RE = re.compile(r"[,，、;；\n]+")
 
 
 def split_tags(text: str) -> list[str]:
-    """切开一段标签文本，去空、去重、保持先后顺序。"""
-    out: list[str] = []
-    for t in _TAG_SEP_RE.split(text or ""):
-        t = t.strip()
-        if t and t not in out:
-            out.append(t)
-    return out
+        """切开一段标签文本，去空、去重、保持先后顺序。"""
+        out: list[str] = []
+        for t in _TAG_SEP_RE.split(text or ""):
+            t = t.strip()
+            if t and t not in out:
+                out.append(t)
+        return out
 
 
 def norm_tags(text: str) -> str:
-    return ",".join(split_tags(text))
+        return ",".join(split_tags(text))
 
 
 # 解题代码的语言。默认 C++（面试手写最常见），但同一题允许同时存多语言、
 # 同一种语言也能存多版解法。键名要和 code_view._SPECS 对齐，否则高亮退回纯文本。
 SOLUTION_LANGUAGES = [
-    ("cpp", "C++"), ("python", "Python"), ("java", "Java"),
-    ("javascript", "JavaScript"), ("typescript", "TypeScript"), ("go", "Go"),
-    ("c", "C"), ("csharp", "C#"), ("rust", "Rust"), ("kotlin", "Kotlin"),
-    ("swift", "Swift"), ("php", "PHP"), ("ruby", "Ruby"),
-    ("sql", "SQL"), ("bash", "Bash"), ("other", "其他"),
+        ("cpp", "C++"), ("python", "Python"), ("java", "Java"),
+        ("javascript", "JavaScript"), ("typescript", "TypeScript"), ("go", "Go"),
+        ("c", "C"), ("csharp", "C#"), ("rust", "Rust"), ("kotlin", "Kotlin"),
+        ("swift", "Swift"), ("php", "PHP"), ("ruby", "Ruby"),
+        ("sql", "SQL"), ("bash", "Bash"), ("other", "其他"),
 ]
 SOLUTION_DEFAULT_LANG = "cpp"
 SOLUTION_LANG_LABEL = {k: label for k, label in SOLUTION_LANGUAGES}
 
 
 def _algo_now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def algo_url(ref: str, url: str = "") -> str:
-    """有链接就用链接，否则按题号推（数字走搜索页，slug 拼题面）。"""
-    url = (url or "").strip()
-    if url:
-        return url
-    return leetcode_link(ref)
+        """有链接就用链接，否则按题号推（数字走搜索页，slug 拼题面）。"""
+        url = (url or "").strip()
+        if url:
+            return url
+        return leetcode_link(ref)
 
 
 def algo_display(p: dict) -> str:
-    """标题可以留空：只记了题号时列表和待办显示「力扣 15」。"""
-    t = (p.get("title") or "").strip()
-    if t:
-        return t
-    ref = (p.get("lc_ref") or "").strip()
-    if ref:
-        return "力扣 %s" % ref
-    return "未命名题目"
+        """标题可以留空：只记了题号时列表和待办显示「力扣 15」。"""
+        t = (p.get("title") or "").strip()
+        if t:
+            return t
+        ref = (p.get("lc_ref") or "").strip()
+        if ref:
+            return "力扣 %s" % ref
+        return "未命名题目"
 
 
 def algo_stage_date(stage: int, base: str = "") -> str:
-    """第 stage 档落在哪一天；越过最后一档返回空串（毕业，不再排复习）。"""
-    return review_stage_date(stage, base)
+        """第 stage 档落在哪一天；越过最后一档返回空串（毕业，不再排复习）。"""
+        return review_stage_date(stage, base)
 
 
 def algo_ensure_list() -> None:
-    """建「算法复习」清单（幂等）。用户自己建过同名清单也不会重复建。"""
-    _review_ensure_list("algo")
+        """建「算法复习」清单（幂等）。用户自己建过同名清单也不会重复建。"""
+        _review_ensure_list("algo")
 
 
 # ---- 题目本体 -------------------------------------------------------------
 
 def algo_problem_list(archived: int = 0, keyword: str = "", tag: str = "",
-                      due_only: bool = False) -> list[dict]:
-    """archived: 0=只在刷 / 1=只归档 / -1=全部。到期的排前面，其余按下次复习日。"""
-    sql = "SELECT * FROM algo_problems WHERE 1=1"
-    args: list[Any] = []
-    if archived != -1:
-        sql += " AND archived = ?"
-        args.append(int(archived))
-    if keyword:
-        sql += " AND (title LIKE ? OR tags LIKE ? OR lc_ref LIKE ? OR note LIKE ?)"
-        args.extend([f"%{keyword}%"] * 4)
-    if tag:
-        # 逗号包裹再匹配，避免「树」命中「二叉树」这种子串误伤
-        sql += " AND ',' || tags || ',' LIKE ?"
-        args.append(f"%,{tag},%")
-    if due_only:
-        sql += " AND next_review <> '' AND next_review <= date('now','localtime')"
-    sql += (" ORDER BY CASE WHEN next_review = '' THEN 1 ELSE 0 END, "
-            "next_review, id DESC")
-    with db.connect() as conn:
-        rows = conn.execute(sql, args).fetchall()
-    return [_row_to_dict(r) for r in rows]
+                          due_only: bool = False) -> list[dict]:
+        """archived: 0=只在刷 / 1=只归档 / -1=全部。到期的排前面，其余按下次复习日。"""
+        sql = "SELECT * FROM algo_problems WHERE 1=1"
+        args: list[Any] = []
+        if archived != -1:
+            sql += " AND archived = ?"
+            args.append(int(archived))
+        if keyword:
+            sql += " AND (title LIKE ? OR tags LIKE ? OR lc_ref LIKE ? OR note LIKE ?)"
+            args.extend([f"%{keyword}%"] * 4)
+        if tag:
+            # 逗号包裹再匹配，避免「树」命中「二叉树」这种子串误伤
+            sql += " AND ',' || tags || ',' LIKE ?"
+            args.append(f"%,{tag},%")
+        if due_only:
+            sql += " AND next_review <> '' AND next_review <= date('now','localtime')"
+        sql += (" ORDER BY CASE WHEN next_review = '' THEN 1 ELSE 0 END, "
+                "next_review, id DESC")
+        with db.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def algo_problem_get(pid: int) -> dict:
-    with db.connect() as conn:
-        row = conn.execute("SELECT * FROM algo_problems WHERE id = ?",
-                           (int(pid),)).fetchone()
-    return _row_to_dict(row)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM algo_problems WHERE id = ?",
+                               (int(pid),)).fetchone()
+        return _row_to_dict(row)
 
 
 def algo_problem_add(title: str, tags: str = "", lc_ref: str = "",
-                     url: str = "", note: str = "") -> int:
-    """新录一道题：立刻按第 0 档排出第一个复习点（也就是明天）。
+                         url: str = "", note: str = "") -> int:
+        """新录一道题：立刻按第 0 档排出第一个复习点（也就是明天）。
 
-    标题可以留空 —— 只记个力扣题号（或粘个链接）也算一道题，
-    名字由 algo_display 兜出来，不逼人先起标题。
-    """
-    title = (title or "").strip()
-    lc_ref = (lc_ref or "").strip()
-    url = (url or "").strip()
-    if not (title or lc_ref or url):
-        return 0
-    nxt = algo_stage_date(0)
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO algo_problems(title, tags, lc_ref, url, note, "
-            "stage, next_review) VALUES(?,?,?,?,?,?,?)",
-            (title, norm_tags(tags), lc_ref, algo_url(lc_ref, url),
-             note, 0, nxt))
-        pid = int(cur.lastrowid)
-    _review_ensure_open("algo", pid)
-    return pid
+        标题可以留空 —— 只记个力扣题号（或粘个链接）也算一道题，
+        名字由 algo_display 兜出来，不逼人先起标题。
+        """
+        title = (title or "").strip()
+        lc_ref = (lc_ref or "").strip()
+        url = (url or "").strip()
+        if not (title or lc_ref or url):
+            return 0
+        nxt = algo_stage_date(0)
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO algo_problems(title, tags, lc_ref, url, note, "
+                "stage, next_review) VALUES(?,?,?,?,?,?,?)",
+                (title, norm_tags(tags), lc_ref, algo_url(lc_ref, url),
+                 note, 0, nxt))
+            pid = int(cur.lastrowid)
+        _review_ensure_open("algo", pid)
+        return pid
 
 
 def algo_problem_update(pid: int, **fields: Any) -> None:
-    allowed = {"title", "tags", "lc_ref", "url", "note", "solved",
-               "last_written_at", "stage", "next_review", "archived"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
-        return
-    if "tags" in updates:
-        updates["tags"] = norm_tags(updates["tags"])
-    # 只填了题号却删掉标题时，得保证还有东西能认得出这道题
-    if "title" in updates or "lc_ref" in updates:
-        cur = algo_problem_get(pid)
-        t = updates.get("title", cur.get("title") or "").strip()
-        ref = updates.get("lc_ref", cur.get("lc_ref") or "").strip()
-        u = updates.get("url", cur.get("url") or "").strip()
-        if not (t or ref or u):
-            updates.pop("title", None)
-            updates.pop("lc_ref", None)
-            if not updates:
-                return
-        if "lc_ref" in updates or "url" in updates:
-            updates["url"] = u or algo_url(ref, u)
-    updates.setdefault("updated_at", _algo_now())
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE algo_problems SET {cols} WHERE id = ?",
-                     (*updates.values(), int(pid)))
-    if "title" in fields:
-        _review_sync_title("algo", pid)
+        allowed = {"title", "tags", "lc_ref", "url", "note", "solved",
+                   "last_written_at", "stage", "next_review", "archived"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        if "tags" in updates:
+            updates["tags"] = norm_tags(updates["tags"])
+        # 只填了题号却删掉标题时，得保证还有东西能认得出这道题
+        if "title" in updates or "lc_ref" in updates:
+            cur = algo_problem_get(pid)
+            t = updates.get("title", cur.get("title") or "").strip()
+            ref = updates.get("lc_ref", cur.get("lc_ref") or "").strip()
+            u = updates.get("url", cur.get("url") or "").strip()
+            if not (t or ref or u):
+                updates.pop("title", None)
+                updates.pop("lc_ref", None)
+                if not updates:
+                    return
+            if "lc_ref" in updates or "url" in updates:
+                updates["url"] = u or algo_url(ref, u)
+        updates.setdefault("updated_at", _algo_now())
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE algo_problems SET {cols} WHERE id = ?",
+                         (*updates.values(), int(pid)))
+        if "title" in fields:
+            _review_sync_title("algo", pid)
 
 
 def algo_problem_delete(pid: int) -> None:
-    """连题解、写作记录、复习映射一起删；挂在待办里的复习也一并撤掉。
+        """连题解、写作记录、复习映射一起删；挂在待办里的复习也一并撤掉。
 
-    历史那几条也要清 —— 它们是这一页合成的，题目本体没了之后留在清单里
-    只会是「一道已经不存在的题的复习」这种认不出来源的残骸。
-    """
-    pid = int(pid)
-    _review_erase("algo", pid)
-    with db.connect() as conn:
-        conn.execute("DELETE FROM algo_problems WHERE id = ?", (pid,))
-        conn.execute("DELETE FROM algo_solutions WHERE problem_id = ?", (pid,))
-        conn.execute("DELETE FROM algo_writes WHERE problem_id = ?", (pid,))
+        历史那几条也要清 —— 它们是这一页合成的，题目本体没了之后留在清单里
+        只会是「一道已经不存在的题的复习」这种认不出来源的残骸。
+        """
+        pid = int(pid)
+        _review_erase("algo", pid)
+        with db.connect() as conn:
+            conn.execute("DELETE FROM algo_problems WHERE id = ?", (pid,))
+            conn.execute("DELETE FROM algo_solutions WHERE problem_id = ?", (pid,))
+            conn.execute("DELETE FROM algo_writes WHERE problem_id = ?", (pid,))
 
 
 def algo_problem_set_archived(pid: int, on: bool) -> dict:
-    """归档 = 停止排复习但记录全留；取消归档按当前档期重新排一次。"""
-    pid = int(pid)
-    algo_problem_update(pid, archived=int(on))
-    if on:
-        _review_close("algo", pid, "dropped")
-    else:
-        p = algo_problem_get(pid)
-        if p and not p.get("next_review"):
-            algo_problem_update(pid, next_review=algo_stage_date(
-                int(p.get("stage") or 0)))
-        _review_ensure_open("algo", pid)
-    return algo_problem_get(pid)
+        """归档 = 停止排复习但记录全留；取消归档按当前档期重新排一次。"""
+        pid = int(pid)
+        algo_problem_update(pid, archived=int(on))
+        if on:
+            _review_close("algo", pid, "dropped")
+        else:
+            p = algo_problem_get(pid)
+            if p and not p.get("next_review"):
+                algo_problem_update(pid, next_review=algo_stage_date(
+                    int(p.get("stage") or 0)))
+            _review_ensure_open("algo", pid)
+        return algo_problem_get(pid)
 
 
 def algo_tags() -> list[str]:
-    """所有用过的标签（去重、按用得多少排），给筛选下拉用。"""
-    with db.connect() as conn:
-        rows = conn.execute("SELECT tags FROM algo_problems").fetchall()
-    counter: dict[str, int] = {}
-    for r in rows:
-        for t in split_tags(r["tags"]):
-            counter[t] = counter.get(t, 0) + 1
-    return [t for t, _n in sorted(counter.items(), key=lambda x: (-x[1], x[0]))]
+        """所有用过的标签（去重、按用得多少排），给筛选下拉用。"""
+        with db.connect() as conn:
+            rows = conn.execute("SELECT tags FROM algo_problems").fetchall()
+        counter: dict[str, int] = {}
+        for r in rows:
+            for t in split_tags(r["tags"]):
+                counter[t] = counter.get(t, 0) + 1
+        return [t for t, _n in sorted(counter.items(), key=lambda x: (-x[1], x[0]))]
 
 
 # ---- 题解（一题可多条）-----------------------------------------------------
 
 def algo_solution_list(pid: int) -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM algo_solutions WHERE problem_id = ? "
-            "ORDER BY CASE WHEN language = ? THEN 0 ELSE 1 END, language, id",
-            (int(pid), SOLUTION_DEFAULT_LANG)).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM algo_solutions WHERE problem_id = ? "
+                "ORDER BY CASE WHEN language = ? THEN 0 ELSE 1 END, language, id",
+                (int(pid), SOLUTION_DEFAULT_LANG)).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def algo_solution_add(pid: int, body: str = "", idea: str = "",
-                      language: str = SOLUTION_DEFAULT_LANG,
-                      source: str = "", allow_empty: bool = False) -> int:
-    """加一版解法。默认 C++，同一语言也能再存几版（暴力 / 最优）。"""
-    lang = (language or SOLUTION_DEFAULT_LANG).strip().lower()
-    if not allow_empty and not (body or "").strip() and not (idea or "").strip():
-        return 0
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO algo_solutions(problem_id, language, idea, body, source) "
-            "VALUES(?,?,?,?,?)",
-            (int(pid), lang, idea or "", body or "", (source or "").strip()))
-        return int(cur.lastrowid)
+                          language: str = SOLUTION_DEFAULT_LANG,
+                          source: str = "", allow_empty: bool = False) -> int:
+        """加一版解法。默认 C++，同一语言也能再存几版（暴力 / 最优）。"""
+        lang = (language or SOLUTION_DEFAULT_LANG).strip().lower()
+        if not allow_empty and not (body or "").strip() and not (idea or "").strip():
+            return 0
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO algo_solutions(problem_id, language, idea, body, source) "
+                "VALUES(?,?,?,?,?)",
+                (int(pid), lang, idea or "", body or "", (source or "").strip()))
+            return int(cur.lastrowid)
 
 
 def algo_solution_update(sid: int, **fields: Any) -> None:
-    updates = {k: v for k, v in fields.items()
-               if k in ("body", "source", "idea", "language")}
-    if not updates:
-        return
-    if "language" in updates:
-        updates["language"] = (str(updates["language"]) or "cpp").strip().lower()
-    updates["updated_at"] = _algo_now()
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE algo_solutions SET {cols} WHERE id = ?",
-                     (*updates.values(), int(sid)))
+        updates = {k: v for k, v in fields.items()
+                   if k in ("body", "source", "idea", "language")}
+        if not updates:
+            return
+        if "language" in updates:
+            updates["language"] = (str(updates["language"]) or "cpp").strip().lower()
+        updates["updated_at"] = _algo_now()
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE algo_solutions SET {cols} WHERE id = ?",
+                         (*updates.values(), int(sid)))
 
 
 def algo_solution_delete(sid: int) -> None:
-    with db.connect() as conn:
-        conn.execute("DELETE FROM algo_solutions WHERE id = ?", (int(sid),))
+        with db.connect() as conn:
+            conn.execute("DELETE FROM algo_solutions WHERE id = ?", (int(sid),))
 
 
 def algo_solution_map() -> dict:
-    return _solution_map("algo_solutions")
+        return _solution_map("algo_solutions")
 
 
 def _solution_map(table: str) -> dict:
-    """{题目 id: "C++×2 · Python"} —— 给列表行用，一次查完不逐题问。"""
-    if table not in ("algo_solutions", "interview_solutions"):
-        raise ValueError(table)
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT problem_id, language, COUNT(*) AS n FROM {table} "
-            "GROUP BY problem_id, language ORDER BY problem_id, language").fetchall()
-    grouped: dict[int, list[str]] = {}
-    for r in rows:
-        label = solution_language_label(r["language"])
-        n = int(r["n"] or 0)
-        grouped.setdefault(r["problem_id"], []).append(
-            f"{label}×{n}" if n > 1 else label)
-    return {pid: " · ".join(parts) for pid, parts in grouped.items()}
+        """{题目 id: "C++×2 · Python"} —— 给列表行用，一次查完不逐题问。"""
+        if table not in ("algo_solutions", "interview_solutions"):
+            raise ValueError(table)
+        with db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT problem_id, language, COUNT(*) AS n FROM {table} "
+                "GROUP BY problem_id, language ORDER BY problem_id, language").fetchall()
+        grouped: dict[int, list[str]] = {}
+        for r in rows:
+            label = solution_language_label(r["language"])
+            n = int(r["n"] or 0)
+            grouped.setdefault(r["problem_id"], []).append(
+                f"{label}×{n}" if n > 1 else label)
+        return {pid: " · ".join(parts) for pid, parts in grouped.items()}
 
 
 # ---- 写作历史 -------------------------------------------------------------
 
 def algo_write_list(pid: int) -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM algo_writes WHERE problem_id = ? "
-            "ORDER BY written_at DESC, id DESC", (int(pid),)).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM algo_writes WHERE problem_id = ? "
+                "ORDER BY written_at DESC, id DESC", (int(pid),)).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 # ---- 复习排期与待办的对账（实现见文件末尾的共用内核）------------------------
 
 def algo_review_list(pid: int) -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM algo_reviews WHERE problem_id = ? "
-            "ORDER BY id DESC", (int(pid),)).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM algo_reviews WHERE problem_id = ? "
+                "ORDER BY id DESC", (int(pid),)).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def algo_open_review(pid: int) -> dict:
-    return _review_open("algo", pid)
+        return _review_open("algo", pid)
 
 
 def algo_log_write(pid: int, independent: bool = True, note: str = "",
-                   when: str = "") -> dict:
-    """记一次「我写了这道题」，并按是否独立做出来推进档期。
+                       when: str = "") -> dict:
+        """记一次「我写了这道题」，并按是否独立做出来推进档期。
 
-    独立做出来 → 进下一档（间隔拉长）；没独立做出来 → 退回一档重记，
-    免得自以为会了把复习点排得太远。越过最后一档就不再排复习。
-    """
-    pid = int(pid)
-    if not algo_problem_get(pid):
-        return {}
-    when = (when or _algo_now()).strip()
-    with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO algo_writes(problem_id, written_at, independent, note) "
-            "VALUES(?,?,?,?)", (pid, when, int(bool(independent)), note))
-    _review_reschedule("algo", pid, independent, when)
-    algo_problem_update(pid, solved=1, last_written_at=when)
-    return algo_problem_get(pid)
+        独立做出来 → 进下一档（间隔拉长）；没独立做出来 → 退回一档重记，
+        免得自以为会了把复习点排得太远。越过最后一档就不再排复习。
+        """
+        pid = int(pid)
+        if not algo_problem_get(pid):
+            return {}
+        when = (when or _algo_now()).strip()
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO algo_writes(problem_id, written_at, independent, note) "
+                "VALUES(?,?,?,?)", (pid, when, int(bool(independent)), note))
+        _review_reschedule("algo", pid, independent, when)
+        algo_problem_update(pid, solved=1, last_written_at=when)
+        return algo_problem_get(pid)
 
 
 def algo_set_next_review(pid: int, due: str) -> dict:
-    """手动指定下次复习日（改档期）。旧的复习待办撤掉，按新日期重建。"""
-    return _review_set_next("algo", pid, due)
+        """手动指定下次复习日（改档期）。旧的复习待办撤掉，按新日期重建。"""
+        return _review_set_next("algo", pid, due)
 
 
 def algo_sync_reviews() -> int:
-    """启动对账：把每道在刷题缺的复习待办补齐。返回补建/推进的条数。"""
-    return _review_sync("algo")
+        """启动对账：把每道在刷题缺的复习待办补齐。返回补建/推进的条数。"""
+        return _review_sync("algo")
 
 
 def algo_stats() -> dict:
-    """页面顶部统计卡要的数。"""
-    with db.connect() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) c FROM algo_problems").fetchone()["c"]
-        active = conn.execute(
-            "SELECT COUNT(*) c FROM algo_problems WHERE archived = 0").fetchone()["c"]
-        due = conn.execute(
-            "SELECT COUNT(*) c FROM algo_problems WHERE archived = 0 "
-            "AND next_review <> '' AND next_review <= date('now','localtime')"
-        ).fetchone()["c"]
-        solved = conn.execute(
-            "SELECT COUNT(*) c FROM algo_problems WHERE solved = 1").fetchone()["c"]
-        writes = conn.execute(
-            "SELECT COUNT(*) c FROM algo_writes").fetchone()["c"]
-        grads = conn.execute(
-            "SELECT COUNT(*) c FROM algo_problems WHERE stage >= ?",
-            (ALGO_GRADUATED,)).fetchone()["c"]
-    return {"total": total, "active": active, "due": due, "solved": solved,
-            "writes": writes, "graduated": grads}
+        """页面顶部统计卡要的数。"""
+        with db.connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) c FROM algo_problems").fetchone()["c"]
+            active = conn.execute(
+                "SELECT COUNT(*) c FROM algo_problems WHERE archived = 0").fetchone()["c"]
+            due = conn.execute(
+                "SELECT COUNT(*) c FROM algo_problems WHERE archived = 0 "
+                "AND next_review <> '' AND next_review <= date('now','localtime')"
+            ).fetchone()["c"]
+            solved = conn.execute(
+                "SELECT COUNT(*) c FROM algo_problems WHERE solved = 1").fetchone()["c"]
+            writes = conn.execute(
+                "SELECT COUNT(*) c FROM algo_writes").fetchone()["c"]
+            grads = conn.execute(
+                "SELECT COUNT(*) c FROM algo_problems WHERE stage >= ?",
+                (ALGO_GRADUATED,)).fetchone()["c"]
+        return {"total": total, "active": active, "due": due, "solved": solved,
+                "writes": writes, "graduated": grads}
 
 
 # ---------------------------------------------------------------------------
@@ -2962,279 +2950,279 @@ _RAWQ_RE = re.compile(r"^【([^】]*)】\s*(.*)$")
 
 
 def interview_parse_deck(text: str) -> list[tuple[str, str]]:
-    """把题库文本解析成 [(问题, 答案)]，两种格式都吃。
+        """把题库文本解析成 [(问题, 答案)]，两种格式都吃。
 
-    1) clean.py 产出的成对格式：``【Q1】问题`` / ``【A1】答案``（答案可跨行）
-    2) raw_text 的原始格式：``【问题】`` 单独一行，后面普通行都是它的答案
+        1) clean.py 产出的成对格式：``【Q1】问题`` / ``【A1】答案``（答案可跨行）
+        2) raw_text 的原始格式：``【问题】`` 单独一行，后面普通行都是它的答案
 
-    两种混在同一个文件里也能解析；问题为空的条目直接丢。
-    """
-    items: list[list[str]] = []
+        两种混在同一个文件里也能解析；问题为空的条目直接丢。
+        """
+        items: list[list[str]] = []
 
-    def append_answer(part: str) -> None:
-        if not items or not part:
-            return
-        items[-1][1] = (items[-1][1] + "\n" + part).strip()
+        def append_answer(part: str) -> None:
+            if not items or not part:
+                return
+            items[-1][1] = (items[-1][1] + "\n" + part).strip()
 
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = _QQ_RE.match(line)
-        if m:
-            items.append([m.group(1).strip(), ""])
-            continue
-        m = _AA_RE.match(line)
-        if m:
-            append_answer(m.group(1).strip())
-            continue
-        m = _RAWQ_RE.match(line)
-        if m and not re.match(r"^[QA]\s*\d*$", m.group(1).strip()):
-            # 原始格式：问题在括号里；括号后还跟着字的话那部分是答案首行
-            q = m.group(1).strip()
-            items.append([q or m.group(2).strip(), "" if q else m.group(2).strip()])
-            continue
-        append_answer(line)
-    return [(q, a.strip()) for q, a in items if q]
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = _QQ_RE.match(line)
+            if m:
+                items.append([m.group(1).strip(), ""])
+                continue
+            m = _AA_RE.match(line)
+            if m:
+                append_answer(m.group(1).strip())
+                continue
+            m = _RAWQ_RE.match(line)
+            if m and not re.match(r"^[QA]\s*\d*$", m.group(1).strip()):
+                # 原始格式：问题在括号里；括号后还跟着字的话那部分是答案首行
+                q = m.group(1).strip()
+                items.append([q or m.group(2).strip(), "" if q else m.group(2).strip()])
+                continue
+            append_answer(line)
+        return [(q, a.strip()) for q, a in items if q]
 
 
 # 列表排序口径。默认按复习日，但攒题库的人最常问的是「我哪几道最弱」。
 INTERVIEW_ORDERS = {
-    "review": ("CASE WHEN next_review = '' THEN 1 ELSE 0 END, "
-               "next_review, id DESC"),
-    "weak": "incorrect_count DESC, correct_count ASC, seen_count ASC, id DESC",
-    "stale": ("CASE WHEN last_seen_at = '' THEN '0000-01-01' "
-              "ELSE last_seen_at END ASC, id DESC"),
-    "score": "best_score ASC, incorrect_count DESC, id DESC",
-    "new": "id DESC",
+        "review": ("CASE WHEN next_review = '' THEN 1 ELSE 0 END, "
+                   "next_review, id DESC"),
+        "weak": "incorrect_count DESC, correct_count ASC, seen_count ASC, id DESC",
+        "stale": ("CASE WHEN last_seen_at = '' THEN '0000-01-01' "
+                  "ELSE last_seen_at END ASC, id DESC"),
+        "score": "best_score ASC, incorrect_count DESC, id DESC",
+        "new": "id DESC",
 }
 
 
 def leetcode_link(ref: str) -> str:
-    """题号 → 力扣地址。
+        """题号 → 力扣地址。
 
-    数字题号拼不出题面 URL（力扣的题面用的是英文 slug，如
-    ``hopper-company-queries-i``，跟数字 ID 不是一回事），
-    所以走搜索页 ``/search/?q=<数字>``，点开就是那道题；
-    给了 slug 才能直接拼题面地址。
-    """
-    ref = (ref or "").strip().strip("/")
-    if not ref:
-        return ""
-    if ref.isdigit():
-        return "https://leetcode.cn/search/?q=%s" % ref
-    return "https://leetcode.cn/problems/%s/" % ref.lower()
+        数字题号拼不出题面 URL（力扣的题面用的是英文 slug，如
+        ``hopper-company-queries-i``，跟数字 ID 不是一回事），
+        所以走搜索页 ``/search/?q=<数字>``，点开就是那道题；
+        给了 slug 才能直接拼题面地址。
+        """
+        ref = (ref or "").strip().strip("/")
+        if not ref:
+            return ""
+        if ref.isdigit():
+            return "https://leetcode.cn/search/?q=%s" % ref
+        return "https://leetcode.cn/problems/%s/" % ref.lower()
 
 
 def interview_url(ref: str, url: str = "") -> str:
-    """用户自己粘过的链接优先；没粘才按题号推。"""
-    url = (url or "").strip()
-    if url:
-        return url
-    return leetcode_link(ref)
+        """用户自己粘过的链接优先；没粘才按题号推。"""
+        url = (url or "").strip()
+        if url:
+            return url
+        return leetcode_link(ref)
 
 
 def interview_display(p: dict) -> str:
-    """列表、待办标题、刷题页都显示这个：题干可以留空，只记题号也算一道题。"""
-    q = (p.get("question") or "").strip()
-    if q:
-        return q
-    ref = (p.get("lc_ref") or "").strip()
-    if ref:
-        return "力扣 %s" % ref
-    return "未命名题目"
+        """列表、待办标题、刷题页都显示这个：题干可以留空，只记题号也算一道题。"""
+        q = (p.get("question") or "").strip()
+        if q:
+            return q
+        ref = (p.get("lc_ref") or "").strip()
+        if ref:
+            return "力扣 %s" % ref
+        return "未命名题目"
 
 
 def interview_ref_is_numeric(p: dict) -> bool:
-    """题号是纯数字时，打开的是力扣搜索页而不是题面页，界面上说明一句。"""
-    return (p.get("lc_ref") or "").strip().isdigit()
+        """题号是纯数字时，打开的是力扣搜索页而不是题面页，界面上说明一句。"""
+        return (p.get("lc_ref") or "").strip().isdigit()
 
 
 def interview_problem_list(archived: int = 0, keyword: str = "", tag: str = "",
-                           due_only: bool = False,
-                           order: str = "review") -> list[dict]:
-    # no_answer 是算出来的列：没写标准答案的题打不了分，界面上必须看得出来
-    # sol_count 同理，省掉列表里逐题查代码的 N+1
-    sql = ("SELECT *, (answer = '') AS no_answer, "
-           "(SELECT COUNT(*) FROM interview_solutions s "
-           " WHERE s.problem_id = interview_problems.id) AS sol_count "
-           "FROM interview_problems WHERE 1=1")
-    args: list[Any] = []
-    if archived != -1:
-        sql += " AND archived = ?"
-        args.append(int(archived))
-    if keyword:
-        sql += (" AND (question LIKE ? OR answer LIKE ? OR tags LIKE ?"
-                " OR note LIKE ? OR lc_ref LIKE ?)")
-        args.extend([f"%{keyword}%"] * 5)
-    if tag:
-        sql += " AND ',' || tags || ',' LIKE ?"
-        args.append(f"%,{tag},%")
-    if due_only:
-        sql += " AND next_review <> '' AND next_review <= date('now','localtime')"
-    # 排序串全部来自上面写死的 INTERVIEW_ORDERS，不接受外部输入
-    sql += " ORDER BY " + INTERVIEW_ORDERS.get(order, INTERVIEW_ORDERS["review"])
-    with db.connect() as conn:
-        rows = conn.execute(sql, args).fetchall()
-    return [_row_to_dict(r) for r in rows]
+                               due_only: bool = False,
+                               order: str = "review") -> list[dict]:
+        # no_answer 是算出来的列：没写标准答案的题打不了分，界面上必须看得出来
+        # sol_count 同理，省掉列表里逐题查代码的 N+1
+        sql = ("SELECT *, (answer = '') AS no_answer, "
+               "(SELECT COUNT(*) FROM interview_solutions s "
+               " WHERE s.problem_id = interview_problems.id) AS sol_count "
+               "FROM interview_problems WHERE 1=1")
+        args: list[Any] = []
+        if archived != -1:
+            sql += " AND archived = ?"
+            args.append(int(archived))
+        if keyword:
+            sql += (" AND (question LIKE ? OR answer LIKE ? OR tags LIKE ?"
+                    " OR note LIKE ? OR lc_ref LIKE ?)")
+            args.extend([f"%{keyword}%"] * 5)
+        if tag:
+            sql += " AND ',' || tags || ',' LIKE ?"
+            args.append(f"%,{tag},%")
+        if due_only:
+            sql += " AND next_review <> '' AND next_review <= date('now','localtime')"
+        # 排序串全部来自上面写死的 INTERVIEW_ORDERS，不接受外部输入
+        sql += " ORDER BY " + INTERVIEW_ORDERS.get(order, INTERVIEW_ORDERS["review"])
+        with db.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def interview_problem_get(iid: int) -> dict:
-    with db.connect() as conn:
-        row = conn.execute("SELECT * FROM interview_problems WHERE id = ?",
-                           (int(iid),)).fetchone()
-    return _row_to_dict(row)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM interview_problems WHERE id = ?",
+                               (int(iid),)).fetchone()
+        return _row_to_dict(row)
 
 
 def interview_problem_add(question: str, answer: str = "", tags: str = "",
-                          url: str = "", note: str = "",
-                          lc_ref: str = "") -> int:
-    """新录一道题：立刻排出第一个复习点（明天）并挂上待办。
+                              url: str = "", note: str = "",
+                              lc_ref: str = "") -> int:
+        """新录一道题：立刻排出第一个复习点（明天）并挂上待办。
 
-    题干允许留空 —— 只记个力扣题号（或粘个链接）也算一道题，
-    名字由 interview_display 兜出来，不逼用户先起标题。
-    """
-    question = (question or "").strip()
-    lc_ref = (lc_ref or "").strip()
-    url = (url or "").strip()
-    if not (question or lc_ref or url):
-        return 0
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO interview_problems(question, answer, tags, url, note, "
-            "lc_ref, stage, next_review) VALUES(?,?,?,?,?,?,?,?)",
-            (question, (answer or "").strip(), norm_tags(tags),
-             interview_url(lc_ref, url), note, lc_ref, 0,
-             review_stage_date(0)))
-        iid = int(cur.lastrowid)
-    _review_ensure_open("interview", iid)
-    return iid
+        题干允许留空 —— 只记个力扣题号（或粘个链接）也算一道题，
+        名字由 interview_display 兜出来，不逼用户先起标题。
+        """
+        question = (question or "").strip()
+        lc_ref = (lc_ref or "").strip()
+        url = (url or "").strip()
+        if not (question or lc_ref or url):
+            return 0
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO interview_problems(question, answer, tags, url, note, "
+                "lc_ref, stage, next_review) VALUES(?,?,?,?,?,?,?,?)",
+                (question, (answer or "").strip(), norm_tags(tags),
+                 interview_url(lc_ref, url), note, lc_ref, 0,
+                 review_stage_date(0)))
+            iid = int(cur.lastrowid)
+        _review_ensure_open("interview", iid)
+        return iid
 
 
 def interview_problem_update(iid: int, **fields: Any) -> None:
-    allowed = {"question", "answer", "tags", "url", "note", "lc_ref", "stage",
-               "next_review", "archived"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
-        return
-    if "tags" in updates:
-        updates["tags"] = norm_tags(updates["tags"])
-    # 只填了题号却删掉题干时，得保证还有东西能认得出这道题
-    if "question" in updates or "lc_ref" in updates:
-        cur = interview_problem_get(iid)
-        q = updates.get("question", cur.get("question") or "").strip()
-        ref = updates.get("lc_ref", cur.get("lc_ref") or "").strip()
-        u = updates.get("url", cur.get("url") or "").strip()
-        if not (q or ref or u):
-            updates.pop("question", None)
-            updates.pop("lc_ref", None)
-            if not updates:
-                return
-        # 题号变了就重算链接（用户手粘过的链接优先保留）
-        if "lc_ref" in updates or "url" in updates:
-            updates["url"] = u or interview_url(ref, u)
-    updates.setdefault("updated_at", _algo_now())
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE interview_problems SET {cols} WHERE id = ?",
-                     (*updates.values(), int(iid)))
-    if "question" in updates or "lc_ref" in updates:
-        _review_sync_title("interview", iid)
+        allowed = {"question", "answer", "tags", "url", "note", "lc_ref", "stage",
+                   "next_review", "archived"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        if "tags" in updates:
+            updates["tags"] = norm_tags(updates["tags"])
+        # 只填了题号却删掉题干时，得保证还有东西能认得出这道题
+        if "question" in updates or "lc_ref" in updates:
+            cur = interview_problem_get(iid)
+            q = updates.get("question", cur.get("question") or "").strip()
+            ref = updates.get("lc_ref", cur.get("lc_ref") or "").strip()
+            u = updates.get("url", cur.get("url") or "").strip()
+            if not (q or ref or u):
+                updates.pop("question", None)
+                updates.pop("lc_ref", None)
+                if not updates:
+                    return
+            # 题号变了就重算链接（用户手粘过的链接优先保留）
+            if "lc_ref" in updates or "url" in updates:
+                updates["url"] = u or interview_url(ref, u)
+        updates.setdefault("updated_at", _algo_now())
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE interview_problems SET {cols} WHERE id = ?",
+                         (*updates.values(), int(iid)))
+        if "question" in updates or "lc_ref" in updates:
+            _review_sync_title("interview", iid)
 
 
 def interview_problem_delete(iid: int) -> None:
-    """作答历史和复习条目一起清：残骸留在清单里就认不出来源了。"""
-    iid = int(iid)
-    _review_erase("interview", iid)
-    with db.connect() as conn:
-        conn.execute("DELETE FROM interview_problems WHERE id = ?", (iid,))
-        conn.execute("DELETE FROM interview_solutions WHERE problem_id = ?", (iid,))
-        conn.execute("DELETE FROM interview_attempts WHERE problem_id = ?", (iid,))
+        """作答历史和复习条目一起清：残骸留在清单里就认不出来源了。"""
+        iid = int(iid)
+        _review_erase("interview", iid)
+        with db.connect() as conn:
+            conn.execute("DELETE FROM interview_problems WHERE id = ?", (iid,))
+            conn.execute("DELETE FROM interview_solutions WHERE problem_id = ?", (iid,))
+            conn.execute("DELETE FROM interview_attempts WHERE problem_id = ?", (iid,))
 
 
 def interview_problem_set_archived(iid: int, on: bool) -> dict:
-    iid = int(iid)
-    interview_problem_update(iid, archived=int(on))
-    if on:
-        _review_close("interview", iid, "dropped")
-    else:
-        p = interview_problem_get(iid)
-        if p and not p.get("next_review"):
-            interview_problem_update(iid, next_review=review_stage_date(
-                int(p.get("stage") or 0)))
-        _review_ensure_open("interview", iid)
-    return interview_problem_get(iid)
+        iid = int(iid)
+        interview_problem_update(iid, archived=int(on))
+        if on:
+            _review_close("interview", iid, "dropped")
+        else:
+            p = interview_problem_get(iid)
+            if p and not p.get("next_review"):
+                interview_problem_update(iid, next_review=review_stage_date(
+                    int(p.get("stage") or 0)))
+            _review_ensure_open("interview", iid)
+        return interview_problem_get(iid)
 
 
 def interview_import_text(text: str, tags: str = "") -> dict:
-    """批量导入题库文本，返回 {"created", "skipped"}。
+        """批量导入题库文本，返回 {"created", "skipped"}。
 
-    重复导入同一份是安全的：问题文本（忽略空白差异）已存在的条目跳过，
-    这样误点两次导入不会把题库翻一倍。
-    """
-    parsed = interview_parse_deck(text)
-    created = skipped = 0
-    with db.connect() as conn:
-        known = {(r["question"] or "").replace(" ", "").replace("\n", "")
-                 for r in conn.execute("SELECT question FROM interview_problems")}
-    for q, a in parsed:
-        key = q.replace(" ", "").replace("\n", "")
-        if key in known:
-            skipped += 1
-            continue
-        known.add(key)
-        if interview_problem_add(q, a, tags):
-            created += 1
-    return {"created": created, "skipped": skipped}
+        重复导入同一份是安全的：问题文本（忽略空白差异）已存在的条目跳过，
+        这样误点两次导入不会把题库翻一倍。
+        """
+        parsed = interview_parse_deck(text)
+        created = skipped = 0
+        with db.connect() as conn:
+            known = {(r["question"] or "").replace(" ", "").replace("\n", "")
+                     for r in conn.execute("SELECT question FROM interview_problems")}
+        for q, a in parsed:
+            key = q.replace(" ", "").replace("\n", "")
+            if key in known:
+                skipped += 1
+                continue
+            known.add(key)
+            if interview_problem_add(q, a, tags):
+                created += 1
+        return {"created": created, "skipped": skipped}
 
 
 def _merge_tags(existing: str, add=(), remove=()) -> str:
-    """标签合并：去重、保持原有顺序，新增的追加在末尾。"""
-    out: list[str] = split_tags(existing)
-    for t in add:
-        for piece in split_tags(t or ""):
-            if piece not in out:
-                out.append(piece)
-    drop = {(t or "").strip() for t in remove}
-    return ",".join(t for t in out if t and t not in drop)
+        """标签合并：去重、保持原有顺序，新增的追加在末尾。"""
+        out: list[str] = split_tags(existing)
+        for t in add:
+            for piece in split_tags(t or ""):
+                if piece not in out:
+                    out.append(piece)
+        drop = {(t or "").strip() for t in remove}
+        return ",".join(t for t in out if t and t not in drop)
 
 
 def interview_archive_many(ids, on: bool) -> int:
-    """批量归档 / 取消归档。逐条走单条入口，归档时撤合成待办那套逻辑才不会漏。"""
-    for iid in ids:
-        interview_problem_set_archived(iid, on)
-    return len(list(ids))
+        """批量归档 / 取消归档。逐条走单条入口，归档时撤合成待办那套逻辑才不会漏。"""
+        for iid in ids:
+            interview_problem_set_archived(iid, on)
+        return len(list(ids))
 
 
 def interview_delete_many(ids) -> int:
-    n = 0
-    for iid in ids:
-        interview_problem_delete(iid)
-        n += 1
-    return n
+        n = 0
+        for iid in ids:
+            interview_problem_delete(iid)
+            n += 1
+        return n
 
 
 def interview_tags_add(ids, raw: str) -> int:
-    """给选中的题批量加标签（一次可以填多个，逗号分隔）。"""
-    add = [t for t in (raw or "").split(",") if t.strip()]
-    if not add:
-        return 0
-    for iid in ids:
-        p = interview_problem_get(iid)
-        if p:
-            interview_problem_update(iid, tags=_merge_tags(p.get("tags"), add))
-    return len(list(ids))
+        """给选中的题批量加标签（一次可以填多个，逗号分隔）。"""
+        add = [t for t in (raw or "").split(",") if t.strip()]
+        if not add:
+            return 0
+        for iid in ids:
+            p = interview_problem_get(iid)
+            if p:
+                interview_problem_update(iid, tags=_merge_tags(p.get("tags"), add))
+        return len(list(ids))
 
 
 def interview_tags_remove(ids, tag: str) -> int:
-    tag = (tag or "").strip()
-    if not tag:
-        return 0
-    for iid in ids:
-        p = interview_problem_get(iid)
-        if p:
-            interview_problem_update(iid, tags=_merge_tags(p.get("tags"), remove=[tag]))
-    return len(list(ids))
+        tag = (tag or "").strip()
+        if not tag:
+            return 0
+        for iid in ids:
+            p = interview_problem_get(iid)
+            if p:
+                interview_problem_update(iid, tags=_merge_tags(p.get("tags"), remove=[tag]))
+        return len(list(ids))
 
 
 # ---- 面经批量粘贴：一组标题 + 编号问题 + 可选的代码题 ----------------------
@@ -3255,393 +3243,393 @@ _ANS_CLOSE_RE = re.compile(r"【\s*/\s*(?:答案|答|A)\s*\d*\s*】")
 
 
 def interview_parse_notes(text: str) -> list[tuple[str, str, str]]:
-    """解析面经文本，返回 [(组名, 问题, 答案)]。
+        """解析面经文本，返回 [(组名, 问题, 答案)]。
 
-    题目边界是编号行；答案用 【答案】/【A】 开、【/答案】/【/A】 闭，
-    沿用题库 txt 里 【Q】/【A】 那一套写法。
+        题目边界是编号行；答案用 【答案】/【A】 开、【/答案】/【/A】 闭，
+        沿用题库 txt 里 【Q】/【A】 那一套写法。
 
-    关键一条：**在答案块里除了闭合标记什么都不认**。答案里写「1. 先粗聚
-    2. 再精聚」或「代码：xxx」都不会被当成新题 —— 与其去猜哪个编号是真题目，
-    不如在答案区域内压根不做题目识别。
+        关键一条：**在答案块里除了闭合标记什么都不认**。答案里写「1. 先粗聚
+        2. 再精聚」或「代码：xxx」都不会被当成新题 —— 与其去猜哪个编号是真题目，
+        不如在答案区域内压根不做题目识别。
 
-    两种写法：
-      单行  ``3. 讲下 fid？【答案】fid 是…``   —— 到行尾结束
-      块    ``【答案】`` 单独收尾，之后每行都算答案，直到 ``【/答案】``
-    块式漏写闭合标记时，后面所有行都会被当成答案一路吃到文末（条数会当场掉下来），
-    界面上按 interview_notes_block_balance 给出警告。
-    其余容错照旧：编号 1. / 1、/ 1）都行；「代码：无」丢掉；折行接到上一题。
-    """
-    items: list[list[str]] = []
-    group = ""
-    in_block = False
-    queue = deque(line.strip() for line in (text or "").splitlines()
-                   if line.strip())
+        两种写法：
+          单行  ``3. 讲下 fid？【答案】fid 是…``   —— 到行尾结束
+          块    ``【答案】`` 单独收尾，之后每行都算答案，直到 ``【/答案】``
+        块式漏写闭合标记时，后面所有行都会被当成答案一路吃到文末（条数会当场掉下来），
+        界面上按 interview_notes_block_balance 给出警告。
+        其余容错照旧：编号 1. / 1、/ 1）都行；「代码：无」丢掉；折行接到上一题。
+        """
+        items: list[list[str]] = []
+        group = ""
+        in_block = False
+        queue = deque(line.strip() for line in (text or "").splitlines()
+                       if line.strip())
 
-    def add_answer(part: str) -> None:
-        part = (part or "").strip()
-        if not items or not part:
-            return
-        items[-1][2] = (items[-1][2] + "\n" + part).strip()
+        def add_answer(part: str) -> None:
+            part = (part or "").strip()
+            if not items or not part:
+                return
+            items[-1][2] = (items[-1][2] + "\n" + part).strip()
 
-    while queue:
-        line = queue.popleft()
+        while queue:
+            line = queue.popleft()
 
-        if in_block:
-            m = _ANS_CLOSE_RE.search(line)
-            if m is None:
-                add_answer(line)
-                continue
-            add_answer(line[:m.start()])
-            in_block = False
-            rest = line[m.end():].strip()
-            if rest:
-                queue.appendleft(rest)      # 同一行闭合后还有内容，接着当普通行认
-            continue
-
-        am = _ANS_OPEN_RE.search(line)
-        head = line
-        tail = ""
-        if am:
-            head = line[:am.start()].strip()
-            tail = line[am.end():].strip()
-            cm = _ANS_CLOSE_RE.search(tail)
-            if cm:
-                # 「【答案】答一【/答案】2. 题二」这种整行写完的写法
-                tail, rest = tail[:cm.start()].strip(), tail[cm.end():].strip()
+            if in_block:
+                m = _ANS_CLOSE_RE.search(line)
+                if m is None:
+                    add_answer(line)
+                    continue
+                add_answer(line[:m.start()])
+                in_block = False
+                rest = line[m.end():].strip()
                 if rest:
-                    queue.appendleft(rest)
-                closed_here = True
+                    queue.appendleft(rest)      # 同一行闭合后还有内容，接着当普通行认
+                continue
+
+            am = _ANS_OPEN_RE.search(line)
+            head = line
+            tail = ""
+            if am:
+                head = line[:am.start()].strip()
+                tail = line[am.end():].strip()
+                cm = _ANS_CLOSE_RE.search(tail)
+                if cm:
+                    # 「【答案】答一【/答案】2. 题二」这种整行写完的写法
+                    tail, rest = tail[:cm.start()].strip(), tail[cm.end():].strip()
+                    if rest:
+                        queue.appendleft(rest)
+                    closed_here = True
+                else:
+                    closed_here = False
             else:
                 closed_here = False
-        else:
-            closed_here = False
 
-        if head:
-            m = _NOTES_NUM_RE.match(head)
-            if m:
-                items.append([group, m.group(2).strip(), ""])
-            else:
-                m = _NOTES_CODE_RE.match(head)
+            if head:
+                m = _NOTES_NUM_RE.match(head)
                 if m:
-                    body = m.group(2).strip()
-                    if body.lower() not in _NOTES_BLANK:
-                        items.append([group, "代码：%s" % body, ""])
+                    items.append([group, m.group(2).strip(), ""])
                 else:
-                    m = _NOTES_GROUP_RE.match(head)
+                    m = _NOTES_CODE_RE.match(head)
                     if m:
-                        group = m.group(1).strip()
-                    elif items and items[-1][0] == group and items[-1][1]:
-                        items[-1][1] = (items[-1][1] + " " + head).strip()
+                        body = m.group(2).strip()
+                        if body.lower() not in _NOTES_BLANK:
+                            items.append([group, "代码：%s" % body, ""])
                     else:
-                        items.append([group, head, ""])
+                        m = _NOTES_GROUP_RE.match(head)
+                        if m:
+                            group = m.group(1).strip()
+                        elif items and items[-1][0] == group and items[-1][1]:
+                            items[-1][1] = (items[-1][1] + " " + head).strip()
+                        else:
+                            items.append([group, head, ""])
 
-        if am:
-            if tail:
-                add_answer(tail)
-            elif not closed_here:
-                in_block = True
+            if am:
+                if tail:
+                    add_answer(tail)
+                elif not closed_here:
+                    in_block = True
 
-    return [(g, q, a.strip()) for g, q, a in items if q]
+        return [(g, q, a.strip()) for g, q, a in items if q]
 
 
 def interview_notes_block_balance(text: str) -> tuple[int, int]:
-    """(开了几个答案块, 正常闭合了几个) —— 预览用它警告漏写【/答案】。
+        """(开了几个答案块, 正常闭合了几个) —— 预览用它警告漏写【/答案】。
 
-    走的是和 interview_parse_notes 同一套判定，不是数标记个数：
-    单行写法 `【答案】后面还有字` 本来就不需要闭合，同行那个 【/答案】
-    也不该记进闭合数，否则「开 1 闭 2」会把真没闭合的那块糊过去。
-    """
-    opens = closed = 0
-    in_block = False
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if in_block:
-            if _ANS_CLOSE_RE.search(line):
-                in_block = False
-                closed += 1
-            continue
-        m = _ANS_OPEN_RE.search(line)
-        if not m:
-            continue
-        rest = line[m.end():]
-        if _ANS_CLOSE_RE.search(rest):
-            continue                      # 同一行就写完了，压根没开块
-        if not rest.strip():
-            in_block = True
-            opens += 1
-    return opens, closed
+        走的是和 interview_parse_notes 同一套判定，不是数标记个数：
+        单行写法 `【答案】后面还有字` 本来就不需要闭合，同行那个 【/答案】
+        也不该记进闭合数，否则「开 1 闭 2」会把真没闭合的那块糊过去。
+        """
+        opens = closed = 0
+        in_block = False
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if in_block:
+                if _ANS_CLOSE_RE.search(line):
+                    in_block = False
+                    closed += 1
+                continue
+            m = _ANS_OPEN_RE.search(line)
+            if not m:
+                continue
+            rest = line[m.end():]
+            if _ANS_CLOSE_RE.search(rest):
+                continue                      # 同一行就写完了，压根没开块
+            if not rest.strip():
+                in_block = True
+                opens += 1
+        return opens, closed
 
 
 def interview_import_notes(text: str, extra_tag: str = "") -> dict:
-    """导入面经：组名当标签，问题和答案一起入库。返回分组明细供预览/回执。"""
-    parsed = interview_parse_notes(text)
-    extra = [t.strip() for t in (extra_tag or "").split(",") if t.strip()]
-    created = skipped = answered = 0
-    per_group: dict[str, int] = {}
-    with db.connect() as conn:
-        known = {(r["question"] or "").replace(" ", "").replace("\n", "")
-                 for r in conn.execute("SELECT question FROM interview_problems")}
-    for group, q, answer in parsed:
-        key = q.replace(" ", "").replace("\n", "")
-        if key in known:
-            skipped += 1
-            continue
-        known.add(key)
-        tags = _merge_tags("", (group,) if group else ())
-        tags = _merge_tags(tags, extra)
-        if interview_problem_add(q, answer, tags):
-            created += 1
-            if answer.strip():
-                answered += 1
-            per_group[group or "（无组名）"] = per_group.get(group or "（无组名）", 0) + 1
-    return {"created": created, "skipped": skipped, "groups": per_group,
-            "answered": answered, "total": len(parsed)}
+        """导入面经：组名当标签，问题和答案一起入库。返回分组明细供预览/回执。"""
+        parsed = interview_parse_notes(text)
+        extra = [t.strip() for t in (extra_tag or "").split(",") if t.strip()]
+        created = skipped = answered = 0
+        per_group: dict[str, int] = {}
+        with db.connect() as conn:
+            known = {(r["question"] or "").replace(" ", "").replace("\n", "")
+                     for r in conn.execute("SELECT question FROM interview_problems")}
+        for group, q, answer in parsed:
+            key = q.replace(" ", "").replace("\n", "")
+            if key in known:
+                skipped += 1
+                continue
+            known.add(key)
+            tags = _merge_tags("", (group,) if group else ())
+            tags = _merge_tags(tags, extra)
+            if interview_problem_add(q, answer, tags):
+                created += 1
+                if answer.strip():
+                    answered += 1
+                per_group[group or "（无组名）"] = per_group.get(group or "（无组名）", 0) + 1
+        return {"created": created, "skipped": skipped, "groups": per_group,
+                "answered": answered, "total": len(parsed)}
 
 
 def interview_tags() -> list[str]:
-    with db.connect() as conn:
-        rows = conn.execute("SELECT tags FROM interview_problems").fetchall()
-    counter: dict[str, int] = {}
-    for r in rows:
-        for t in split_tags(r["tags"]):
-            counter[t] = counter.get(t, 0) + 1
-    return [t for t, _n in sorted(counter.items(), key=lambda x: (-x[1], x[0]))]
+        with db.connect() as conn:
+            rows = conn.execute("SELECT tags FROM interview_problems").fetchall()
+        counter: dict[str, int] = {}
+        for r in rows:
+            for t in split_tags(r["tags"]):
+                counter[t] = counter.get(t, 0) + 1
+        return [t for t, _n in sorted(counter.items(), key=lambda x: (-x[1], x[0]))]
 
 
 # ---- 打分与差异高亮 --------------------------------------------------------
 
 def interview_score(ref: str, user: str) -> int:
-    """用户答案与标准答案的相似度，0-100。跟 AnswerMachine 同一个算法。"""
-    a = re.sub(r"\s+", " ", ref or "").strip()
-    b = re.sub(r"\s+", " ", user or "").strip()
-    if not a:
-        return 0
-    return round(SequenceMatcher(None, a, b).ratio() * 100)
+        """用户答案与标准答案的相似度，0-100。跟 AnswerMachine 同一个算法。"""
+        a = re.sub(r"\s+", " ", ref or "").strip()
+        b = re.sub(r"\s+", " ", user or "").strip()
+        if not a:
+            return 0
+        return round(SequenceMatcher(None, a, b).ratio() * 100)
 
 
 def interview_highlight(ref: str, user: str) -> str:
-    """把标准答案里跟用户答案对不上的部分用 [] 框出来，其余原样保留。"""
-    matcher = SequenceMatcher(None, ref or "", user or "")
-    out = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        piece = (ref or "")[i1:i2]
-        if tag == "equal" or not piece:
-            out.append(piece)
-        else:
-            out.append("[" + piece + "]")
-    return "".join(out)
+        """把标准答案里跟用户答案对不上的部分用 [] 框出来，其余原样保留。"""
+        matcher = SequenceMatcher(None, ref or "", user or "")
+        out = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            piece = (ref or "")[i1:i2]
+            if tag == "equal" or not piece:
+                out.append(piece)
+            else:
+                out.append("[" + piece + "]")
+        return "".join(out)
 
 
 # ---- 抽题与作答 ------------------------------------------------------------
 
 def interview_pick(exclude_id: int = 0, tag: str = "",
-                   keyword: str = "") -> dict:
-    """抽一题：先清到期队列，再按错误率加权。
+                       keyword: str = "") -> dict:
+        """抽一题：先清到期队列，再按错误率加权。
 
-    到期优先是必须的 —— 记忆点排好了却迟迟抽不到，整套艾宾浩斯就白做了。
-    没有到期题时才回到全量按权重抽：错得越多越常抽，从没答对过的给大权重
-    （AnswerMachine 原式 max(1.5*(错+1)-对, 1) + 未答对过 ? 50 : 0）。
-    exclude_id 用来避开刚考过的那题，原程序会连着抽到同一道。
-    """
-    rows = interview_problem_list(archived=0, tag=tag, keyword=keyword)
-    if not rows:
-        return {}
-    today = date.today().isoformat()
-    due = [r for r in rows
-           if r.get("next_review") and r["next_review"] <= today
-           and r["id"] != int(exclude_id)]
-    pool = due or rows
-    if len(pool) > 1:
-        pool = [r for r in pool if r["id"] != int(exclude_id)]
-    weights = [
-        max(_PICK_SMOOTH * (int(r.get("incorrect_count") or 0) + 1)
-            - int(r.get("correct_count") or 0), 1)
-        + (0 if int(r.get(_ROUND_COL) or 0) else _PICK_NEW_BONUS)
-        for r in pool]
-    return random.choices(pool, weights=weights, k=1)[0]
+        到期优先是必须的 —— 记忆点排好了却迟迟抽不到，整套艾宾浩斯就白做了。
+        没有到期题时才回到全量按权重抽：错得越多越常抽，从没答对过的给大权重
+        （AnswerMachine 原式 max(1.5*(错+1)-对, 1) + 未答对过 ? 50 : 0）。
+        exclude_id 用来避开刚考过的那题，原程序会连着抽到同一道。
+        """
+        rows = interview_problem_list(archived=0, tag=tag, keyword=keyword)
+        if not rows:
+            return {}
+        today = date.today().isoformat()
+        due = [r for r in rows
+               if r.get("next_review") and r["next_review"] <= today
+               and r["id"] != int(exclude_id)]
+        pool = due or rows
+        if len(pool) > 1:
+            pool = [r for r in pool if r["id"] != int(exclude_id)]
+        weights = [
+            max(_PICK_SMOOTH * (int(r.get("incorrect_count") or 0) + 1)
+                - int(r.get("correct_count") or 0), 1)
+            + (0 if int(r.get(_ROUND_COL) or 0) else _PICK_NEW_BONUS)
+            for r in pool]
+        return random.choices(pool, weights=weights, k=1)[0]
 
 
 # ---- 解题代码：一题多语言、同语言多方案 ------------------------------------
 
 def interview_solution_list(pid: int, language: str = "") -> list[dict]:
-    sql = "SELECT * FROM interview_solutions WHERE problem_id = ?"
-    args: list[Any] = [int(pid)]
-    if language:
-        sql += " AND language = ?"
-        args.append(language)
-    sql += " ORDER BY CASE WHEN language = ? THEN 0 ELSE 1 END, language, id"
-    args.append(SOLUTION_DEFAULT_LANG)
-    with db.connect() as conn:
-        rows = conn.execute(sql, args).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        sql = "SELECT * FROM interview_solutions WHERE problem_id = ?"
+        args: list[Any] = [int(pid)]
+        if language:
+            sql += " AND language = ?"
+            args.append(language)
+        sql += " ORDER BY CASE WHEN language = ? THEN 0 ELSE 1 END, language, id"
+        args.append(SOLUTION_DEFAULT_LANG)
+        with db.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def interview_solution_get(sid: int) -> dict:
-    with db.connect() as conn:
-        row = conn.execute("SELECT * FROM interview_solutions WHERE id = ?",
-                           (int(sid),)).fetchone()
-    return _row_to_dict(row)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM interview_solutions WHERE id = ?",
+                               (int(sid),)).fetchone()
+        return _row_to_dict(row)
 
 
 def interview_solution_add(pid: int, body: str = "", idea: str = "",
-                           language: str = SOLUTION_DEFAULT_LANG,
-                           allow_empty: bool = False) -> int:
-    """加一版解法。默认 C++，但同一语言可以再存几版（比如暴力 + 最优）。
+                               language: str = SOLUTION_DEFAULT_LANG,
+                               allow_empty: bool = False) -> int:
+        """加一版解法。默认 C++，但同一语言可以再存几版（比如暴力 + 最优）。
 
-    allow_empty 只给界面上「先建一张空卡再往里写」用；批量导入走默认值，
-    免得把空解法塞进库。
-    """
-    lang = (language or SOLUTION_DEFAULT_LANG).strip().lower()
-    if not allow_empty and not (body or "").strip() and not (idea or "").strip():
-        return 0
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO interview_solutions(problem_id, language, body, idea) "
-            "VALUES(?,?,?,?)", (int(pid), lang, body or "", idea or ""))
-        return int(cur.lastrowid)
+        allow_empty 只给界面上「先建一张空卡再往里写」用；批量导入走默认值，
+        免得把空解法塞进库。
+        """
+        lang = (language or SOLUTION_DEFAULT_LANG).strip().lower()
+        if not allow_empty and not (body or "").strip() and not (idea or "").strip():
+            return 0
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO interview_solutions(problem_id, language, body, idea) "
+                "VALUES(?,?,?,?)", (int(pid), lang, body or "", idea or ""))
+            return int(cur.lastrowid)
 
 
 def interview_solution_update(sid: int, **fields: Any) -> None:
-    updates = {k: v for k, v in fields.items()
-               if k in ("body", "idea", "language")}
-    if not updates:
-        return
-    if "language" in updates:
-        updates["language"] = (str(updates["language"]) or "cpp").strip().lower()
-    updates["updated_at"] = _algo_now()
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE interview_solutions SET {cols} WHERE id = ?",
-                     (*updates.values(), int(sid)))
+        updates = {k: v for k, v in fields.items()
+                   if k in ("body", "idea", "language")}
+        if not updates:
+            return
+        if "language" in updates:
+            updates["language"] = (str(updates["language"]) or "cpp").strip().lower()
+        updates["updated_at"] = _algo_now()
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE interview_solutions SET {cols} WHERE id = ?",
+                         (*updates.values(), int(sid)))
 
 
 def interview_solution_delete(sid: int) -> None:
-    with db.connect() as conn:
-        conn.execute("DELETE FROM interview_solutions WHERE id = ?", (int(sid),))
+        with db.connect() as conn:
+            conn.execute("DELETE FROM interview_solutions WHERE id = ?", (int(sid),))
 
 
 def interview_solution_map() -> dict:
-    """{题目 id: "C++×2 · Python"} —— 给列表行用，一次查完不逐题问。"""
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT problem_id, language, COUNT(*) AS n FROM interview_solutions "
-            "GROUP BY problem_id, language ORDER BY problem_id, language").fetchall()
-    grouped: dict[int, list[str]] = {}
-    for r in rows:
-        label = solution_language_label(r["language"])
-        n = int(r["n"] or 0)
-        grouped.setdefault(r["problem_id"], []).append(
-            f"{label}×{n}" if n > 1 else label)
-    return {pid: " · ".join(parts) for pid, parts in grouped.items()}
+        """{题目 id: "C++×2 · Python"} —— 给列表行用，一次查完不逐题问。"""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT problem_id, language, COUNT(*) AS n FROM interview_solutions "
+                "GROUP BY problem_id, language ORDER BY problem_id, language").fetchall()
+        grouped: dict[int, list[str]] = {}
+        for r in rows:
+            label = solution_language_label(r["language"])
+            n = int(r["n"] or 0)
+            grouped.setdefault(r["problem_id"], []).append(
+                f"{label}×{n}" if n > 1 else label)
+        return {pid: " · ".join(parts) for pid, parts in grouped.items()}
 
 
 def interview_attempt_list(iid: int, limit: int = 20) -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM interview_attempts WHERE problem_id = ? "
-            "ORDER BY answered_at DESC, id DESC LIMIT ?",
-            (int(iid), int(limit))).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM interview_attempts WHERE problem_id = ? "
+                "ORDER BY answered_at DESC, id DESC LIMIT ?",
+                (int(iid), int(limit))).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def interview_log_attempt(iid: int, user_answer: str = "", score: int = 0,
-                          decision: str = "skip") -> dict:
-    """记一次作答，并按判定重排复习档期。
+                              decision: str = "skip") -> dict:
+        """记一次作答，并按判定重排复习档期。
 
-    correct → 进下一档；incorrect → 退一档重记；skip 只算见过，不动档期。
-    """
-    iid = int(iid)
-    p = interview_problem_get(iid)
-    if not p:
-        return {}
-    when = _algo_now()
-    decision = decision if decision in ("correct", "incorrect", "skip") else "skip"
-    with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO interview_attempts(problem_id, answered_at, "
-            "user_answer, score, decision) VALUES(?,?,?,?,?)",
-            (iid, when, user_answer or "", int(score), decision))
-        conn.execute(
-            "UPDATE interview_problems SET seen_count = seen_count + 1, "
-            "last_seen_at = ?, best_score = MAX(best_score, ?), "
-            "correct_count = correct_count + ?, "
-            "incorrect_count = incorrect_count + ?, "
-            "has_been_correct = MAX(has_been_correct, ?) WHERE id = ?",
-            (when, int(score), int(decision == "correct"),
-             int(decision == "incorrect"), int(decision == "correct"), iid))
-    if decision != "skip":
-        _review_reschedule("interview", iid, decision == "correct", when)
-    return interview_problem_get(iid)
+        correct → 进下一档；incorrect → 退一档重记；skip 只算见过，不动档期。
+        """
+        iid = int(iid)
+        p = interview_problem_get(iid)
+        if not p:
+            return {}
+        when = _algo_now()
+        decision = decision if decision in ("correct", "incorrect", "skip") else "skip"
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO interview_attempts(problem_id, answered_at, "
+                "user_answer, score, decision) VALUES(?,?,?,?,?)",
+                (iid, when, user_answer or "", int(score), decision))
+            conn.execute(
+                "UPDATE interview_problems SET seen_count = seen_count + 1, "
+                "last_seen_at = ?, best_score = MAX(best_score, ?), "
+                "correct_count = correct_count + ?, "
+                "incorrect_count = incorrect_count + ?, "
+                "has_been_correct = MAX(has_been_correct, ?) WHERE id = ?",
+                (when, int(score), int(decision == "correct"),
+                 int(decision == "incorrect"), int(decision == "correct"), iid))
+        if decision != "skip":
+            _review_reschedule("interview", iid, decision == "correct", when)
+        return interview_problem_get(iid)
 
 
 def interview_round_complete() -> bool:
-    """一轮 = 每道在刷的题都至少答对过一次。"""
-    rows = interview_problem_list(archived=0)
-    return bool(rows) and all(int(r.get(_ROUND_COL) or 0) for r in rows)
+        """一轮 = 每道在刷的题都至少答对过一次。"""
+        rows = interview_problem_list(archived=0)
+        return bool(rows) and all(int(r.get(_ROUND_COL) or 0) for r in rows)
 
 
 def interview_reset_round() -> int:
-    """重开一轮：只清「本轮已答对」，历次统计全部保留。"""
-    with db.connect() as conn:
-        cur = conn.execute("UPDATE interview_problems SET has_been_correct = 0 "
-                           "WHERE archived = 0")
-        return cur.rowcount
+        """重开一轮：只清「本轮已答对」，历次统计全部保留。"""
+        with db.connect() as conn:
+            cur = conn.execute("UPDATE interview_problems SET has_been_correct = 0 "
+                               "WHERE archived = 0")
+            return cur.rowcount
 
 
 # ---- 统计 ------------------------------------------------------------------
 
 def interview_stats() -> dict:
-    """页面统计 + 刷题模式的进度面板（正确次数分布照 AnswerMachine 的口径）。"""
-    with db.connect() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) c FROM interview_problems").fetchone()["c"]
-        active = conn.execute(
-            "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0"
-        ).fetchone()["c"]
-        due = conn.execute(
-            "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0 "
-            "AND next_review <> '' AND next_review <= date('now','localtime')"
-        ).fetchone()["c"]
-        mastered = conn.execute(
-            "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0 "
-            "AND has_been_correct = 1").fetchone()["c"]
-        attempts = conn.execute(
-            "SELECT COUNT(*) c FROM interview_attempts").fetchone()["c"]
-        dist = {n: 0 for n in (0, 1, 2, 3, 4)}
-        for r in conn.execute(
-                "SELECT correct_count AS c, COUNT(*) AS n "
-                "FROM interview_problems WHERE archived = 0 GROUP BY c"):
-            dist[4 if int(r["c"] or 0) > 3 else int(r["c"] or 0)] += r["n"]
-    return {"total": total, "active": active, "due": due,
-            "mastered": mastered, "attempts": attempts, "dist": dist}
+        """页面统计 + 刷题模式的进度面板（正确次数分布照 AnswerMachine 的口径）。"""
+        with db.connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) c FROM interview_problems").fetchone()["c"]
+            active = conn.execute(
+                "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0"
+            ).fetchone()["c"]
+            due = conn.execute(
+                "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0 "
+                "AND next_review <> '' AND next_review <= date('now','localtime')"
+            ).fetchone()["c"]
+            mastered = conn.execute(
+                "SELECT COUNT(*) c FROM interview_problems WHERE archived = 0 "
+                "AND has_been_correct = 1").fetchone()["c"]
+            attempts = conn.execute(
+                "SELECT COUNT(*) c FROM interview_attempts").fetchone()["c"]
+            dist = {n: 0 for n in (0, 1, 2, 3, 4)}
+            for r in conn.execute(
+                    "SELECT correct_count AS c, COUNT(*) AS n "
+                    "FROM interview_problems WHERE archived = 0 GROUP BY c"):
+                dist[4 if int(r["c"] or 0) > 3 else int(r["c"] or 0)] += r["n"]
+        return {"total": total, "active": active, "due": due,
+                "mastered": mastered, "attempts": attempts, "dist": dist}
 
 
 # ---- 复习待办（薄封装，实现都在文件末尾的共用内核里）------------------------
 
 def interview_open_review(iid: int) -> dict:
-    return _review_open("interview", iid)
+        return _review_open("interview", iid)
 
 
 def interview_review_list(iid: int) -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM interview_reviews WHERE problem_id = ? "
-            "ORDER BY id DESC", (int(iid),)).fetchall()
-    return [_row_to_dict(r) for r in rows]
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM interview_reviews WHERE problem_id = ? "
+                "ORDER BY id DESC", (int(iid),)).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def interview_ensure_list() -> None:
-    _review_ensure_list("interview")
+        _review_ensure_list("interview")
 
 
 def interview_sync_reviews() -> int:
-    return _review_sync("interview")
+        return _review_sync("interview")
 
 
 def interview_set_next_review(iid: int, due: str) -> dict:
-    return _review_set_next("interview", iid, due)
+        return _review_set_next("interview", iid, due)
 
 
 # ---------------------------------------------------------------------------
@@ -3657,527 +3645,553 @@ def interview_set_next_review(iid: int, due: str) -> dict:
 # 刷出二十行，既盖住了别的任务，番茄钟也没法一次选一整天的复习。
 
 _REVIEW_KINDS = {
-    "algo": {
-        "problems": "algo_problems",
-        "reviews": "algo_reviews",
-        "list_name": ALGO_LIST_NAME,
-        "label_col": "title",
-        "label_max": 26,
-        "display": algo_display,
-    },
-    "interview": {
-        "problems": "interview_problems",
-        "reviews": "interview_reviews",
-        "list_name": INTERVIEW_LIST_NAME,
-        "label_col": "question",
-        "label_max": 26,
-        "display": interview_display,
-    },
+        "algo": {
+            "problems": "algo_problems",
+            "reviews": "algo_reviews",
+            "list_name": ALGO_LIST_NAME,
+            "label_col": "title",
+            "label_max": 26,
+            "display": algo_display,
+        },
+        "interview": {
+            "problems": "interview_problems",
+            "reviews": "interview_reviews",
+            "list_name": INTERVIEW_LIST_NAME,
+            "label_col": "question",
+            "label_max": 26,
+            "display": interview_display,
+        },
 }
 
 
 def _shorten(text: str, limit: int = 40) -> str:
-    text = (text or "").strip().replace("\n", " ")
-    return text if len(text) <= limit else text[:limit] + "…"
+        text = (text or "").strip().replace("\n", " ")
+        return text if len(text) <= limit else text[:limit] + "…"
 
 
 _review_rev = 0
 
 
 def review_rev() -> int:
-    """复习排期的版本号。待办页 / 日历页在 showEvent 里比它，决定要不要重刷。
+        """复习排期的版本号。待办页 / 日历页在 showEvent 里比它，决定要不要重刷。
 
-    为什么不像习惯那样让每个写入口自己记得 bump：改一次复习日会牵动
-    撤子任务、收尾当天大任务、在新日期挂一条 —— 散在好几个原语里，
-    总有一个会忘。所以 bump 全打在下面这四个原语上，写路径绕不过去。
-    """
-    return _review_rev
+        为什么不像习惯那样让每个写入口自己记得 bump：改一次复习日会牵动
+        撤子任务、收尾当天大任务、在新日期挂一条 —— 散在好几个原语里，
+        总有一个会忘。所以 bump 全打在下面这四个原语上，写路径绕不过去。
+        """
+        return _review_rev
 
 
 def bump_review_rev() -> None:
-    global _review_rev
-    _review_rev += 1
+        global _review_rev
+        _review_rev += 1
 
 
 def review_stage_date(stage: int, base: str = "") -> str:
-    """第 stage 档的复习日期；越过最后一档返回空串（毕业，不再排）。"""
-    if stage >= len(ALGO_INTERVALS) or stage < 0:
-        return ""
-    base_d = _parse_d(base) or date.today()
-    return (base_d + timedelta(days=ALGO_INTERVALS[stage])).isoformat()
+        """第 stage 档的复习日期；越过最后一档返回空串（毕业，不再排）。"""
+        if stage >= len(ALGO_INTERVALS) or stage < 0:
+            return ""
+        base_d = _parse_d(base) or date.today()
+        return (base_d + timedelta(days=ALGO_INTERVALS[stage])).isoformat()
 
 
 def _review_problem(kind: str, pid: int) -> dict:
-    tbl = _REVIEW_KINDS[kind]["problems"]
-    with db.connect() as conn:
-        return _row_to_dict(conn.execute(
-            f"SELECT * FROM {tbl} WHERE id = ?", (int(pid),)).fetchone())
+        tbl = _REVIEW_KINDS[kind]["problems"]
+        with db.connect() as conn:
+            return _row_to_dict(conn.execute(
+                f"SELECT * FROM {tbl} WHERE id = ?", (int(pid),)).fetchone())
 
 
 def _review_patch(kind: str, pid: int, **fields: Any) -> None:
-    """排期内核只允许改这两列；其余字段由各页自己的 update 负责。"""
-    fields = {k: v for k, v in fields.items() if k in ("stage", "next_review")}
-    if not fields:
-        return
-    tbl = _REVIEW_KINDS[kind]["problems"]
-    cols = ", ".join(f"{k} = ?" for k in fields)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE {tbl} SET {cols} WHERE id = ?",
-                     (*fields.values(), int(pid)))
-    bump_review_rev()
+        """排期内核只允许改这两列；其余字段由各页自己的 update 负责。"""
+        fields = {k: v for k, v in fields.items() if k in ("stage", "next_review")}
+        if not fields:
+            return
+        tbl = _REVIEW_KINDS[kind]["problems"]
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE {tbl} SET {cols} WHERE id = ?",
+                         (*fields.values(), int(pid)))
+        bump_review_rev()
 
 
 def _review_active(kind: str) -> list[dict]:
-    tbl = _REVIEW_KINDS[kind]["problems"]
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM {tbl} WHERE archived = 0 ORDER BY id").fetchall()
-    return [_row_to_dict(r) for r in rows]
+        tbl = _REVIEW_KINDS[kind]["problems"]
+        with db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM {tbl} WHERE archived = 0 ORDER BY id").fetchall()
+        return [_row_to_dict(r) for r in rows]
 
 
 def _review_ensure_list(kind: str) -> None:
-    name = _REVIEW_KINDS[kind]["list_name"]
-    if any(l["name"] == name and l.get("kind") != "folder"
-           for l in list_all(include_archived=True)):
-        return
-    list_add(name, color="")
+        name = _REVIEW_KINDS[kind]["list_name"]
+        if any(l["name"] == name and l.get("kind") != "folder"
+               for l in list_all(include_archived=True)):
+            return
+        list_add(name, color="")
 
 
 def _review_open(kind: str, pid: int) -> dict:
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    with db.connect() as conn:
-        return _row_to_dict(conn.execute(
-            f"SELECT * FROM {tbl} WHERE problem_id = ? AND status = 'open' "
-            "LIMIT 1", (int(pid),)).fetchone())
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        with db.connect() as conn:
+            return _row_to_dict(conn.execute(
+                f"SELECT * FROM {tbl} WHERE problem_id = ? AND status = 'open' "
+                "LIMIT 1", (int(pid),)).fetchone())
 
 
 def _review_update(kind: str, rid: int, **fields: Any) -> None:
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    fields = {k: v for k, v in fields.items()
-              if k in ("status", "due_date", "todo_id", "stage", "subtask_id")}
-    if not fields:
-        return
-    cols = ", ".join(f"{k} = ?" for k in fields)
-    with db.connect() as conn:
-        conn.execute(f"UPDATE {tbl} SET {cols} WHERE id = ?",
-                     (*fields.values(), int(rid)))
-    bump_review_rev()
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        fields = {k: v for k, v in fields.items()
+                  if k in ("status", "due_date", "todo_id", "stage", "subtask_id")}
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with db.connect() as conn:
+            conn.execute(f"UPDATE {tbl} SET {cols} WHERE id = ?",
+                         (*fields.values(), int(rid)))
+        bump_review_rev()
 
 
 def _review_by_sub(kind: str, sub_id: int) -> dict:
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    with db.connect() as conn:
-        return _row_to_dict(conn.execute(
-            f"SELECT * FROM {tbl} WHERE subtask_id = ? AND status = 'open' LIMIT 1",
-            (int(sub_id),)).fetchone())
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        with db.connect() as conn:
+            return _row_to_dict(conn.execute(
+                f"SELECT * FROM {tbl} WHERE subtask_id = ? AND status = 'open' LIMIT 1",
+                (int(sub_id),)).fetchone())
 
 
 def _review_sub_title(kind: str, p: dict) -> str:
-    """子任务标题：大任务那一行已经写了「算法复习」，这里只留题名。
+        """子任务标题：大任务那一行已经写了「算法复习」，这里只留题名。
 
-    旧形状是一题一条独立待办，得靠「复习：」前缀认出来；现在前缀只会把
-    本来就有 26 个字的题名再撑长三个字符。
-    """
-    spec = _REVIEW_KINDS[kind]
-    name = (p.get(spec["label_col"]) or "").strip()
-    # 题干/标题空着时用兜底名，否则子任务会变成一条空白项
-    label = _shorten(name or spec["display"](p), spec["label_max"])
-    ref = (p.get("lc_ref") or "").strip()
-    if ref and name:
-        return "%s（力扣 %s）" % (label, ref)
-    return label
+        旧形状是一题一条独立待办，得靠「复习：」前缀认出来；现在前缀只会把
+        本来就有 26 个字的题名再撑长三个字符。
+        """
+        spec = _REVIEW_KINDS[kind]
+        name = (p.get(spec["label_col"]) or "").strip()
+        # 题干/标题空着时用兜底名，否则子任务会变成一条空白项
+        label = _shorten(name or spec["display"](p), spec["label_max"])
+        ref = (p.get("lc_ref") or "").strip()
+        if ref and name:
+            return "%s（力扣 %s）" % (label, ref)
+        return label
 
 
 def _review_day_task(kind: str, day: str) -> int:
-    """某天那门课的复习大任务 id，没有就建一个 —— 一天只占一行。
+        """某天那门课的复习大任务 id，没有就建一个 —— 一天只占一行。
 
-    先问排期表：这天还开着的复习挂在谁名下就跟着走。按标题找不行，
-    用户把大任务改过名之后，那条判据会给他再建一条重复的。
-    只认「已经挂过子任务」的那些映射行：旧形状里 todo_id 指的是一题一条的
-    待办，迁移途中把它当大任务复用的话，那条待办标题还带着「复习：」前缀，
-    清单里就会同时留下两行同日的复习。
-    """
-    name = _REVIEW_KINDS[kind]["list_name"]
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    with db.connect() as conn:
-        row = conn.execute(
-            f"SELECT todo_id FROM {tbl} WHERE status = 'open' AND due_date = ? "
-            "AND todo_id > 0 AND COALESCE(subtask_id, 0) > 0 "
-            "ORDER BY id LIMIT 1", (day,)).fetchone()
-        tid = int(row["todo_id"]) if row else 0
-    if tid and todo_get(tid):
-        return tid
-    with db.connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM todos WHERE list_name = ? AND due_date = ? "
-            "AND title = ? AND COALESCE(deleted_at, '') = '' "
-            "ORDER BY done ASC, id ASC LIMIT 1", (name, day, name)).fetchone()
-        if row:
-            return int(row["id"])
-    return int(todo_add(title=name, note="", due_date=day, list_name=name))
+        先问排期表：这天还开着的复习挂在谁名下就跟着走。按标题找不行，
+        用户把大任务改过名之后，那条判据会给他再建一条重复的。
+        只认「已经挂过子任务」的那些映射行：旧形状里 todo_id 指的是一题一条的
+        待办，迁移途中把它当大任务复用的话，那条待办标题还带着「复习：」前缀，
+        清单里就会同时留下两行同日的复习。
+        """
+        name = _REVIEW_KINDS[kind]["list_name"]
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        with db.connect() as conn:
+            row = conn.execute(
+                f"SELECT todo_id FROM {tbl} WHERE status = 'open' AND due_date = ? "
+                "AND todo_id > 0 AND COALESCE(subtask_id, 0) > 0 "
+                # 大任务被整条删进垃圾桶时映射行的 status 还是 open（收尾那条路
+                # 走不到这里），不复筛一遍 deleted_at 就会把新的题目继续挂进垃圾桶。
+                "AND COALESCE((SELECT deleted_at FROM todos t "
+                "              WHERE t.id = todo_id), '') = '' "
+                "ORDER BY id LIMIT 1", (day,)).fetchone()
+            tid = int(row["todo_id"]) if row else 0
+        if tid and todo_get(tid):
+            return tid
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM todos WHERE list_name = ? AND due_date = ? "
+                "AND title = ? AND COALESCE(deleted_at, '') = '' "
+                "ORDER BY done ASC, id ASC LIMIT 1", (name, day, name)).fetchone()
+            if row:
+                return int(row["id"])
+        return int(todo_add(title=name, note="", due_date=day, list_name=name))
 
 
 def _review_attach(kind: str, p: dict, due: str) -> tuple[int, int]:
-    """把这题挂到某天的复习大任务下，返回 (大任务 id, 子任务 id)。"""
-    _review_ensure_list(kind)
-    day = (due or "")[:10]
-    tid = _review_day_task(kind, day)
-    t = todo_get(tid)
-    if t and int(t.get("done") or 0):
-        # 这天已经清空过一次，现在又有题排回来了，大任务要跟着回到待做
-        todo_update(tid, done=0, completed_at="")
-    sid = int(subtask_add(tid, _review_sub_title(kind, p)))
-    bump_review_rev()
-    return tid, sid
+        """把这题挂到某天的复习大任务下，返回 (大任务 id, 子任务 id)。"""
+        _review_ensure_list(kind)
+        day = (due or "")[:10]
+        tid = _review_day_task(kind, day)
+        t = todo_get(tid)
+        if t and int(t.get("done") or 0):
+            # 这天已经清空过一次，现在又有题排回来了，大任务要跟着回到待做
+            todo_update(tid, done=0, completed_at="")
+        sid = int(subtask_add(tid, _review_sub_title(kind, p)))
+        bump_review_rev()
+        return tid, sid
 
 
 def _review_prune_day(day_id: int) -> None:
-    """一天的复习条目清空后收尾这条大任务。
+        """一天的复习条目清空后收尾这条大任务。
 
-    三种情况要分开：
-    - 那天还有别的子任务 / 还有别的题挂着 open → 什么都不做；
-    - 清空是因为题目做完了（排期行落在 done_*）→ 勾成已完成，那一天留个记录；
-    - 清空是因为排期作废（归档 / 删题 / 迁移重挂）→ 整条硬删，
-      不然清单里会永远挂着一行什么都没发生的「八股复习」。
-    用户自己往大任务下加的检查事项算「还没清完」，别替他收尾。
-    """
-    if not day_id:
-        return
-    t = todo_get(day_id)
-    if not t:
-        return
-    with db.connect() as conn:
-        if conn.execute("SELECT COUNT(*) c FROM subtasks WHERE todo_id = ?",
-                        (day_id,)).fetchone()["c"]:
+        三种情况要分开：
+        - 那天还有别的子任务 / 还有别的题挂着 open → 什么都不做；
+        - 清空是因为题目做完了（排期行落在 done_*）→ 勾成已完成，那一天留个记录；
+        - 清空是因为排期作废（归档 / 删题 / 迁移重挂）→ 整条硬删，
+          不然清单里会永远挂着一行什么都没发生的「八股复习」。
+        用户自己往大任务下加的检查事项算「还没清完」，别替他收尾。
+        """
+        if not day_id:
             return
-        specs = [spec["reviews"] for spec in _REVIEW_KINDS.values()]
-        for tbl in specs:
-            if conn.execute(f"SELECT 1 FROM {tbl} WHERE todo_id = ? "
-                            "AND status = 'open' LIMIT 1", (day_id,)).fetchone():
+        t = todo_get(day_id)
+        if not t:
+            return
+        with db.connect() as conn:
+            if conn.execute("SELECT COUNT(*) c FROM subtasks WHERE todo_id = ?",
+                            (day_id,)).fetchone()["c"]:
                 return
-        worked = any(conn.execute(
-            f"SELECT 1 FROM {tbl} WHERE todo_id = ? "
-            "AND status LIKE 'done%' LIMIT 1", (day_id,)).fetchone()
-            for tbl in specs)
-    if not worked:
-        todo_delete(day_id, hard=True)
-        return
-    if int(t.get("done") or 0):
-        return
-    todo_update(day_id, done=1, completed_at=_algo_now())
+            specs = [spec["reviews"] for spec in _REVIEW_KINDS.values()]
+            for tbl in specs:
+                if conn.execute(f"SELECT 1 FROM {tbl} WHERE todo_id = ? "
+                                "AND status = 'open' LIMIT 1", (day_id,)).fetchone():
+                    return
+            worked = any(conn.execute(
+                f"SELECT 1 FROM {tbl} WHERE todo_id = ? "
+                "AND status LIKE 'done%' LIMIT 1", (day_id,)).fetchone()
+                for tbl in specs)
+        if not worked:
+            todo_delete(day_id, hard=True)
+            return
+        if int(t.get("done") or 0):
+            return
+        todo_update(day_id, done=1, completed_at=_algo_now())
 
 
 def _review_state(r: dict) -> str:
-    """这条排期在待办里现在什么样：gone（被删了）/ done（勾了）/ open。"""
-    sid = int(r.get("subtask_id") or 0)
-    if sid:
-        with db.connect() as conn:
-            row = conn.execute("SELECT done FROM subtasks WHERE id = ?",
-                               (sid,)).fetchone()
-        if row is None:
+        """这条排期在待办里现在什么样：gone（被删了）/ done（勾了）/ open。"""
+        sid = int(r.get("subtask_id") or 0)
+        if sid:
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT s.done AS d, t.deleted_at AS del FROM subtasks s "
+                    "LEFT JOIN todos t ON t.id = s.todo_id WHERE s.id = ?",
+                    (sid,)).fetchone()
+            if row is None:
+                return "gone"
+            # 大任务整条删掉时子任务行还活着（待办列表按 deleted_at 过滤，界面上
+            # 看不见）。只看 subtasks.done 的话这条永远算 open：统计挂着
+            # 「还有一天要复习」，点开又什么都没有。
+            if row["del"]:
+                return "gone"
+            return "done" if int(row["d"] or 0) else "open"
+        t = todo_get(int(r.get("todo_id") or 0))
+        if not t or t.get("deleted_at"):
             return "gone"
-        return "done" if int(row["done"] or 0) else "open"
-    t = todo_get(int(r.get("todo_id") or 0))
-    if not t or t.get("deleted_at"):
-        return "gone"
-    return "done" if int(t.get("done") or 0) else "open"
+        return "done" if int(t.get("done") or 0) else "open"
 
 
 def _review_detach(kind: str, r: dict) -> None:
-    """撤掉一条排期在待办里留下的痕迹。
+        """撤掉一条排期在待办里留下的痕迹。
 
-    新形状是删那条子任务（空了的大任务收尾）；旧形状「一题一条」整条硬删 ——
-    留着会在清单里永远挂一条没人认领的复习。
-    """
-    sid = int(r.get("subtask_id") or 0)
-    if sid:
-        subtask_delete(sid)
-        bump_review_rev()
-        _review_prune_day(int(r.get("todo_id") or 0))
-        return
-    tid = int(r.get("todo_id") or 0)
-    if tid:
-        todo_delete(tid, hard=True)
-        bump_review_rev()
-
-
-def _review_erase(kind: str, pid: int) -> None:
-    """题目本身没了：把它在待办里留下的复习痕迹擦干净。
-
-    不能整条大任务删 —— 那天别的题目还挂在同一条上；也不能先收尾再删映射行
-    （收尾那条「还有没有 open 的」判据会被正要删的这条挡住）。
-    旧形状「一题一条」的待办标题不是清单名，那种整条都是这一题的，照旧硬删。
-    """
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    name = _REVIEW_KINDS[kind]["list_name"]
-    with db.connect() as conn:
-        rows = [_row_to_dict(r) for r in conn.execute(
-            f"SELECT * FROM {tbl} WHERE problem_id = ?", (int(pid),)).fetchall()]
-    days = set()
-    for r in rows:
-        tid = int(r.get("todo_id") or 0)
-        t = todo_get(tid) if tid else None
-        if t and t["title"] != name:
-            todo_delete(tid, hard=True)
-            continue
+        新形状是删那条子任务（空了的大任务收尾）；旧形状「一题一条」整条硬删 ——
+        留着会在清单里永远挂一条没人认领的复习。
+        """
         sid = int(r.get("subtask_id") or 0)
         if sid:
             subtask_delete(sid)
+            bump_review_rev()
+            _review_prune_day(int(r.get("todo_id") or 0))
+            return
+        tid = int(r.get("todo_id") or 0)
+        if tid:
+            todo_delete(tid, hard=True)
+            bump_review_rev()
+
+
+def _review_erase(kind: str, pid: int) -> None:
+        """题目本身没了：把它在待办里留下的复习痕迹擦干净。
+
+        不能整条大任务删 —— 那天别的题目还挂在同一条上；也不能先收尾再删映射行
+        （收尾那条「还有没有 open 的」判据会被正要删的这条挡住）。
+        旧形状「一题一条」整条都是这一题的，那种照旧硬删 —— 靠 subtask_id
+        有没有值区分形状，标题不能当判据（大任务是可以改名的）。
+        """
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        with db.connect() as conn:
+            rows = [_row_to_dict(r) for r in conn.execute(
+                f"SELECT * FROM {tbl} WHERE problem_id = ?", (int(pid),)).fetchall()]
+        days = set()
+        for r in rows:
+            tid = int(r.get("todo_id") or 0)
+            sid = int(r.get("subtask_id") or 0)
+            if not sid:
+                # 旧形状「一题一条」：整条待办就是这一题的，硬删。
+                # 以前这里靠「标题不等于清单名」判旧形状 —— 用户把大任务改过名
+                # 就会被当成旧形状，把那天别的题目一起删掉。形状要用 subtask_id 判。
+                if tid:
+                    todo_delete(tid, hard=True)
+                continue
+            subtask_delete(sid)
             days.add(tid)
-    with db.connect() as conn:
-        conn.execute(f"DELETE FROM {tbl} WHERE problem_id = ?", (int(pid),))
-    for day in days:
-        _review_prune_day(day)
+        with db.connect() as conn:
+            conn.execute(f"DELETE FROM {tbl} WHERE problem_id = ?", (int(pid),))
+        for day in days:
+            _review_prune_day(day)
 
 
 def _review_sync_title(kind: str, pid: int) -> None:
-    """题干改了就把挂着的那条子任务标题一起改掉。
+        """题干改了就把挂着的那条子任务标题一起改掉。
 
-    标题是挂上去的时候从题干拼出来的，不同步就会留下指向已改名条目的复习项。
-    """
-    r = _review_open(kind, pid)
-    sid = int((r or {}).get("subtask_id") or 0)
-    if not sid:
-        return
-    p = _review_problem(kind, pid)
-    if not p:
-        return
-    subtask_update(sid, title=_review_sub_title(kind, p))
+        标题是挂上去的时候从题干拼出来的，不同步就会留下指向已改名条目的复习项。
+        """
+        r = _review_open(kind, pid)
+        sid = int((r or {}).get("subtask_id") or 0)
+        if not sid:
+            return
+        p = _review_problem(kind, pid)
+        if not p:
+            return
+        subtask_update(sid, title=_review_sub_title(kind, p))
+        # 待办页 / 日历的 showEvent 是靠这个版本号决定要不要重刷的：不 bump，
+        # 改了题干之后那天的子任务、日历上摊出来的那一题还顶着旧文字
+        bump_review_rev()
 
 
 def _review_close(kind: str, pid: int, status: str) -> None:
-    """结掉当前挂着的那条复习，并把它在待办里留下的条目一起收走。
+        """结掉当前挂着的那条复习，并把它在待办里留下的条目一起收走。
 
-    只改映射不够：done_* 说明这次真做了，dropped 说明排期作废，两种都该从
-    这一天的清单里消失；下一档另建一条新的。
-    """
-    r = _review_open(kind, pid)
-    if not r:
-        return
-    _review_update(kind, r["id"], status=status, subtask_id=0)
-    _review_detach(kind, r)
+        只改映射不够：done_* 说明这次真做了，dropped 说明排期作废，两种都该从
+        这一天的清单里消失；下一档另建一条新的。
+        """
+        r = _review_open(kind, pid)
+        if not r:
+            return
+        _review_update(kind, r["id"], status=status, subtask_id=0)
+        _review_detach(kind, r)
 
 
 def _review_ensure_open(kind: str, pid: int) -> None:
-    """守住不变量：有下次复习日 ↔ 待办里挂着一条没勾掉的复习条目。
+        """守住不变量：有下次复习日 ↔ 待办里挂着一条没勾掉的复习条目。
 
-    只在缺的时候补建，不改已有条目的日期 —— 用户在刷题页手动顺延复习日是
-    合法操作，反向覆盖它只会跟用户打架。
-    """
-    p = _review_problem(kind, pid)
-    if not p or p.get("archived") or not p.get("next_review"):
-        return
-    r = _review_open(kind, pid)
-    if r and _review_state(r) == "open":
-        return
-    if r:
-        _review_update(kind, r["id"], status="dropped", subtask_id=0)
-        _review_detach(kind, r)
-    tid, sid = _review_attach(kind, p, p["next_review"])
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    with db.connect() as conn:
-        conn.execute(
-            f"INSERT INTO {tbl}(problem_id, todo_id, subtask_id, stage, due_date) "
-            "VALUES(?,?,?,?,?)",
-            (int(pid), tid, sid, int(p.get("stage") or 0),
-             p["next_review"][:10]))
+        只在缺的时候补建，不改已有条目的日期 —— 用户在刷题页手动顺延复习日是
+        合法操作，反向覆盖它只会跟用户打架。
+        """
+        p = _review_problem(kind, pid)
+        if not p or p.get("archived") or not p.get("next_review"):
+            return
+        r = _review_open(kind, pid)
+        if r and _review_state(r) == "open":
+            return
+        if r:
+            _review_update(kind, r["id"], status="dropped", subtask_id=0)
+            _review_detach(kind, r)
+        tid, sid = _review_attach(kind, p, p["next_review"])
+        tbl = _REVIEW_KINDS[kind]["reviews"]
+        with db.connect() as conn:
+            conn.execute(
+                f"INSERT INTO {tbl}(problem_id, todo_id, subtask_id, stage, due_date) "
+                "VALUES(?,?,?,?,?)",
+                (int(pid), tid, sid, int(p.get("stage") or 0),
+                 p["next_review"][:10]))
 
 
 def _review_migrate_flat(kind: str) -> int:
-    """把旧形状「一题一条独立待办」搬成新形状「一天一条 + 题目做子任务」。
+        """把旧形状「一题一条独立待办」搬成新形状「一天一条 + 题目做子任务」。
 
-    判据就是排期行上有没有 subtask_id：没有的必然是旧库留下的。搬完自然为 0，
-    不用另存迁移标记。题目自己的 stage / next_review 一个字段都不动，
-    被硬删的那些待办本来就是排期自己合成的（排期行按 todo_id 认领），不丢用户数据。
-    """
-    tbl = _REVIEW_KINDS[kind]["reviews"]
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM {tbl} WHERE status = 'open' "
-            "AND COALESCE(subtask_id, 0) = 0").fetchall()
-    fixed = 0
-    for raw in rows:
-        r = _row_to_dict(raw)
-        pid = int(r["problem_id"])
-        old = int(r.get("todo_id") or 0)
-        t = todo_get(old) if old else None
-        p = _review_problem(kind, pid)
-        due = ((p or {}).get("next_review") or r.get("due_date") or "")[:10]
-        if t and int(t.get("done") or 0):
-            # 勾了却没答结论：跟启动对账一样按「做出来了」推进，
-            # 顺序要紧 —— 先落定旧的再重排，新形状由重排那一步自己建出来。
-            _review_update(kind, r["id"], status="done_indep")
-            if old:
-                todo_delete(old, hard=True)
-            _review_reschedule(kind, pid, True,
-                               t.get("completed_at") or _algo_now())
-        elif not p or p.get("archived") or not due:
-            # 已经没有排期了（毕业 / 归档 / 题目被删）：撤掉那条待办，映射作废
-            _review_update(kind, r["id"], status="dropped")
-            if old:
-                todo_delete(old, hard=True)
-        else:
-            tid, sid = _review_attach(kind, p, due)
-            _review_update(kind, r["id"], todo_id=tid, subtask_id=sid,
-                           due_date=due)
-            if old and old != tid:
-                todo_delete(old, hard=True)
-        fixed += 1
-    return fixed
-
-
-def _review_reschedule(kind: str, pid: int, independent: bool,
-                       when: str) -> str:
-    """按本次结果推进档期并换一条新的复习待办，返回新的下次复习日。
-
-    调用方负责往自己的历史表里记这一次（algo_writes / interview_attempts）。
-    """
-    p = _review_problem(kind, pid)
-    if not p:
-        return ""
-    stage = int(p.get("stage") or 0)
-    stage = stage + 1 if independent else max(0, stage - 1)
-    _review_close(kind, pid, "done_indep" if independent else "done_struggle")
-    due = review_stage_date(stage, (when or "")[:10])
-    _review_patch(kind, pid, stage=stage, next_review=due)
-    _review_ensure_open(kind, pid)
-    return due
-
-
-def _review_set_next(kind: str, pid: int, due: str) -> dict:
-    """手动指定下次复习日：从原来那天摘掉，按新日期重挂一条。"""
-    r = _review_open(kind, pid)
-    if r:
-        _review_update(kind, r["id"], status="dropped", subtask_id=0)
-        _review_detach(kind, r)
-    _review_patch(kind, pid, next_review=(due or "").strip())
-    _review_ensure_open(kind, pid)
-    return _review_problem(kind, pid)
-
-
-def _review_sync(kind: str) -> int:
-    """启动对账：把排期和待办里实际挂着的东西对上。返回补建/推进的条数。
-
-    待办是「活」的 —— 用户可能删了它、勾了它却没走询问流程（拖到已完成）、
-    也可能排期那天压根没开过应用。旧形状的排期行在这里先搬成新形状。
-    """
-    _review_ensure_list(kind)
-    fixed = _review_migrate_flat(kind)
-    for p in _review_active(kind):
-        pid = p["id"]
-        r = _review_open(kind, pid)
-        if r:
-            state = _review_state(r)
-            if state == "gone":
-                # 用户把那条复习删了：那天可能因此空掉，顺手收尾
-                _review_update(kind, r["id"], status="dropped", subtask_id=0)
-                _review_prune_day(int(r.get("todo_id") or 0))
-            elif state == "done":
-                # 勾掉了却没走询问：按「做出来了」推进，别把这道题卡死
-                _review_update(kind, r["id"], status="done_indep",
-                               subtask_id=0)
-                _review_detach(kind, r)
-                _review_reschedule(kind, pid, True, _algo_now())
-                fixed += 1
-                continue
-        if not _review_open(kind, pid):
-            _review_ensure_open(kind, pid)
-            if _review_open(kind, pid):
-                fixed += 1
-    return fixed
-
-
-def review_resolve_sub(sub_id: int, independent: bool) -> tuple[str, dict]:
-    """待办页勾掉一条复习子任务时的统一入口：查是哪一页的题，再重排。
-
-    直接复用各页自己的「记一次」函数，而不是在这儿重写一遍它们的 SQL ——
-    否则以后任何一页改了记账口径，这条路径就会悄悄漏字段。
-    返回 (kind, 题目行)；kind 为空串表示这条子任务不属于任何复习。
-    """
-    for kind in ("algo", "interview"):
-        r = _review_by_sub(kind, sub_id)
-        if not r:
-            continue
-        pid = r["problem_id"]
-        if kind == "algo":
-            return kind, algo_log_write(pid, independent=independent)
-        return kind, interview_log_attempt(
-            pid, "", 0, "correct" if independent else "incorrect")
-    return "", {}
-
-
-def review_todo_ids() -> set[int]:
-    """现在挂着复习条目的大任务 id 集合。
-
-    待办页每行都要知道「这是不是一天的复习」（决定行内要不要摊开题目），
-    一次查完两张排期表，别在建行循环里逐条问。
-    """
-    out = set()
-    with db.connect() as conn:
-        for spec in _REVIEW_KINDS.values():
-            for r in conn.execute(
-                    f"SELECT todo_id FROM {spec['reviews']} "
-                    "WHERE status = 'open' AND todo_id > 0").fetchall():
-                out.add(int(r["todo_id"]))
-    return out
-
-
-def review_pending_subs(todo_id: int) -> list[dict]:
-    """这条大任务下还没勾掉的复习条目：[{kind, sub, problem_id}, ...]。
-
-    整条大任务一起勾的时候要用它把还没做的题逐个结掉 —— 排期是按题走的，
-    一次结论得展开成 N 次重排。用户自己加的检查事项不在排期表里，自然过滤掉。
-    """
-    out = []
-    for kind in ("algo", "interview"):
+        判据就是排期行上有没有 subtask_id：没有的必然是旧库留下的。搬完自然为 0，
+        不用另存迁移标记。题目自己的 stage / next_review 一个字段都不动，
+        被硬删的那些待办本来就是排期自己合成的（排期行按 todo_id 认领），不丢用户数据。
+        """
         tbl = _REVIEW_KINDS[kind]["reviews"]
         with db.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM {tbl} WHERE todo_id = ? AND status = 'open' "
-                "AND COALESCE(subtask_id, 0) > 0 ORDER BY id",
-                (int(todo_id),)).fetchall()
+                f"SELECT * FROM {tbl} WHERE status = 'open' "
+                "AND COALESCE(subtask_id, 0) = 0").fetchall()
+        fixed = 0
         for raw in rows:
             r = _row_to_dict(raw)
-            with db.connect() as conn:
-                sub = _row_to_dict(conn.execute(
-                    "SELECT * FROM subtasks WHERE id = ?",
-                    (int(r["subtask_id"]),)).fetchone())
-            if not sub or int(sub.get("done") or 0):
+            pid = int(r["problem_id"])
+            old = int(r.get("todo_id") or 0)
+            t = todo_get(old) if old else None
+            p = _review_problem(kind, pid)
+            due = ((p or {}).get("next_review") or r.get("due_date") or "")[:10]
+            if t and int(t.get("done") or 0):
+                # 勾了却没答结论：跟启动对账一样按「做出来了」推进，
+                # 顺序要紧 —— 先落定旧的再重排，新形状由重排那一步自己建出来。
+                _review_update(kind, r["id"], status="done_indep")
+                if old:
+                    todo_delete(old, hard=True)
+                _review_reschedule(kind, pid, True,
+                                   t.get("completed_at") or _algo_now())
+            elif not p or p.get("archived") or not due:
+                # 已经没有排期了（毕业 / 归档 / 题目被删）：撤掉那条待办，映射作废
+                _review_update(kind, r["id"], status="dropped")
+                if old:
+                    todo_delete(old, hard=True)
+            else:
+                tid, sid = _review_attach(kind, p, due)
+                _review_update(kind, r["id"], todo_id=tid, subtask_id=sid,
+                               due_date=due)
+                if old and old != tid:
+                    todo_delete(old, hard=True)
+            fixed += 1
+        return fixed
+
+
+def _review_reschedule(kind: str, pid: int, independent: bool,
+                           when: str) -> str:
+        """按本次结果推进档期并换一条新的复习待办，返回新的下次复习日。
+
+        调用方负责往自己的历史表里记这一次（algo_writes / interview_attempts）。
+        """
+        p = _review_problem(kind, pid)
+        if not p:
+            return ""
+        stage = int(p.get("stage") or 0)
+        stage = stage + 1 if independent else max(0, stage - 1)
+        _review_close(kind, pid, "done_indep" if independent else "done_struggle")
+        due = review_stage_date(stage, (when or "")[:10])
+        _review_patch(kind, pid, stage=stage, next_review=due)
+        _review_ensure_open(kind, pid)
+        return due
+
+
+def _review_set_next(kind: str, pid: int, due: str) -> dict:
+        """手动指定下次复习日：从原来那天摘掉，按新日期重挂一条。"""
+        r = _review_open(kind, pid)
+        if r:
+            _review_update(kind, r["id"], status="dropped", subtask_id=0)
+            _review_detach(kind, r)
+        _review_patch(kind, pid, next_review=(due or "").strip())
+        _review_ensure_open(kind, pid)
+        return _review_problem(kind, pid)
+
+
+def _review_sync(kind: str) -> int:
+        """启动对账：把排期和待办里实际挂着的东西对上。返回补建/推进的条数。
+
+        待办是「活」的 —— 用户可能删了它、勾了它却没走询问流程（拖到已完成）、
+        也可能排期那天压根没开过应用。旧形状的排期行在这里先搬成新形状。
+        """
+        _review_ensure_list(kind)
+        fixed = _review_migrate_flat(kind)
+        for p in _review_active(kind):
+            pid = p["id"]
+            r = _review_open(kind, pid)
+            if r:
+                state = _review_state(r)
+                if state == "gone":
+                    # 用户把那条复习删了：那天可能因此空掉，顺手收尾
+                    _review_update(kind, r["id"], status="dropped", subtask_id=0)
+                    _review_prune_day(int(r.get("todo_id") or 0))
+                elif state == "done":
+                    # 勾掉了却没走询问：按「做出来了」推进，别把这道题卡死
+                    _review_update(kind, r["id"], status="done_indep",
+                                   subtask_id=0)
+                    _review_detach(kind, r)
+                    _review_reschedule(kind, pid, True, _algo_now())
+                    fixed += 1
+                    continue
+            if not _review_open(kind, pid):
+                _review_ensure_open(kind, pid)
+                if _review_open(kind, pid):
+                    fixed += 1
+        return fixed
+
+
+def review_resolve_sub(sub_id: int, independent: bool) -> tuple[str, dict]:
+        """待办页勾掉一条复习子任务时的统一入口：查是哪一页的题，再重排。
+
+        直接复用各页自己的「记一次」函数，而不是在这儿重写一遍它们的 SQL ——
+        否则以后任何一页改了记账口径，这条路径就会悄悄漏字段。
+        返回 (kind, 题目行)；kind 为空串表示这条子任务不属于任何复习。
+        """
+        for kind in ("algo", "interview"):
+            r = _review_by_sub(kind, sub_id)
+            if not r:
                 continue
-            out.append({"kind": kind, "sub": sub,
-                        "problem_id": int(r["problem_id"])})
-    return out
+            pid = r["problem_id"]
+            if kind == "algo":
+                return kind, algo_log_write(pid, independent=independent)
+            return kind, interview_log_attempt(
+                pid, "", 0, "correct" if independent else "incorrect")
+        return "", {}
+
+
+def review_todo_ids() -> set[int]:
+        """现在挂着复习条目的大任务 id 集合。
+
+        待办页每行都要知道「这是不是一天的复习」（决定行内要不要摊开题目），
+        一次查完两张排期表，别在建行循环里逐条问。
+        """
+        out = set()
+        with db.connect() as conn:
+            for spec in _REVIEW_KINDS.values():
+                for r in conn.execute(
+                        f"SELECT todo_id FROM {spec['reviews']} "
+                        "WHERE status = 'open' AND todo_id > 0").fetchall():
+                    out.add(int(r["todo_id"]))
+        return out
+
+
+def review_pending_subs(todo_id: int) -> list[dict]:
+        """这条大任务下还没勾掉的复习条目：[{kind, sub, problem_id}, ...]。
+
+        整条大任务一起勾的时候要用它把还没做的题逐个结掉 —— 排期是按题走的，
+        一次结论得展开成 N 次重排。用户自己加的检查事项不在排期表里，自然过滤掉。
+        """
+        out = []
+        for kind in ("algo", "interview"):
+            tbl = _REVIEW_KINDS[kind]["reviews"]
+            with db.connect() as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM {tbl} WHERE todo_id = ? AND status = 'open' "
+                    "AND COALESCE(subtask_id, 0) > 0 ORDER BY id",
+                    (int(todo_id),)).fetchall()
+            for raw in rows:
+                r = _row_to_dict(raw)
+                with db.connect() as conn:
+                    sub = _row_to_dict(conn.execute(
+                        "SELECT * FROM subtasks WHERE id = ?",
+                        (int(r["subtask_id"]),)).fetchone())
+                if not sub or int(sub.get("done") or 0):
+                    continue
+                out.append({"kind": kind, "sub": sub,
+                            "problem_id": int(r["problem_id"])})
+        return out
 
 
 def review_kind_of_sub(sub_id: int) -> str:
-    """这条子任务是不是复习条目。待办页据此决定勾它要不要问结论。"""
-    for kind in ("algo", "interview"):
-        if _review_by_sub(kind, sub_id):
-            return kind
-    return ""
+        """这条子任务是不是复习条目。待办页据此决定勾它要不要问结论。"""
+        for kind in ("algo", "interview"):
+            if _review_by_sub(kind, sub_id):
+                return kind
+        return ""
 
 
 def review_owner_of_sub(sub_id: int) -> tuple[str, int]:
-    """返回 (kind, 题目 id)；kind 为空串表示这不是复习条目。"""
-    for kind in ("algo", "interview"):
-        r = _review_by_sub(kind, sub_id)
-        if r:
-            return kind, int(r["problem_id"])
-    return "", 0
+        """返回 (kind, 题目 id)；kind 为空串表示这不是复习条目。"""
+        for kind in ("algo", "interview"):
+            r = _review_by_sub(kind, sub_id)
+            if r:
+                return kind, int(r["problem_id"])
+        return "", 0
+
+
+# 「算法复习」是清单名，「算法刷题」才是侧栏那一页的名字。拦下用户操作时
+# 要报的是后者，报成 algo / interview 就是给中文界面里塞英文键。
+TRAINER_PAGES = {"algo": "算法刷题", "interview": "八股刷题"}
+
+
+def review_page_of_todo(todo_id: int) -> str:
+        """这条待办是哪一页排出来的（给用户看的页名）；不是复习就返回空串。"""
+        return TRAINER_PAGES.get(review_kind_of_todo(todo_id), "")
 
 
 def review_kind_of_todo(todo_id: int) -> str:
-    """这条待办是不是一门课在某天的复习大任务（那些题做完没都算）。
+        """这条待办是不是一门课在某天的复习大任务（那些题做完没都算）。
 
-    待办页拿它决定「勾整条要怎么收尾」「要不要浮撤销条」。不看 status：
-    一天的题目全做完之后那些行就成了 done_*，这时大任务反而是最需要认出来的
-    —— 它勾掉的是十几条已经记进排期的复习，撤销条回收不了那些结论。
-    """
-    for kind, spec in _REVIEW_KINDS.items():
-        with db.connect() as conn:
-            if conn.execute(
-                    f"SELECT 1 FROM {spec['reviews']} WHERE todo_id = ? LIMIT 1",
-                    (int(todo_id),)).fetchone():
-                return kind
-    return ""
+        待办页拿它决定「勾整条要怎么收尾」「要不要浮撤销条」。不看 status：
+        一天的题目全做完之后那些行就成了 done_*，这时大任务反而是最需要认出来的
+        —— 它勾掉的是十几条已经记进排期的复习，撤销条回收不了那些结论。
+        """
+        for kind, spec in _REVIEW_KINDS.items():
+            with db.connect() as conn:
+                if conn.execute(
+                        f"SELECT 1 FROM {spec['reviews']} WHERE todo_id = ? LIMIT 1",
+                        (int(todo_id),)).fetchone():
+                    return kind
+        return ""
 

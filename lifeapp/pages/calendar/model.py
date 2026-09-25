@@ -115,8 +115,8 @@ _WD_CN = "日一二三四五六"
 # 而启动对账只补「被删/被勾掉」的，不会把被改动的日期改回来 —— 两边就悄悄
 # 对不上了。判据用清单名（就是这两个页写入的地方），不用查库：
 # 每次 reload 每格每条都要问一次，那里省下来的是实打实的耗时。
-TRAINER_LISTS = {services.ALGO_LIST_NAME: "算法刷题",
-                 services.INTERVIEW_LIST_NAME: "八股刷题"}
+TRAINER_LISTS = {services.ALGO_LIST_NAME: services.TRAINER_PAGES["algo"],
+                 services.INTERVIEW_LIST_NAME: services.TRAINER_PAGES["interview"]}
 
 
 def trainer_of(row: dict) -> str:

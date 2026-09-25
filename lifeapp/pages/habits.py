@@ -1848,9 +1848,6 @@ class HabitPane(QWidget):
         # 计数型习惯一次点击可能只加一步，没到目标不算打卡成功
         if not done and new_count >= services.habit_goal_count(habit):
             sounds.play("habit_checkin")
-        if not done and date == _today_str() and habit.get("auto_log") \
-                and not rec["note"].strip():
-            self._ask_note(habit_id, date)
         row = self._row_widgets.get(habit_id)
         if row is not None:
             row.habit = habit
@@ -1859,15 +1856,33 @@ class HabitPane(QWidget):
             self.reload()
         if habit_id == self._current_id:
             self.detail.reload()
+        # 先让点阵变成已打卡，再问日志：反过来会让人以为刚才那一下没点上
+        if not done and date == _today_str() and habit.get("auto_log") \
+                and not rec["note"].strip():
+            self._ask_note(habit_id, date, row or self.add_btn)
 
-    def _ask_note(self, habit_id: int, date: str) -> None:
+    def _ask_note(self, habit_id: int, date: str,
+                  anchor: QWidget) -> None:
         pop = NotePopup(f"{date} 的打卡日志", "", self)
         pop.accepted.connect(
-            lambda text: services.habit_set_note(habit_id, date, text))
+            lambda text: self._save_note_and_show(habit_id, date, text))
         self._popup = pop
-        _place_popup(pop, self.add_btn)
+        # 挂在被点的那一行上。以前固定挂 add_btn（列表右上角的 ＋），
+        # 在长列表底部打个卡，日志框却从顶上冒出来，看着不像同一件事。
+        _place_popup(pop, anchor)
         pop.show()
         pop.focus_editor()
+
+    def _save_note_and_show(self, habit_id: int, date: str,
+                            text: str) -> None:
+        services.habit_set_note(habit_id, date, text)
+        # 只写库不刷界面：日志那一栏要等下一次别的刷新才冒出这条，
+        # 用户写完点保存看着像没存进去。
+        row = self._row_widgets.get(habit_id)
+        if row is not None:
+            row.refresh(services.habit_checks_map(habit_id))
+        if self._current_id == habit_id:
+            self.detail.reload()
 
     # ---- 增删改 ----
     def _add_habit(self) -> None:

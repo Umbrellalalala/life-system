@@ -90,7 +90,14 @@ class AlgoPage(Page):
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(140)
         self.search.setMaximumWidth(240)
-        self.search.textChanged.connect(self._reload_list)
+        # 逐字符重建整张列表的话，300 题实测打一个中文要等 2.0 秒（手比机器快得多）。
+        # 停 200ms 再筛，回车立刻筛 —— 和笔记页那套防抖同一个形状。
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._reload_list)
+        self.search.textChanged.connect(self._search_timer.start)
+        self.search.returnPressed.connect(self._reload_list)
         bar.addWidget(self.search)
 
         self.tag_filter = widgets.ComboBox()
@@ -221,6 +228,9 @@ class AlgoPage(Page):
     def _reload_list(self) -> None:
         self._flush()
         prev = self._pid
+        # 筛一次字不该把视口弹回顶部：clear() 会把滚动条归零，所以先记下位置，
+        # 重建完再滚回来（下一帧才滚得动，几何这时才定下来）。
+        saved = self.list.verticalScrollBar().value()
         self.list.blockSignals(True)
         self.list.clear()
         rows = services.algo_problem_list(
@@ -244,6 +254,9 @@ class AlgoPage(Page):
         self.list.fit_rows()
         # 选中项没变也要重画详情：复习结论是在待办页写的，这边 _pid 不变，
         # 只靠 currentRowChanged 会让详情停在旧数据上。
+        # keep 要在这一下改判 prev 之前算：还在原选中题上才滚回原位置，
+        # 换了题（原题被筛掉）就该跟着 _select 走到新题那里。
+        keep = prev != 0 and any(r["id"] == prev for r in rows)
         if not rows:
             self._pid = 0
         else:
@@ -254,6 +267,9 @@ class AlgoPage(Page):
         self._render_detail()
         self._n_rows = len(rows)
         self._update_hint()
+        if keep:
+            sb = self.list.verticalScrollBar()
+            QTimer.singleShot(0, lambda: sb.setValue(saved))
 
     def _update_hint(self) -> None:
         self.hint.setText("%d 道题%s" % (

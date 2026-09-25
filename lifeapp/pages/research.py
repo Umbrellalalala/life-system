@@ -171,6 +171,9 @@ def _field(text: str) -> QLabel:
 def _link_btn(text: str, on_click, tip: str = "") -> QPushButton:
     b = QPushButton(text)
     b.setObjectName("LinkBtn")
+    # 行内小按钮永远不该是回车目标：留在对话框里它会以 autoDefault 身份抢走默认按钮
+    b.setAutoDefault(False)
+    b.setDefault(False)
     b.setCursor(Qt.PointingHandCursor)
     if tip:
         b.setToolTip(tip)
@@ -272,6 +275,7 @@ class ProjectDialog(QDialog):
         cancel.clicked.connect(self.reject)
         ok = QPushButton("保存")
         ok.setObjectName("Primary")
+        ok.setDefault(True)      # 回车=提交；不设的话六个弹窗按回车都没反应
         ok.clicked.connect(self._accept)
         btns.addWidget(cancel)
         btns.addWidget(ok)
@@ -350,6 +354,7 @@ class MilestoneAddDialog(QDialog):
         cancel.clicked.connect(self.reject)
         ok = QPushButton("保存" if ms else "添加")
         ok.setObjectName("Primary")
+        ok.setDefault(True)      # 回车=提交；不设的话六个弹窗按回车都没反应
         ok.clicked.connect(self._accept)
         btns.addWidget(cancel)
         btns.addWidget(ok)
@@ -452,6 +457,7 @@ class ArxivPickerDialog(QDialog):
         cancel.clicked.connect(self.reject)
         ok = QPushButton("关联所选")
         ok.setObjectName("Primary")
+        ok.setDefault(True)      # 回车=提交；不设的话六个弹窗按回车都没反应
         ok.clicked.connect(self.accept)
         foot.addWidget(cancel)
         foot.addWidget(ok)
@@ -539,6 +545,7 @@ class KeywordsDialog(QDialog):
         cancel.clicked.connect(self.reject)
         ok = QPushButton("保存")
         ok.setObjectName("Primary")
+        ok.setDefault(True)      # 回车=提交；不设的话六个弹窗按回车都没反应
         ok.clicked.connect(self.accept)
         btns.addWidget(cancel)
         btns.addWidget(ok)
@@ -952,10 +959,13 @@ class NextStepCard(QFrame):
                 self.notes_edit.setPlainText(proj.get("notes") or "")
             minutes = services.project_focus_minutes(proj)
             self.focus_lbl.setText(f"近 30 天 {_fmt_minutes(minutes)}" if minutes else "")
-        # 行不受「展开」条件保护：它们身上有 theme.get() 算出来的内联色（逾期的红），
-        # 收起时不重建就会在切主题后留着旧色值，等展开那一瞬先闪一下错的配色。
+        # DDL 行不受「展开」条件保护：它们身上有 theme.get() 算出来的内联色
+        # （逾期的红），收起时不重建就会在切主题后留着旧色值，展开那一瞬先闪错的。
         self._fill_ddls()
-        self._fill_papers()
+        # 论文行反过来要挡：它每行都要去 Arxiver 的库里现查元数据（上千篇的库，
+        # 一次十几毫秒），而收起态根本不显示论文 —— 三张卡白查三遍。
+        if self._open:
+            self._fill_papers()
         self._loading = False
 
     def _fill_venue_row(self, proj: dict, open_n: int) -> None:
@@ -975,6 +985,16 @@ class NextStepCard(QFrame):
 
     def _fill_next(self, proj: dict) -> None:
         """下一步 = 最早那条没做完的 DDL；没有 DDL 就说这一步该干什么。"""
+        if proj.get("status") == "done":
+            # 结题的排在最后，但也要一眼看出它是「不用管了」而不是「还欠着事」
+            self.next_lbl.setText("已收尾，不再推进")
+            self.next_sub.setText("点「更多」可以改回在研，或直接删掉")
+            self.next_lbl.setStyleSheet(
+                f"font-size: 15px; font-weight: 700; color: {theme.get('muted')};")
+            self.badge.set_icon("🏁", "muted")
+            self.done_btn.setEnabled(False)
+            self.done_btn.setToolTip("这个课题已经收尾了")
+            return
         nxt = None
         for m in services.milestone_list(self.rid):
             if m["done"]:
@@ -1187,7 +1207,10 @@ class ResearchPage(Page):
             days += [_days_left(m["due_date"]) for m in services.milestone_list(p["id"])
                      if not m["done"]]
             soon = [d for d in days if d is not None]
-            return (9e9 if not soon else min(soon),
+            # 第一位必须是「结没结题」：已收尾的课题往往留着过去的截稿日，
+            # 只按天数排会让它顶着「逾期 N 天」冲到最上面。
+            return (1 if p.get("status") == "done" else 0,
+                    9e9 if not soon else min(soon),
                     -int(p.get("priority", 1) or 0), p["id"])
         return sorted(projects, key=key)
 

@@ -133,6 +133,18 @@ class SettingsPage(Page):
 
         theme.manager.changed.connect(self._update_theme_btn)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        """每次进这页都重读一遍「外面会变的数」。
+
+        库目录是在笔记页换的、开机自启可能被别的程序改，而这两处以前只在构造时
+        读一次 —— 换完库切回设置，那行还写着旧路径和旧篇数，看着像没换成功。
+        """
+        super().showEvent(event)
+        self._refresh_vault_lbl()
+        self.autostart_check.blockSignals(True)
+        self.autostart_check.setChecked(autostart.is_enabled())
+        self.autostart_check.blockSignals(False)
+
     def _toggle_autostart(self, checked: bool) -> None:
         if not autostart.sync(checked):
             popups.notify(self, "开机自启", "设置失败，请检查系统权限后重试。",
@@ -351,7 +363,7 @@ class SettingsPage(Page):
     # ---------- Obsidian ----------
     def _refresh_vault_lbl(self) -> None:
         root = vault.vault_path()
-        n = len(vault.iter_notes(root)) if root else 0
+        n = vault.count_notes(root) if root else 0
         self.vault_lbl.setText(
             f"{root}  ·  {n} 篇笔记" if root else "未设置（去笔记页选一个库目录）")
         last = vault.last_sync_at()

@@ -1,7 +1,9 @@
 """通用 UI 组件：卡片、统计卡、标签、图表、环形进度。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, QSize, QObject, QEvent, QDate
+from PySide6.QtCore import (
+    Qt, QRectF, QPointF, QPoint, QSize, QObject, QEvent, QDate, QTimer,
+)
 from PySide6.QtGui import (
     QColor, QPainter, QPainterPath, QPen, QFont, QLinearGradient, QPolygonF,
     QPixmap,
@@ -351,6 +353,13 @@ class FittingList(QListWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 拖分割条时每来一个像素都会进一次 resizeEvent，而 fit_rows 是 O(行数)：
+        # 300 行实测一次 7~26ms，一次拖动里近四分之一时间花在这。攒 60ms 再量
+        # 一次 —— 后果只是拖动过程中行宽晚一帧跟上，停下就来对，不会裁字。
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self.fit_rows)
 
     def fit_rows(self) -> None:
         # QListView 把行控件摆在 item 矩形里偏 (1,1) 的位置，宽高各再少 1：
@@ -372,7 +381,7 @@ class FittingList(QListWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self.fit_rows()
+        self._fit_timer.start()
 
 
 class Card(QFrame):
@@ -1527,10 +1536,15 @@ def icon_pixmap(name: str, kind: str = "category", size: int = 28,
 class ElidedLabel(QLabel):
     """文本过长自动显示省略号，并在 tooltip 中保留全文。"""
 
-    def __init__(self, text: str = "", parent: QWidget | None = None):
+    def __init__(self, text: str = "", parent: QWidget | None = None,
+                 keep_tip: bool = False):
         super().__init__(text, parent)
         self._full = text
         self._shown = text
+        # keep_tip：调用方自己管这根标签的悬停文案，折行时别拿标题去覆盖。
+        # 日历色条就是这种：条上挂的是「清单 / 标签 / 子任务 3/14 / 备注」那一整段，
+        # 而标签盖住了条面九成面积，一覆盖就什么都看不到了。
+        self._keep_tip = keep_tip
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
@@ -1556,7 +1570,8 @@ class ElidedLabel(QLabel):
             return
         self._shown = elided
         super().setText(elided)
-        self.setToolTip(self._full if elided != self._full else "")
+        if not self._keep_tip:
+            self.setToolTip(self._full if elided != self._full else "")
 
 
 def hline() -> QFrame:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from PySide6.QtCore import Qt, QDate, QSize, Signal
+from PySide6.QtCore import Qt, QDate, QTimer, QSize, Signal
 from PySide6.QtGui import QIcon, QColor, QPainter
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
@@ -639,9 +639,20 @@ class CategoryDialog(QDialog):
 
     def _del(self, name: str) -> None:
         cats = services.get_custom_categories(self.kind)
-        if name in cats:
-            cats.remove(name)
-            services.set_custom_categories(self.kind, cats)
+        if name not in cats:
+            return
+        used = sum(1 for r in services.finance_list() if r["category"] == name)
+        # 以前一声不响就删了：记过的账里那条 category 字符串原样留着，
+        # 于是分类筛选下拉和支出结构图里这个名字照旧出现（看着像没删动），
+        # 而它那份自定义图标 / 颜色对所有历史记录已经失效 —— 一句都不说，
+        # 用户只会以为操作失败了再点一遍。
+        tip = ("这个分类下面还有 %d 笔账。删掉之后账目本身不动，"
+               "但那几笔会退回默认图标和颜色，分类筛选里也还会看到这个名字。"
+               % used) if used else "删除分类「%s」？" % name
+        if not popups.confirm(self, "删除分类", tip, "删除"):
+            return
+        cats.remove(name)
+        services.set_custom_categories(self.kind, cats)
         self._reload()
 
 
@@ -1612,8 +1623,17 @@ class FinancePage(QWidget):
         self._build_assets()
 
         generate_recurring()
+        # 钱的颜色是建那批行时用 theme.get() 算死的，换肤不会重跑这里；
+        # 但切回本页的 reload 本来就有，所以这里只管「站着不动换肤」那一种，
+        # 人在别的页就别把流水整表重建（400 笔一次 120-178ms 白干）。
+        theme.manager.changed.connect(self._on_theme_changed)
         self.reload()
         self._reload_assets()
+
+    def _on_theme_changed(self) -> None:
+        if self.isVisible():
+            self.reload()
+            self._reload_assets()
 
     def showEvent(self, event) -> None:  # noqa: N802
         """切回本页时刷新（页面在启动时已构造，避免看到过期数据）。"""
@@ -1732,7 +1752,14 @@ class FinancePage(QWidget):
         filters.addWidget(self.cat_combo)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索备注 / 分类")
-        self.search_edit.textChanged.connect(self._on_filter_change)
+        # 流水列表每敲一个字就整表重建（400 笔实测一个中文 644ms）。
+        # 停 200ms 再筛，回车立刻筛 —— 和笔记页那套防抖同一个形状。
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._on_filter_change)
+        self.search_edit.textChanged.connect(self._search_timer.start)
+        self.search_edit.returnPressed.connect(self._on_filter_change)
         filters.addWidget(self.search_edit, 1)
         clear_btn = QPushButton("清空筛选")
         clear_btn.setObjectName("LinkBtn")

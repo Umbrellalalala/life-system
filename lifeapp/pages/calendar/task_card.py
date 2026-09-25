@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QMenu, QApplication, QListWidget, QListWidgetItem)
 
 from ... import dateparse, popups, services, todo_icons, widgets
-from ..todo import DatePickerPopup
+from ..todo import DatePickerPopup, _review_ask_group, _review_ask_sub
 from . import model, style
 from .repeat_dialog import RepeatDialog
 
@@ -115,8 +115,9 @@ class TaskCard(QFrame):
         # 落到 Fusion 默认样式上会画成一条深灰凹槽，比滴答重得多
         root.addWidget(style.sep_line())
         self._build_footer(root)
-        self._sync()
+        # 先定锁再填内容：_rebuild_subs 要看 _locked 决定子任务给不给改字
         self._apply_lock()
+        self._sync()
 
     # ------------------------------------------------------------ 只读模式
     def _apply_lock(self) -> None:
@@ -124,7 +125,8 @@ class TaskCard(QFrame):
 
         改了日期，题目那边的 next_review 不会跟着动，两边就悄悄对不上了；
         标题 / 描述 / 子任务也是那一页的题库内容，在日历里编辑没有归宿。
-        唯一留着的是完成勾选 —— 勾掉复习待办正是推进记忆档的动作。
+        留着的是勾选：整条勾一次会按一个结论结掉这天的题，逐条勾则一题一问 ——
+        推进记忆档靠的就是它，日历把题目摊成一根根条之后更是只有这里能答。
         """
         self._locked = bool(model.trainer_of(self.row))
         if not self._locked:
@@ -133,7 +135,9 @@ class TaskCard(QFrame):
             w.setReadOnly(True)
         for w in (self.flag, self.repeat_btn, self.list_btn, self.sub_add):
             w.setEnabled(False)
-        self.sub_list.setEnabled(False)
+        # 子任务列表**不能**整块 setEnabled(False)：那会连勾选一起吞掉，
+        # 而逐题作答正是复习推进记忆档的唯一入口（_on_sub_toggled 里问结论）。
+        # 不许改字已经在 _rebuild_subs 里按条撤掉 ItemIsEditable 了。
         widgets._apply_property(self.date_btn, "locked", "true")
         self.head_note = QLabel("这条由「%s」页排期，日历里只能查看"
                                 % model.trainer_of(self.row))
@@ -318,8 +322,11 @@ class TaskCard(QFrame):
             it.setData(Qt.ItemDataRole.UserRole, s["id"])
             # 多存一份原标题：itemChanged 同时被勾选和改名触发，靠它分辨是哪种
             it.setData(Qt.ItemDataRole.UserRole + 1, s["title"])
-            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable
-                        | Qt.ItemFlag.ItemIsEditable)
+            flags = it.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if not self._locked:
+                # 复习题目是刷题页的题库内容：能在日历里勾着答，不能就地改字
+                flags |= Qt.ItemFlag.ItemIsEditable
+            it.setFlags(flags)
             it.setCheckState(Qt.CheckState.Checked if s["done"]
                              else Qt.CheckState.Unchecked)
             f = QFont()
@@ -393,7 +400,12 @@ class TaskCard(QFrame):
             self.changed.emit()
 
     def _on_check(self, checked: bool) -> None:
-        services.occ_set_done(self.row["id"], self.row["occ"], checked)
+        tid, occ = int(self.row["id"]), self.row["occ"]
+        services.occ_set_done(tid, occ, checked)
+        if checked and not _review_ask_group(self, tid):
+            # 复习大任务：整天的题目按一个结论结掉；没答就退回未完成
+            services.occ_set_done(tid, occ, False)
+            checked = False
         self.row["done"] = checked
         self.changed.emit()
         self._sync()
@@ -415,8 +427,13 @@ class TaskCard(QFrame):
             item.setData(Qt.ItemDataRole.UserRole + 1, title)
             self.changed.emit()
             return
-        services.subtask_update(
-            sub_id, done=int(item.checkState() == Qt.CheckState.Checked))
+        done = int(item.checkState() == Qt.CheckState.Checked)
+        services.subtask_update(sub_id, done=done)
+        if done:
+            # 一道题问一次结论，答完才往下/退一档重排；没答的话 _review_ask_sub
+            # 自己把 done 退回 0。日历不再把题目摊成一根根条，这个钩子只能挂在
+            # 卡片里，否则复习就断在日历这一侧了。
+            _review_ask_sub(self, {"id": sub_id})
         self._rebuild_subs()
         self.changed.emit()
 
@@ -500,6 +517,10 @@ class TaskCard(QFrame):
                 return
             if scope == "all":
                 services.series_shift(self.row["id"], self.row["occ"], new_date)
+                if new_time:
+                    # 拖日期时顺手改的时刻也要跟着进系列，否则「所有周期」
+                    # 这一档会静默把时间丢掉（只此周期那档是不会的）
+                    services.todo_update(self.row["id"], due_time=new_time)
             else:
                 services.occ_move(self.row["id"], self.row["occ"], new_date,
                                   new_time)
@@ -509,7 +530,25 @@ class TaskCard(QFrame):
         self.close()
 
     def _clear_date(self) -> None:
-        services.todo_update(self.row["id"], due_date="", due_time="")
+        tid, occ = self.row["id"], self.row["occ"]
+        if self.row["repeat"]:
+            # 重复系列没有「这一次不排日期」这种状态：日期是规则算出来的。
+            # 抹掉 due_date 等于把整个系列从日历上删了，而旁边那格
+            # 「跳过此周期」只是不做这一次 —— 两者差得远，必须问一句
+            scope = RepeatDialog.ask(
+                self, "清除重复任务的日期",
+                "这一条是重复任务。只清掉这个周期（这一次不做），"
+                "还是整个系列都不再排期？")
+            if scope is None:
+                self._sync()
+                return
+            if scope == "all":
+                services.todo_update(self.row["id"], repeat="",
+                                     due_date="", due_time="")
+            else:
+                services.occ_delete(tid, occ)
+        else:
+            services.todo_update(tid, due_date="", due_time="")
         self.changed.emit()
         self.close()
 

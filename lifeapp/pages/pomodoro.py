@@ -801,6 +801,13 @@ class ImmersiveOverlay(QWidget):
         self._sync_timer.start()
         self.setFocus()
 
+    def hideEvent(self, event) -> None:  # noqa: N802
+        # 收起 Mini 的每一条路（点✕ / Esc / 再点一次工具栏）都只调 hide()，
+        # hide() 不发 closeEvent —— 那个 400ms 的轮询会一直跑下去，
+        # 「关了」的 Mini 每秒 still 醒 2.5 次去 repaint、去读 page 的状态
+        self._sync_timer.stop()
+        super().hideEvent(event)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self._sync_timer.stop()
 
@@ -971,9 +978,11 @@ class TaskPickerPopup(popups.PopupCard):
         self.search.installEventFilter(self)
         # 防抖：_refresh 会把列表全删重建并整表查一次 todo_list()，
         # 直接挂在 textChanged 上等于每敲一个字就来一遍。
+        # 120ms 就够 —— 实测整表重建只有 3ms 量级，250ms 纯粹是把延迟加在人身上：
+        # 打一个字要等四分之一秒才看到列表动，感觉像卡。
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(250)
+        self._search_timer.setInterval(120)
         self._search_timer.timeout.connect(self._refresh)
         self.search.textChanged.connect(lambda _t: self._search_timer.start())
         # 交给 PopupCard：_arm() 会延后一轮激活窗口并把焦点给到它，输入法才跟得上
@@ -1922,6 +1931,10 @@ class SettingsDialog(QDialog):
                                             _s_int("pomodoro_long", 15), "pomodoro_long")
         self.interval_spin = self._add_spin_row(card, "长休息间隔番茄数", "个", 1, 12,
                                                 _s_int("pomodoro_interval", 4), "pomodoro_interval")
+        # 环下方那行「今日目标 N/8」一直在读 pomodoro_goal，也留了写入分支，
+        # 但设置里从来没有这一项 —— 目标永远只能是默认 8 个。
+        self.goal_spin = self._add_spin_row(card, "今日目标番茄数", "个", 1, 24,
+                                            _s_int("pomodoro_goal", 8), "pomodoro_goal")
 
         # ---- 自动选项 ----
         card = self._card(lay, "自动选项")
@@ -2724,6 +2737,7 @@ class MiniWindow(QWidget):
     def _build_menu(self) -> QMenu:
         pg = self.page
         menu = QMenu(self)
+        menu.setAttribute(Qt.WA_DeleteOnClose, True)   # 右键一次留一个菜单 + 子菜单
         menu.setStyleSheet(MINI_MENU_QSS)
 
         act_focus = QAction("🔗  专注于", menu)
@@ -2789,6 +2803,7 @@ class MiniWindow(QWidget):
     # ---- 菜单动作 ----
     def _pick_task(self):
         popup = TaskPickerPopup(self.page, self)
+        popup.setAttribute(Qt.WA_DeleteOnClose, True)
         popup.picked.connect(lambda _t: self.update())
         pos = self.mapToGlobal(QPoint(24, self.height() + 6))
         popup.move(pos.x(), pos.y())
@@ -2796,6 +2811,7 @@ class MiniWindow(QWidget):
 
     def _open_stat_menu(self):
         menu = QMenu(self)
+        menu.setAttribute(Qt.WA_DeleteOnClose, True)
         menu.setStyleSheet(MINI_MENU_QSS)
         for key, label in STAT_MODES:
             a = QAction(label, menu)
@@ -3110,7 +3126,7 @@ class FocusManagerView(QWidget):
 
     # ---- 样式 ----
     def _apply_style(self) -> None:
-        self.setStyleSheet(
+        qss = (
             "QWidget#FocusManagerPage { background: %s; }"
             "QLabel { background: transparent; }"
             "QFrame#FavListRow { background: transparent; border: none;"
@@ -3149,6 +3165,12 @@ class FocusManagerView(QWidget):
                theme.get("text_hi"), theme.get("focus"),
                theme.get("text_hi"), focus_ui.neutral_text("label").name(),
                theme.get("text_hi")))
+        # 整棵子树重新抛光实测 ~105ms，而这一页每次 showEvent 都会走一遍
+        # （showEvent → apply_theme）。颜色没变就别重设 —— 和统计页同一套做法。
+        if qss == getattr(self, "_qss_applied", None):
+            return
+        self._qss_applied = qss
+        self.setStyleSheet(qss)
 
     def apply_theme(self) -> None:
         self._apply_style()
@@ -3496,6 +3518,10 @@ class FocusManagerView(QWidget):
         n = services.pomodoro_fav_summary(fav.get("id") or "")["count"]
         tail = (f"它已产生的 {n} 条专注记录仍会留在记录列表里。" if n
                 else "它还没有专注记录。")
+        running = ((self.page._active_fav or {}).get("id") == fav.get("id")
+                   and self.page.running)
+        if running:
+            tail += " 它正在计时，删掉会结束这一轮（未完成的这段不记入记录）。"
         if not popups.confirm(
                 self, "删除常用专注",
                 f"确定删除「{fav.get('name') or '未命名'}」吗？{tail}"):
@@ -3503,9 +3529,14 @@ class FocusManagerView(QWidget):
         favs = [f for f in _load_favorites() if f.get("id") != fav.get("id")]
         _save_favorites(favs)
         if self.page._active_fav and self.page._active_fav.get("id") == fav.get("id"):
+            # 只清 fav_id 不够：环还在按被删那个的时长倒数，坞和落库用的
+            # 也还是旧名字。删掉正在计时的它，就把这一轮一起结束掉。
             self.page._active_fav = None
             self.page._fav_id = ""
+            self.page._task = ""
             self.page.task_lbl.setText("专注 ›")
+            if self.page.running or self.page._session_start is not None:
+                self.page._reset()
         self._selected = None
         self._refresh_list()
 
@@ -3562,6 +3593,13 @@ class PomodoroPage(Page):
         self._hotkey_retry.timeout.connect(self._register_hotkey)
         self._state_text: str = "待开始"
         self._side_applying: bool = False
+        # 拖动分隔条时 splitterMoved 每移动 1px 发一次，直接写库就是一次拖拽
+        # 上百条 UPDATE。攒到停手后再落一次。
+        self._side_save = QTimer(self)
+        self._side_save.setSingleShot(True)
+        self._side_save.setInterval(400)
+        self._side_save.timeout.connect(self._persist_side_ratio)
+        self._goal_hit: bool | None = None      # 环下那行的颜色状态，避免每秒重设样式
 
         self._build_ui()
         self._set_mode("work")
@@ -3586,6 +3624,7 @@ class PomodoroPage(Page):
         for hdr in self.findChildren(_DateHeader):
             hdr.apply_theme()
         # 目标达成那行的绿色是内联样式，换肤时得重算
+        self._goal_hit = None              # 让 _refresh_status 别跳过那次 setStyleSheet
         self._refresh_status()
         self.update()
         for w in self.findChildren(QWidget):
@@ -3810,6 +3849,9 @@ class PomodoroPage(Page):
             return
         self._side_width = sizes[1]
         self._side_ratio = max(0.18, min(0.85, sizes[1] / total))
+        self._side_save.start()          # 停手 400ms 后再落库
+
+    def _persist_side_ratio(self) -> None:
         db.set_setting("pomodoro_side_ratio", str(int(self._side_ratio * 100)))
 
     def reset_side_width(self):
@@ -3979,10 +4021,16 @@ class PomodoroPage(Page):
         # 长得一样，做满一天也看不出区别。
         if today_count >= self._goal:
             goal = f"今日目标已达成 {today_count}/{self._goal}"
-            self.goal_lbl.setStyleSheet("color: %s;" % theme.get("green"))
+            hit = True
         else:
             goal = f"今日目标 {today_count}/{self._goal} 个番茄"
-            self.goal_lbl.setStyleSheet("")
+            hit = False
+        # 这一行每秒都会重算，setStyleSheet 每次都让该控件重新抛光一遍；
+        # 只有「达没达成」真的翻转时才需要动样式。
+        if hit != self._goal_hit:
+            self._goal_hit = hit
+            self.goal_lbl.setStyleSheet(
+                "color: %s;" % theme.get("green") if hit else "")
         self.goal_lbl.setText(f"{state} · {goal}" if state else goal)
         self.goal_lbl.setVisible(True)
 
@@ -4182,8 +4230,12 @@ class PomodoroPage(Page):
     def _open_add_favorite(self, fav: dict | None = None):
         """新增（fav=None）或编辑（传 fav）一个常用专注。"""
         dlg = AddFocusDialog(self, fav)
-        if dlg.exec() == QDialog.Accepted and dlg.result_fav:
-            self._upsert_favorite(dlg.result_fav, notify=True)
+        # 模态框关掉之后 C++ 侧还挂在页面上，开一次留一个整树。
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        ok = dlg.exec() == QDialog.Accepted
+        result = dlg.result_fav if ok else None      # 趁对象还活着取出来
+        if result:
+            self._upsert_favorite(result, notify=True)
 
     def _upsert_favorite(self, fav: dict, notify: bool = False) -> bool:
         """按 id 新增或更新一个常用专注。
@@ -4307,7 +4359,9 @@ class PomodoroPage(Page):
     # 设置弹窗
     # ------------------------------------------------------------------
     def _open_settings(self):
-        SettingsDialog(self).exec()
+        dlg = SettingsDialog(self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)   # 否则每开一次留一整棵设置树
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Mini 快捷键
@@ -4367,8 +4421,11 @@ class PomodoroPage(Page):
     # ------------------------------------------------------------------
     def _add_record(self):
         dlg = AddRecordDialog(self._work_min, self._work_min, self)
-        if dlg.exec() == QDialog.Accepted:
-            task, minutes, started, note = dlg.values()
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        ok = dlg.exec() == QDialog.Accepted
+        vals = dlg.values() if ok else None          # 关掉后 C++ 侧就该释放了
+        if vals:
+            task, minutes, started, note = vals
             services.pomodoro_add(minutes, task, 1, started_at=started, note=note)
             self._refresh_stats()
             self._reload_records()
@@ -4377,11 +4434,14 @@ class PomodoroPage(Page):
         """从常用专注页给某个专注补录一条记录（带 fav_id，统计才归到它头上）。"""
         minutes = int(fav.get("minutes") or self._work_min)
         dlg = AddRecordDialog(minutes, minutes, self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         name = fav.get("name") or ""
         if name:
             dlg._on_task(name)
-        if dlg.exec() == QDialog.Accepted:
-            task, mins, started, note = dlg.values()
+        ok = dlg.exec() == QDialog.Accepted
+        vals = dlg.values() if ok else None
+        if vals:
+            task, mins, started, note = vals
             services.pomodoro_add(mins, task, 1, started_at=started, note=note,
                                   fav_id=fav.get("id") or "")
             self._refresh_stats()
@@ -4641,6 +4701,13 @@ class PomodoroPage(Page):
             "task": self._task,
             "session_count": self.session_count,
             "auto_done_in_round": self._auto_done_in_round,
+            # 开始时刻和归属的常用专注必须一起存：恢复后 remaining 已经小于 total，
+            # _toggle 里那句「全新开始才记 _session_start」不会再触发，于是
+            # started_at 退化成完成时刻、fav_id 变空 —— 这条记录既归错时间，
+            # 也从该常用专注的累计里消失。
+            "session_start": (self._session_start.strftime("%Y-%m-%d %H:%M:%S")
+                              if self._session_start else ""),
+            "fav_id": self._fav_id,
         }
         db.set_setting(self.SESSION_KEY, json.dumps(data, ensure_ascii=False))
 
@@ -4665,8 +4732,22 @@ class PomodoroPage(Page):
         self._task = data.get("task", "")
         self.session_count = int(data.get("session_count", 0))
         self._auto_done_in_round = int(data.get("auto_done_in_round", 0))
+        self._fav_id = data.get("fav_id", "") or ""
+        ss = data.get("session_start", "")
+        if ss:
+            try:
+                self._session_start = datetime.strptime(ss, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                self._session_start = None
+        # 认回它归属的那个常用专注：环下方的模式、行尾那枚 ⏸、改名时同步标题
+        # 都靠 _active_fav，不认回来就只是「名字碰巧一样的一个番茄」。
+        if self._fav_id:
+            self._active_fav = next(
+                (f for f in _load_favorites() if f.get("id") == self._fav_id), None)
         if self._task:
-            self.task_lbl.setText(f"{self._task} ›")
+            emoji = (self._active_fav or {}).get("emoji") or ""
+            self.task_lbl.setText(f"{emoji} {self._task} ›" if emoji
+                                  else f"{self._task} ›")
         self._seg.set_index(0 if self.timer_mode == "pomodoro" else 1)
         self.start_btn.setText("继续")
         self._set_state("上次计时未完成")
@@ -4676,6 +4757,9 @@ class PomodoroPage(Page):
 
     def save_on_exit(self):
         """应用退出时：正计时进行中直接结算落库；番茄倒计时保留进度。"""
+        if self._side_save.isActive():      # 刚拖完概览栏就退出，别把比例丢了
+            self._side_save.stop()
+            self._persist_side_ratio()
         if self.timer_mode == "countup":
             # 正计时：已发生的专注时间不能丢，直接按当前累计结算
             if self.countup_elapsed > 0:
