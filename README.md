@@ -11,6 +11,8 @@
 | ![待办清单](docs/todo.png) | ![日历](docs/calendar.png) |
 | **番茄钟** | **习惯打卡** |
 | ![番茄钟](docs/focus.png) | ![习惯打卡](docs/habit.png) |
+| **理财记账** | **体重趋势** |
+| ![理财记账](docs/finance.png) | ![体重趋势](docs/weight.png) |
 
 > 以上截图为演示数据，界面运行时的数据全部存放在你自己的 `~/.life_system/life.db`。
 
