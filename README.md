@@ -91,7 +91,7 @@ life_system/
 ## 说明
 
 - 集成工具页依赖上面提到的三个外部项目，没装的话点开会提示目录不存在，其余功能不受影响。
-- 本仓库不含个人数据库、密钥、笔记或本机日志。历史桌面回滚包集中保存在 `release-history/desktop/`，通过 Git LFS 管理；版本与已知更新说明记录在该目录的 `CHANGELOG.md`。
+- 本仓库不含个人数据库、密钥、笔记或本机日志。历史桌面回滚包与 Android 安装包分别保存在 release-history/desktop/ 和 release-history/android/，均由 Git LFS 管理；版本与已知更新说明记录在 release-history/CHANGELOG.md。
 
 ## License
 
